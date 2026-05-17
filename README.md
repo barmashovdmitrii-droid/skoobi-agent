@@ -1,23 +1,10 @@
 # Skoobi Agent
 
-Skoobi Agent is a Telegram-first personal assistant runtime. This public edition is the open-source base for running a Skoobi instance with tenant isolation, quota accounting, memory provenance, Codex subscription primary runtime, and Claude SDK fallback.
+Skoobi Agent is a Telegram-first personal assistant runtime. It provides a safe base for running a Skoobi instance with tenant isolation, quota accounting, memory provenance, a Codex subscription runtime adapter, and Claude SDK fallback.
 
-## Runtime Shape
+## Install
 
-- Telegram is the primary channel.
-- New installs keep guest live disabled by default: `SKOOBI_TELEGRAM_GUEST_LIVE_ENABLED=false`.
-- Owner/main tenants are excluded from guest live and should remain on the legacy Claude SDK path unless separately reviewed.
-- Primary guest provider can be `codex_subscription_cli`.
-- Fallback provider can be `claude_sdk`.
-- Requested Codex model is `gpt-5.5`.
-- Downgrade to `gpt-5.4` is disabled unless `SKOOBI_CODEX_ALLOW_MODEL_DOWNGRADE=true` is explicitly set.
-- WhatsApp, MCP, and owner shell/write/restart tools are not part of the public guest runtime surface.
-
-## Quick Install
-
-Review `scripts/install.sh` before piping remote shell into `bash`.
-
-Future public release command:
+Review `install.sh` before piping remote shell into `bash`.
 
 ```bash
 curl -fsSL https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/latest/download/install.sh | bash
@@ -36,9 +23,73 @@ The installer uses an app/instance layout:
 ~/.skoobi/instances/default/         # .env, store, groups, logs, data
 ```
 
-Set `--repo git@github.com:barmashovdmitrii-droid/skoobi-agent.git` when installing from a private fork or when using a custom repository location.
+New installs keep live guest rollout disabled by default:
 
-See [Install](docs/INSTALL.md) for macOS/Linux service management, update, and uninstall commands.
+```bash
+SKOOBI_TELEGRAM_GUEST_LIVE_ENABLED=false
+```
+
+See [Install](docs/INSTALL.md) for macOS/Linux service management, updates, and uninstall commands.
+
+## Requirements
+
+- macOS or Linux
+- Node.js 22+
+- npm
+- git
+- sqlite3
+- curl
+- Telegram bot token
+- Optional: Codex CLI login for `codex_subscription_cli`
+- Optional: Claude CLI login for Claude SDK fallback
+
+The installer does not read Codex/Claude auth files, browser cookies, OAuth tokens, or session token stores.
+
+## Quick Start After Install
+
+1. Edit the instance config:
+
+   ```bash
+   $EDITOR ~/.skoobi/instances/default/.env
+   ```
+
+2. Add your Telegram bot token. In the instance `.env`, set `TELEGRAM_BOT_TOKEN` to the token from BotFather.
+
+   Do not paste the token into issues, logs, commits, or documentation.
+
+3. Check local requirements:
+
+   ```bash
+   ~/.skoobi/app/skoobi-agent/bin/skoobi.js doctor
+   ```
+
+4. Start or restart the service:
+
+   macOS:
+
+   ```bash
+   launchctl kickstart -k gui/$(id -u)/com.skoobi.default
+   ```
+
+   Linux:
+
+   ```bash
+   systemctl --user restart skoobi-default
+   ```
+
+5. Watch logs:
+
+   macOS:
+
+   ```bash
+   tail -f ~/.skoobi/instances/default/logs/service.out.log ~/.skoobi/instances/default/logs/service.err.log
+   ```
+
+   Linux:
+
+   ```bash
+   journalctl --user -u skoobi-default -f
+   ```
 
 ## Runtime Overview
 
@@ -79,14 +130,17 @@ SKOOBI_CODEX_ALLOW_MODEL_DOWNGRADE=false
 
 If Codex is unavailable, not logged in, timed out, rate-limited, returns no usable answer, or hits a model availability error, Skoobi can fall back to the Claude SDK runtime. The fallback must produce at most one user-visible Telegram answer and must not double-charge usage.
 
-## Tenant Safety
+## Security Model
 
-Telegram identity is based on stable Telegram IDs:
-
-- tenant identity: `tenant_id` plus channel/chat scope
-- user identity for quota: `tenant_id + channel + Telegram from.id`
-
-Display names and usernames are never identity. Owner/main tenants are excluded from guest live rollout and should stay on `claude_sdk` unless a separate owner-specific migration is designed and reviewed.
+- Telegram display names and usernames are not identity.
+- Telegram identity is based on stable Telegram IDs.
+- Quota identity is scoped by tenant, channel, and Telegram `from.id`.
+- Guest tenants must not read owner/main tenant memory.
+- Guest tenants must not read another tenant's memory.
+- Guest tenants must not access `.env`, raw runtime databases, `~/.ssh`, `~/.codex`, or `~/.claude`.
+- The model is not a trusted security boundary.
+- Tool availability and execution must be decided by Skoobi policy and audit controls.
+- Quota/status commands do not call the model and must not create usage charges.
 
 ## Quota And Internal Credits
 
@@ -105,8 +159,6 @@ User-facing quota commands:
 - `/limit`
 - `/balance`
 - natural-language requests such as `Покажи мой лимит`, `Сколько токенов осталось?`, `show my limit`
-
-Quota status requests do not call the model and must not create `usage_ledger` charges.
 
 ## Memory And Privacy
 
@@ -131,6 +183,16 @@ Memory deletion requires exact confirmation:
 
 Deletion/tombstone flow must only affect tenant/sender-scoped memory. It must not delete messages, events, model traces, usage ledger rows, or audit/accounting data.
 
+## Current Limitations
+
+- Telegram is the primary supported channel.
+- New installs require manual Telegram bot token setup.
+- Codex subscription runtime depends on a local `codex` CLI login.
+- Claude fallback depends on a local Claude SDK/CLI setup.
+- npm and Homebrew installers are planned but not published.
+- The public installer builds from source locally.
+- Some legacy ClaudeClaw naming remains in internal extension/tool identifiers for compatibility.
+
 ## Repository Hygiene
 
 Do not commit:
@@ -147,12 +209,13 @@ Do not commit:
 
 `groups/`, `store/`, runtime logs, and local auth/session files are instance state, not source code.
 
-## Key Documentation
+## Documentation
 
 - [Install](docs/INSTALL.md)
 - [Release](docs/RELEASE.md)
 - [Memory](docs/MEMORY.md)
 - [Security](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
 
 ## Attribution
 

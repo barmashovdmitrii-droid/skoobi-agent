@@ -1,34 +1,34 @@
 # Release Process
 
-Skoobi Agent releases are created from Git tags that match `package.json` version.
-The release workflow runs CI, attaches `scripts/install.sh`, and attaches a
-SHA-256 checksum file. It does not publish npm, create a Homebrew tap, or touch
-any production runtime instance.
+Skoobi Agent releases are created from Git tags that match `package.json` version. The release workflow runs CI, attaches `scripts/install.sh`, and attaches a SHA-256 checksum file.
+
+The release workflow does not publish npm, create a Homebrew tap, or touch any runtime instance.
 
 ## Create A Release Tag
 
 1. Make sure `package.json` has the version you want to release.
 
-2. Run the local checks:
+2. Run local checks:
 
    ```bash
    PATH=/opt/homebrew/opt/node@22/bin:$PATH npm test
    PATH=/opt/homebrew/opt/node@22/bin:$PATH npm run typecheck
    PATH=/opt/homebrew/opt/node@22/bin:$PATH npm run build
    cd agent/runner && PATH=/opt/homebrew/opt/node@22/bin:$PATH npm run build
+   cd ../..
    bash -n scripts/*.sh
+   node bin/skoobi.js --help
    ```
 
-3. Create and push a matching tag:
+3. Create and push a matching public tag:
 
    ```bash
    VERSION="$(node -p "require('./package.json').version")"
-   git tag -a "v$VERSION" -m "Skoobi v$VERSION"
-   git push skoobi-private "v$VERSION"
+   git tag -a "v$VERSION" -m "Skoobi Agent v$VERSION"
+   git push origin "v$VERSION"
    ```
 
-The GitHub Actions release workflow runs only for tags shaped like `vX.Y.Z`.
-It also verifies that the tag equals `v${package.json.version}`.
+The GitHub Actions release workflow runs only for tags shaped like `vX.Y.Z`. It also verifies that the tag equals `v${package.json.version}`.
 
 ## Verify Release Assets
 
@@ -63,30 +63,45 @@ Review the installer before piping it to `bash`.
 curl -fsSL https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/latest/download/install.sh | bash
 ```
 
-For a private repository, use authenticated GitHub CLI download:
+## Release Installer Smoke
+
+Use a temporary prefix. Do not test releases against a real production instance.
 
 ```bash
-mkdir -p /tmp/skoobi-release-install
-cd /tmp/skoobi-release-install
+VERSION="$(node -p "require('./package.json').version")"
+rm -rf /tmp/skoobi-agent-release-smoke
+mkdir -p /tmp/skoobi-agent-release-smoke/home
 
-gh release download \
-  --repo barmashovdmitrii-droid/skoobi-agent \
-  --pattern install.sh
-
-bash install.sh \
-  --repo git@github.com:barmashovdmitrii-droid/skoobi-agent.git
+HOME=/tmp/skoobi-agent-release-smoke/home \
+bash /tmp/skoobi-release-check/install.sh \
+  --prefix /tmp/skoobi-agent-release-smoke \
+  --instance smoke \
+  --ref "v$VERSION" \
+  --no-service \
+  --no-start \
+  --yes
 ```
 
-If your SSH config uses a host alias, pass that clone URL instead:
+Verify:
 
 ```bash
---repo git@github.com:barmashovdmitrii-droid/skoobi-agent.git
+test -d /tmp/skoobi-agent-release-smoke/app/skoobi-agent
+test -f /tmp/skoobi-agent-release-smoke/instances/smoke/.env
+grep '^SKOOBI_TELEGRAM_GUEST_LIVE_ENABLED=' /tmp/skoobi-agent-release-smoke/instances/smoke/.env
+/tmp/skoobi-agent-release-smoke/app/skoobi-agent/bin/skoobi.js paths \
+  --prefix /tmp/skoobi-agent-release-smoke \
+  --instance smoke
+```
+
+Expected:
+
+```text
+SKOOBI_TELEGRAM_GUEST_LIVE_ENABLED="false"
 ```
 
 ## Roll Back A Release
 
-If a release is bad, do not rewrite production data. Roll back by removing the
-bad GitHub Release and tag, then use the previous release.
+If a release is bad, do not rewrite user data. Roll back by removing the bad GitHub Release and tag, then use the previous release.
 
 Delete the bad release and remote tag:
 
@@ -116,8 +131,4 @@ For an installed instance, update or reinstall from the previous good tag:
 ~/.skoobi/app/skoobi-agent/scripts/update.sh --ref vPREVIOUS.GOOD.VERSION
 ```
 
-Emergency runtime rollback remains separate from release rollback:
-
-```bash
-scripts/skoobi-global-guest-live-rollback.sh
-```
+Runtime rollback is deployment-specific and separate from release rollback. Preserve instance `.env`, `groups/`, `store/`, `logs/`, and audit/accounting data.

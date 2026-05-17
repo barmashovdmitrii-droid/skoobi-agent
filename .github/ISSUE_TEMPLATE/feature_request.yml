@@ -1,0 +1,52 @@
+name: Feature request
+description: Suggest an improvement for Skoobi Agent.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Do not include secrets, private chat logs, auth files, or runtime databases.
+
+        Private security issues should not be reported in public issues. See `SECURITY.md`.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like Skoobi Agent to do?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Telegram
+        - Installer
+        - Providers
+        - Memory
+        - Quota
+        - Security
+        - Documentation
+        - Other
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety checklist
+      options:
+        - label: This request does not require exposing secrets or private runtime data.
+          required: true
+        - label: I understand owner/admin tooling changes need a separate security review.
+          required: true

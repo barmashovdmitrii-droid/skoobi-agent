@@ -1,6 +1,6 @@
 # Security Policy
 
-Skoobi is a private Telegram assistant runtime. Security issues should be reported privately to the repository owner/operator.
+Skoobi Agent is a Telegram-first assistant runtime. Security issues should be reported privately to the repository owner/maintainer, not through public issues.
 
 ## Secrets
 

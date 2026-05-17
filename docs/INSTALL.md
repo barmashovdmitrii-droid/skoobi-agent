@@ -1,10 +1,10 @@
 # Install Skoobi Agent
 
-Skoobi can be installed from GitHub into an app/instance layout.
+Skoobi Agent installs into an app/instance layout:
 
 ```text
 ~/.skoobi/
-  app/skoobi-agent/        # code checkout
+  app/skoobi-agent/             # code checkout
   instances/default/            # user data and runtime cwd
     .env
     store/
@@ -28,94 +28,50 @@ with `WorkingDirectory` set to:
 
 That is important because Skoobi uses cwd as its state root.
 
-## macOS One-Command Install
+## Public Release Install
 
 Review `install.sh` before piping it to `bash`.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/barmashovdmitrii-droid/skoobi-agent/main/scripts/install.sh | bash
+curl -fsSL https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/latest/download/install.sh | bash
 ```
 
 or:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/barmashovdmitrii-droid/skoobi-agent/main/scripts/install.sh)
+bash <(curl -fsSL https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/latest/download/install.sh)
 ```
 
 Useful flags:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/barmashovdmitrii-droid/skoobi-agent/main/scripts/install.sh) \
+bash <(curl -fsSL https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/latest/download/install.sh) \
   --prefix "$HOME/.skoobi" \
   --instance default
 ```
 
-## Linux One-Command Install
+The release installer downloads source, checks out the requested ref, installs dependencies, builds the app, and creates an isolated instance directory.
+
+## Private Fork Install
+
+If you install from a private fork, authenticated raw GitHub URLs may return 404. Authenticate GitHub access first, then fetch the installer through `gh api` and pass your fork's SSH repo URL:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/barmashovdmitrii-droid/skoobi-agent/main/scripts/install.sh | bash
-```
-
-The installer writes a user systemd unit:
-
-```text
-~/.config/systemd/user/skoobi-default.service
-```
-
-Start/status/logs:
-
-```bash
-systemctl --user status skoobi-default
-journalctl --user -u skoobi-default -f
-```
-
-## Private GitHub Install
-
-If the repository is private, unauthenticated `raw.githubusercontent.com` may
-return 404. Authenticate GitHub access first, then fetch the installer through
-`gh api` and pass the SSH repo URL to the installer:
-
-```bash
-gh api repos/barmashovdmitrii-droid/skoobi-agent/contents/scripts/install.sh \
+gh api repos/YOUR-OWNER/skoobi-agent/contents/scripts/install.sh \
   --jq '.content' \
   | base64 --decode \
   | bash -s -- \
-      --repo git@github.com:barmashovdmitrii-droid/skoobi-agent.git
+      --repo git@github.com:YOUR-OWNER/skoobi-agent.git
 ```
 
-`gh api` downloads the private `scripts/install.sh` through your authenticated
-GitHub CLI session. `--repo git@github.com:...` is still needed because the
-installer itself clones or updates the app checkout, and that clone should use
-your SSH access to the private repository.
+`gh api` downloads the private `scripts/install.sh` through your authenticated GitHub CLI session. `--repo git@github.com:...` tells the installer which repository to clone.
 
-Alternatively, clone the repository and run the local installer:
+Alternatively, clone the fork and run the local installer:
 
 ```bash
-git clone git@github.com:barmashovdmitrii-droid/skoobi-agent.git
+git clone git@github.com:YOUR-OWNER/skoobi-agent.git
 cd skoobi-agent
 scripts/install.sh
-```
-
-## Future Public Release Install
-
-The current installer clones GitHub source and builds locally. A future public
-release should download a signed GitHub release tarball and verify checksum
-before install.
-
-## Future npm Create Path
-
-Planned, not published yet:
-
-```bash
-npm exec --yes create-skoobi@latest
-```
-
-## Future Homebrew Path
-
-Planned, not published yet:
-
-```bash
-brew install barmashovdmitrii-droid/skoobi/skoobi
 ```
 
 ## Requirements
@@ -152,8 +108,19 @@ SKOOBI_TELEGRAM_GUEST_LIVE_ENABLED=false
 SKOOBI_LIVE_CANARY_ENABLED=false
 ```
 
-`SKOOBI_TELEGRAM_GUEST_LIVE_ENABLED=false` is intentional for new installs. Set
-up Telegram and run a canary before enabling broader live behavior.
+`SKOOBI_TELEGRAM_GUEST_LIVE_ENABLED=false` is intentional for new installs. Set up Telegram and run a canary before enabling broader live behavior.
+
+## Telegram Setup
+
+Edit the instance `.env`:
+
+```bash
+$EDITOR ~/.skoobi/instances/default/.env
+```
+
+Set `TELEGRAM_BOT_TOKEN` locally in the instance `.env` to the token from BotFather.
+
+Do not commit `.env`.
 
 ## Service Management
 
@@ -180,8 +147,7 @@ The installer also offers an optional CLI symlink:
 ~/.local/bin/skoobi -> ~/.skoobi/app/skoobi-agent/bin/skoobi.js
 ```
 
-It never overwrites an existing `~/.local/bin/skoobi` without confirmation or a
-backup.
+It never overwrites an existing `~/.local/bin/skoobi` without confirmation or a backup.
 
 If the symlink is installed and `~/.local/bin` is on your `PATH`, use:
 
@@ -223,8 +189,7 @@ Default uninstall removes the service and app code, but keeps instance data:
 ~/.skoobi/app/skoobi-agent/scripts/uninstall.sh
 ```
 
-To delete data, use `--purge` and type the exact confirmation phrase. Do this
-only after backup.
+To delete data, use `--purge` and type the exact confirmation phrase. Do this only after backup.
 
 ## Troubleshooting
 
@@ -257,6 +222,15 @@ Check Claude fallback:
 
 ```bash
 claude --version
+```
+
+## Future Installers
+
+Planned, not published yet:
+
+```bash
+npm exec --yes create-skoobi@latest
+brew install barmashovdmitrii-droid/skoobi/skoobi
 ```
 
 ## Security Notes
