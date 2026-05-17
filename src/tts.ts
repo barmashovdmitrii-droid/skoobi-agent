@@ -15,6 +15,7 @@ import https from 'https';
 
 import { readEnvFile } from './orchestrator/env.js';
 import { logger } from './orchestrator/logger.js';
+import { FFMPEG_FALLBACKS, resolveBinary } from './lib/binary-paths.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -38,7 +39,9 @@ const OPENAI_VOICE =
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ttsEnv.OPENAI_API_KEY || '';
 const SAY_BIN = process.env.SAY_BIN || ttsEnv.SAY_BIN || '/usr/bin/say';
 const FFMPEG_BIN =
-  process.env.FFMPEG_BIN || ttsEnv.FFMPEG_BIN || '/opt/homebrew/bin/ffmpeg';
+  process.env.FFMPEG_BIN ||
+  ttsEnv.FFMPEG_BIN ||
+  resolveBinary('ffmpeg', FFMPEG_FALLBACKS);
 
 const MAX_CHUNK = 3000;
 

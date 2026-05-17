@@ -2755,9 +2755,16 @@ export class TelegramChannel implements Channel {
             maxBuffer: 64 * 1024,
             env: {
               ...process.env,
-              PATH:
-                '/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:' +
-                (process.env.PATH || ''),
+              PATH: [
+                path.dirname(process.execPath),
+                '/opt/homebrew/bin',
+                '/usr/local/bin',
+                '/usr/bin',
+                '/bin',
+                process.env.PATH || '',
+              ]
+                .filter(Boolean)
+                .join(':'),
             },
           },
         );

@@ -18,16 +18,23 @@ import { logger } from './orchestrator/logger.js';
 import { basenameOnly } from './lib/log-sanitize.js';
 import { folderAbsFromMediaPath, updateMediaEntry } from './media-manifest.js';
 import { transcribeAudioFile } from './transcription.js';
+import {
+  FFMPEG_FALLBACKS,
+  FFPROBE_FALLBACKS,
+  resolveBinary,
+} from './lib/binary-paths.js';
 
 const execFileAsync = promisify(execFile);
 
 const envVars = readEnvFile(['FFMPEG_BIN', 'FFPROBE_BIN']);
 const FFMPEG_BIN =
-  process.env.FFMPEG_BIN || envVars.FFMPEG_BIN || '/opt/homebrew/bin/ffmpeg';
+  process.env.FFMPEG_BIN ||
+  envVars.FFMPEG_BIN ||
+  resolveBinary('ffmpeg', FFMPEG_FALLBACKS);
 const FFPROBE_BIN =
   process.env.FFPROBE_BIN ||
   envVars.FFPROBE_BIN ||
-  FFMPEG_BIN.replace(/ffmpeg$/, 'ffprobe');
+  resolveBinary('ffprobe', FFPROBE_FALLBACKS);
 
 const TELEGRAM_VIDEO_NOTE_RETRIES = 3;
 const TELEGRAM_VIDEO_NOTE_RETRY_BASE_MS = 500;

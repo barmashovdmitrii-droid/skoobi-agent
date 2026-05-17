@@ -18,6 +18,11 @@ import { logger } from './orchestrator/logger.js';
 import { readEnvFile } from './orchestrator/env.js';
 import { basenameOnly } from './lib/log-sanitize.js';
 import {
+  FFMPEG_FALLBACKS,
+  WHISPER_FALLBACKS,
+  resolveBinary,
+} from './lib/binary-paths.js';
+import {
   folderAbsFromMediaPath,
   updateMediaEntry,
 } from './media-manifest.js';
@@ -36,7 +41,7 @@ const envVars = readEnvFile([
 const WHISPER_BIN =
   process.env.WHISPER_BIN ||
   envVars.WHISPER_BIN ||
-  '/opt/homebrew/bin/whisper-cli';
+  resolveBinary('whisper-cli', WHISPER_FALLBACKS);
 const WHISPER_MODEL = process.env.WHISPER_MODEL || envVars.WHISPER_MODEL || '';
 const WHISPER_NO_GPU =
   (process.env.WHISPER_NO_GPU || envVars.WHISPER_NO_GPU || '').toLowerCase() ===
@@ -48,7 +53,9 @@ const WHISPER_TIMEOUT_MS = parseInt(
   10,
 );
 const FFMPEG_BIN =
-  process.env.FFMPEG_BIN || envVars.FFMPEG_BIN || '/opt/homebrew/bin/ffmpeg';
+  process.env.FFMPEG_BIN ||
+  envVars.FFMPEG_BIN ||
+  resolveBinary('ffmpeg', FFMPEG_FALLBACKS);
 
 // Serialise local whisper-cli runs: large-v3 на CPU без GPU съедает 4 потока на
 // процесс, 3 параллельных voice'а = 12 потоков на 10-core M4 + ffmpeg + Node →

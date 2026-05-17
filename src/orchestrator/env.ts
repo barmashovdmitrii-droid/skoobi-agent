@@ -10,9 +10,10 @@ import { logger } from './logger.js';
  */
 /**
  * Resolve the .env file path.
- * Priority: CLAUDECLAW_ENV_FILE > cwd/.env
+ * Priority: SKOOBI_ENV_FILE > CLAUDECLAW_ENV_FILE (legacy) > cwd/.env
  */
 function resolveEnvPath(): string {
+  if (process.env.SKOOBI_ENV_FILE) return process.env.SKOOBI_ENV_FILE;
   if (process.env.CLAUDECLAW_ENV_FILE) return process.env.CLAUDECLAW_ENV_FILE;
   return path.join(process.cwd(), '.env');
 }

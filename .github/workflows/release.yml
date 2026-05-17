@@ -11,6 +11,11 @@ permissions:
 jobs:
   release:
     runs-on: macos-latest
+    env:
+      # Opt into Node.js 24 for marketplace actions ahead of the Sep 2026
+      # deprecation deadline; keeps release runs free of the deprecation
+      # annotation.
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     steps:
       - name: Checkout

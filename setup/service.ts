@@ -90,6 +90,16 @@ export async function run(_args: string[]): Promise<void> {
   }
 }
 
+function buildServicePathChain(nodePath: string, homeDir: string): string {
+  // Mirror scripts/install.sh build_service_path_chain: prepend the directory
+  // of the node binary used at setup time so launchd/systemd can find the
+  // matching node 22 even when /opt/homebrew/bin is missing (Intel macOS,
+  // non-Homebrew Linux, asdf, nvm shims).
+  const nodeBinDir = nodePath ? path.dirname(nodePath) : '';
+  const base = `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin`;
+  return nodeBinDir ? `${nodeBinDir}:${base}` : base;
+}
+
 function setupLaunchd(
   codeRoot: string,
   dataDir: string,
@@ -111,6 +121,7 @@ function setupLaunchd(
   const logDir = path.join(dataDir, 'logs');
   fs.mkdirSync(logDir, { recursive: true });
 
+  const pathChain = buildServicePathChain(nodePath, homeDir);
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -131,7 +142,7 @@ function setupLaunchd(
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin</string>
+        <string>${pathChain}</string>
         <key>HOME</key>
         <string>${homeDir}</string>
     </dict>
@@ -259,6 +270,7 @@ function setupSystemd(
   const logDir = path.join(dataDir, 'logs');
   fs.mkdirSync(logDir, { recursive: true });
 
+  const pathChain = buildServicePathChain(nodePath, homeDir);
   const unit = `[Unit]
 Description=ClaudeClaw Personal Assistant (${dirName})
 After=network.target
@@ -270,7 +282,7 @@ WorkingDirectory=${dataDir}
 Restart=always
 RestartSec=5
 Environment=HOME=${homeDir}
-Environment=PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
+Environment=PATH=${pathChain}
 StandardOutput=append:${logDir}/claudeclaw.log
 StandardError=append:${logDir}/claudeclaw.error.log
 
@@ -329,7 +341,7 @@ function setupNohupFallback(
     '',
     'set -euo pipefail',
     '',
-    `export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin"`,
+    `export PATH=${JSON.stringify(buildServicePathChain(nodePath, homeDir))}`,
     `cd ${JSON.stringify(dataDir)}`,
     '',
     '# Stop existing instance if running',

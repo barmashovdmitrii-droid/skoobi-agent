@@ -8,7 +8,16 @@ on:
 
 jobs:
   test:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # Opt into Node.js 24 for marketplace actions (checkout, setup-node, …)
+      # ahead of the September 2026 deprecation deadline. Removes the
+      # "Node.js 20 actions are deprecated" annotation on workflow runs.
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     steps:
       - name: Checkout

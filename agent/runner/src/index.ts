@@ -123,21 +123,40 @@ interface SDKUserMessage {
 
 // Runtime-agnostic path resolution:
 // Docker/Container: paths are /workspace/* via volume mounts (env vars absent, fallback used)
-// Sandbox: CLAUDECLAW_*_DIR env vars provide actual host paths
-const WORKSPACE_GROUP = process.env.CLAUDECLAW_GROUP_DIR || '/workspace/group';
-const WORKSPACE_IPC = process.env.CLAUDECLAW_IPC_DIR || '/workspace/ipc';
+// Sandbox: SKOOBI_*_DIR (preferred) or legacy CLAUDECLAW_*_DIR env vars provide
+// actual host paths. New variable names are picked up first; legacy ones stay
+// as a fallback so existing host-side launchers keep working.
+function envWithLegacy(skoobiKey: string, legacyKey: string): string | undefined {
+  return process.env[skoobiKey] || process.env[legacyKey] || undefined;
+}
+
+const WORKSPACE_GROUP =
+  envWithLegacy('SKOOBI_GROUP_DIR', 'CLAUDECLAW_GROUP_DIR') ||
+  '/workspace/group';
+const WORKSPACE_IPC =
+  envWithLegacy('SKOOBI_IPC_DIR', 'CLAUDECLAW_IPC_DIR') || '/workspace/ipc';
 const WORKSPACE_PROJECT =
-  process.env.CLAUDECLAW_PROJECT_DIR || '/workspace/project';
+  envWithLegacy('SKOOBI_PROJECT_DIR', 'CLAUDECLAW_PROJECT_DIR') ||
+  '/workspace/project';
 const WORKSPACE_GLOBAL =
-  process.env.CLAUDECLAW_GLOBAL_DIR || '/workspace/global';
-const WORKSPACE_EXTRA = process.env.CLAUDECLAW_EXTRA_DIR || '/workspace/extra';
+  envWithLegacy('SKOOBI_GLOBAL_DIR', 'CLAUDECLAW_GLOBAL_DIR') ||
+  '/workspace/global';
+const WORKSPACE_EXTRA =
+  envWithLegacy('SKOOBI_EXTRA_DIR', 'CLAUDECLAW_EXTRA_DIR') ||
+  '/workspace/extra';
 
 const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 const RUNNER_IDLE_WAIT_MS = Math.max(
   1000,
-  parseInt(process.env.CLAUDECLAW_RUNNER_IDLE_WAIT_MS || '15000', 10) || 15000,
+  parseInt(
+    envWithLegacy(
+      'SKOOBI_RUNNER_IDLE_WAIT_MS',
+      'CLAUDECLAW_RUNNER_IDLE_WAIT_MS',
+    ) || '15000',
+    10,
+  ) || 15000,
 );
 
 /**
@@ -685,9 +704,11 @@ async function runQuery(
       extraDirs.push(dir);
     }
   };
-  if (process.env.CLAUDECLAW_EXTRA_DIRS) {
+  const extraDirsEnv =
+    process.env.SKOOBI_EXTRA_DIRS || process.env.CLAUDECLAW_EXTRA_DIRS;
+  if (extraDirsEnv) {
     try {
-      const dirs = JSON.parse(process.env.CLAUDECLAW_EXTRA_DIRS);
+      const dirs = JSON.parse(extraDirsEnv);
       if (Array.isArray(dirs)) {
         for (const dir of dirs) addExtraDir(String(dir));
       }

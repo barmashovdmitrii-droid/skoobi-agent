@@ -2,6 +2,20 @@
 
 All notable changes to Skoobi Agent will be documented here.
 
+## 1.2.18 - 2026-05-17
+
+Follow-up audit cleanup: portability, supply chain, legacy alias shim.
+
+- Typecheck now covers `setup/` via a dedicated `tsconfig.typecheck.json`; caught a stale `.ts` import extension in `setup/register.ts` that the previous src-only check missed.
+- Dependency tree pins `postcss` to `^8.5.10` via `overrides`, removing the moderate XSS advisory (CVE GHSA-qx2v-qp2m-jg93). `npm audit` reports 0 vulnerabilities.
+- CI matrix runs on both `macos-latest` and `ubuntu-latest` with `fail-fast: false`, so the Linux install path documented in the README is exercised on every push.
+- Workflows set `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true`, opting marketplace actions into the Node.js 24 runtime ahead of the September 2026 deprecation deadline (closes #5).
+- New `src/lib/binary-paths.ts` resolves `ffmpeg`, `ffprobe`, and `whisper-cli` via `which` first, then Apple Silicon, Intel macOS, and Linux fallbacks; replaces the previous Apple-Silicon-only hardcoded defaults in `src/tts.ts`, `src/transcription.ts`, and `src/video-telegram.ts`.
+- Installer launchd plist and systemd unit now prepend the directory of the install-time `node` binary to the service `PATH`, so non-Homebrew node installs (Intel macOS, asdf, nvm, Linux package managers) start with a working `node` on PATH instead of relying on `/opt/homebrew/opt/node@22/bin`.
+- `setup/service.ts` (alt-installer) and `selftest` PATH in `src/channels/telegram.ts` use the same dynamic node bin directory.
+- Legacy `CLAUDECLAW_*` environment variables now have `SKOOBI_*` aliases (`SKOOBI_ENV_FILE`, `SKOOBI_GROUP_DIR`, `SKOOBI_IPC_DIR`, `SKOOBI_PROJECT_DIR`, `SKOOBI_GLOBAL_DIR`, `SKOOBI_EXTRA_DIR`, `SKOOBI_EXTRA_DIRS`, `SKOOBI_RUNNER_IDLE_WAIT_MS`). New name takes precedence; the legacy name remains a fallback so existing host-side launchers keep working without manual migration.
+- Mount and sender allowlists are looked up under `~/.config/skoobi/` first, then under the legacy `~/.config/claudeclaw/` directory. Fresh installs land on the skoobi path.
+
 ## 1.2.17 - 2026-05-17
 
 Bug-fix release closing audit findings against 1.2.16.

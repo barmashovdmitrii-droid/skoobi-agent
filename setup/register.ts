@@ -11,7 +11,7 @@ import { STORE_DIR } from '../src/orchestrator/config.js';
 import { initDatabase, setRegisteredGroup } from '../src/orchestrator/db.js';
 import { isValidGroupFolder } from '../src/orchestrator/group-folder.js';
 import { logger } from '../src/orchestrator/logger.js';
-import { emitStatus } from './status.ts';
+import { emitStatus } from './status.js';
 
 interface RegisterArgs {
   jid: string;

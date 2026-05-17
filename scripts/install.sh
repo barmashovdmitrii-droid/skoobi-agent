@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_DEFAULT="https://github.com/barmashovdmitrii-droid/skoobi-agent.git"
 REF_DEFAULT="main"
 APP_NAME="skoobi-agent"
-VERSION="1.2.17"
+VERSION="1.2.18"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P || pwd)"
 CHECKOUT_DIR="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd -P || true)"
 
@@ -263,15 +263,35 @@ resolve_default_repo_from_checkout() {
   done
 }
 
+build_service_path_chain() {
+  # PATH chain for launchd/systemd unit. The first entry is the directory of
+  # the node binary that was used at install time; subsequent entries cover
+  # Apple Silicon and Intel Homebrew prefixes plus standard system paths and
+  # user-local bin. Duplicates are harmless. node_bin_dir may be empty if
+  # node is not on PATH, in which case the chain still works via the rest.
+  local node_path="$1"
+  local home_path="$2"
+  local node_bin_dir=""
+  if [[ -n "$node_path" ]]; then
+    node_bin_dir="$(dirname "$node_path")"
+  fi
+  local chain="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$home_path/.local/bin"
+  if [[ -n "$node_bin_dir" ]]; then
+    chain="$node_bin_dir:$chain"
+  fi
+  printf '%s' "$chain"
+}
+
 launchd_plist() {
   local node_path="$1"
-  local label_esc app_esc cwd_esc out_esc err_esc home_esc
+  local label_esc app_esc cwd_esc out_esc err_esc home_esc path_esc
   label_esc="$(xml_escape "$SERVICE_LABEL")"
   app_esc="$(xml_escape "$APP_DIR/dist/service.js")"
   cwd_esc="$(xml_escape "$INSTANCE_DIR")"
   out_esc="$(xml_escape "$INSTANCE_DIR/logs/service.out.log")"
   err_esc="$(xml_escape "$INSTANCE_DIR/logs/service.err.log")"
   home_esc="$(xml_escape "$HOME")"
+  path_esc="$(xml_escape "$(build_service_path_chain "$node_path" "$HOME")")"
   cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -293,7 +313,7 @@ launchd_plist() {
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$home_esc/.local/bin</string>
+    <string>$path_esc</string>
     <key>HOME</key>
     <string>$home_esc</string>
   </dict>
@@ -308,6 +328,8 @@ EOF
 
 systemd_unit() {
   local node_path="$1"
+  local path_chain
+  path_chain="$(build_service_path_chain "$node_path" "$HOME")"
   cat <<EOF
 [Unit]
 Description=Skoobi ($INSTANCE)
@@ -320,7 +342,7 @@ WorkingDirectory="$INSTANCE_DIR"
 Restart=always
 RestartSec=5
 Environment=HOME=$HOME
-Environment=PATH=/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin
+Environment=PATH=$path_chain
 
 [Install]
 WantedBy=default.target

@@ -32,17 +32,21 @@ export const SCHEDULER_POLL_INTERVAL = 60000;
 
 const HOME_DIR = process.env.HOME || os.homedir();
 
-// Mount security: allowlist stored OUTSIDE project root, never mounted into containers
-export const MOUNT_ALLOWLIST_PATH = path.join(
-  HOME_DIR,
-  '.config',
-  'claudeclaw',
-  'mount-allowlist.json',
-);
-export const SENDER_ALLOWLIST_PATH = path.join(
-  HOME_DIR,
-  '.config',
-  'claudeclaw',
+// Mount security: allowlist stored OUTSIDE project root, never mounted into
+// containers. Skoobi-named directory is the canonical location going forward;
+// the legacy claudeclaw directory is kept as a read-only fallback so existing
+// installs keep working without manual migration. Fresh installs always land
+// on the skoobi path.
+function resolveAllowlistPath(filename: string): string {
+  const skoobi = path.join(HOME_DIR, '.config', 'skoobi', filename);
+  const legacy = path.join(HOME_DIR, '.config', 'claudeclaw', filename);
+  if (fs.existsSync(skoobi)) return skoobi;
+  if (fs.existsSync(legacy)) return legacy;
+  return skoobi;
+}
+
+export const MOUNT_ALLOWLIST_PATH = resolveAllowlistPath('mount-allowlist.json');
+export const SENDER_ALLOWLIST_PATH = resolveAllowlistPath(
   'sender-allowlist.json',
 );
 // Code root: where the claudeclaw source/dist lives.
