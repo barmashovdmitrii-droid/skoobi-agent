@@ -1,8 +1,34 @@
 # Changelog
 
-All notable changes to ClaudeClaw will be documented in this file.
+All notable changes to Skoobi Agent will be documented here.
 
-## [1.2.0](https://github.com/sbusso/claudeclaw/compare/v1.1.6...v1.2.0)
+## 1.2.16 - 2026-05-17
 
-[BREAKING] WhatsApp removed from core, now a skill. Run `/add-whatsapp` to re-add (existing auth/groups preserved).
-- **fix:** Prevent scheduled tasks from executing twice when container runtime exceeds poll interval (#138, #669)
+Public repository hygiene release.
+
+- Removed internal readiness report from public source.
+- Replaced inherited upstream changelog content with Skoobi Agent public changelog.
+- Cleaned public CI branch configuration.
+- Cleaned public documentation commands for Node.js 22 usage.
+- Kept release installer pinned to the release tag.
+
+## 1.2.15 - 2026-05-17
+
+First stable public installer release.
+
+- Release installer is pinned to the release tag.
+- Added public GitHub release installer.
+- Added app/instance install layout.
+- Added Skoobi Agent public documentation.
+- Added checksum verification for install.sh.
+
+## 1.2.14 - 2026-05-17
+
+Superseded initial public release.
+
+- Initial public release.
+- Superseded by 1.2.15 because the installer asset was not pinned to the release tag.
+
+## Attribution
+
+Skoobi Agent was derived from ClaudeClaw/NanoClaw ideas. Historical compatibility identifiers may still appear in code, but the public product identity is Skoobi Agent.

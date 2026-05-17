@@ -1,6 +1,6 @@
 {
   "name": "skoobi-agent",
-  "version": "1.2.15",
+  "version": "1.2.16",
   "description": "Telegram-first personal assistant runtime with Codex subscription primary provider and Claude SDK fallback.",
   "type": "module",
   "main": "dist/index.js",
@@ -22,8 +22,8 @@
     "selftest": "bash scripts/selftest.sh",
     "recent-errors": "bash scripts/recent-errors.sh",
     "apply:full-access": "node scripts/apply-skoobi-full-access.mjs",
-    "telegram-users": "/opt/homebrew/opt/node@22/bin/node scripts/telegram-users.mjs",
-    "smoke:telegram": "/opt/homebrew/opt/node@22/bin/node scripts/telegram-delivery-smoke.mjs",
+    "telegram-users": "node scripts/telegram-users.mjs",
+    "smoke:telegram": "node scripts/telegram-delivery-smoke.mjs",
     "smoke:voice": "bash scripts/voice-smoke.sh",
     "test": "vitest run",
     "test:watch": "vitest"

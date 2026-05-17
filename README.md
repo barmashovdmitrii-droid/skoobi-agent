@@ -192,6 +192,7 @@ Deletion/tombstone flow must only affect tenant/sender-scoped memory. It must no
 - npm and Homebrew installers are planned but not published.
 - The public installer builds from source locally.
 - Some legacy ClaudeClaw naming remains in internal extension/tool identifiers for compatibility.
+- Some internal compatibility identifiers still use the historical ClaudeClaw namespace. The public product identity is Skoobi Agent. A compatibility-safe rename is planned separately.
 
 ## Repository Hygiene
 
@@ -213,6 +214,7 @@ Do not commit:
 
 - [Install](docs/INSTALL.md)
 - [Release](docs/RELEASE.md)
+- [Roadmap](docs/ROADMAP.md)
 - [Memory](docs/MEMORY.md)
 - [Security](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)

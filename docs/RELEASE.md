@@ -10,14 +10,26 @@ The release workflow does not publish npm, create a Homebrew tap, or touch any r
 
 2. Run local checks:
 
+   Use Node.js 22. If you use `nvm`:
+
    ```bash
-   PATH=/opt/homebrew/opt/node@22/bin:$PATH npm test
-   PATH=/opt/homebrew/opt/node@22/bin:$PATH npm run typecheck
-   PATH=/opt/homebrew/opt/node@22/bin:$PATH npm run build
-   cd agent/runner && PATH=/opt/homebrew/opt/node@22/bin:$PATH npm run build
+   nvm use 22
+   ```
+
+   ```bash
+   npm test
+   npm run typecheck
+   npm run build
+   cd agent/runner && npm run build
    cd ../..
    bash -n scripts/*.sh
    node bin/skoobi.js --help
+   ```
+
+   On macOS with Homebrew Node 22, you can run:
+
+   ```bash
+   export PATH="/opt/homebrew/opt/node@22/bin:$PATH"
    ```
 
 3. Create and push a matching public tag:

@@ -11,19 +11,29 @@ Thanks for helping improve Skoobi Agent.
 
 ## Local Checks
 
+Use Node.js 22. If you use `nvm`:
+
+```bash
+nvm use 22
+```
+
 Run these before opening a pull request:
 
 ```bash
-PATH=/opt/homebrew/opt/node@22/bin:$PATH npm test
-PATH=/opt/homebrew/opt/node@22/bin:$PATH npm run typecheck
-PATH=/opt/homebrew/opt/node@22/bin:$PATH npm run build
-cd agent/runner && PATH=/opt/homebrew/opt/node@22/bin:$PATH npm run build
+npm test
+npm run typecheck
+npm run build
+cd agent/runner && npm run build
 cd ..
 bash -n scripts/*.sh
 node bin/skoobi.js --help
 ```
 
-On Linux or non-Homebrew macOS setups, use your local Node.js 22 path instead of `/opt/homebrew/opt/node@22/bin`.
+On macOS with Homebrew Node 22, you can run:
+
+```bash
+export PATH="/opt/homebrew/opt/node@22/bin:$PATH"
+```
 
 ## Pull Requests
 
