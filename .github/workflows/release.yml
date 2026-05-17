@@ -64,6 +64,19 @@ jobs:
         run: |
           mkdir -p release-assets
           cp scripts/install.sh release-assets/install.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          p = Path("release-assets/install.sh")
+          text = p.read_text()
+          tag = os.environ["GITHUB_REF_NAME"]
+          before = 'REF_DEFAULT="main"'
+          after = f'REF_DEFAULT="{tag}"'
+          if before not in text:
+            raise SystemExit("Expected REF_DEFAULT=\"main\" in scripts/install.sh")
+          p.write_text(text.replace(before, after, 1))
+          PY
           chmod +x release-assets/install.sh
           cd release-assets
           shasum -a 256 install.sh > install.sh.sha256

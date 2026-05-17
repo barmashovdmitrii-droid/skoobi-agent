@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_DEFAULT="https://github.com/barmashovdmitrii-droid/skoobi-agent.git"
 REF_DEFAULT="main"
 APP_NAME="skoobi-agent"
-VERSION="1.2.14"
+VERSION="1.2.15"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P || pwd)"
 CHECKOUT_DIR="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd -P || true)"
 
