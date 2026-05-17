@@ -1,0 +1,27 @@
+node_modules/
+dist/
+agent/runner/dist/
+store/
+store/*.db*
+data/
+data/ipc/
+groups/
+logs/
+.env
+.env.*
+models/
+
+# Installable extensions (per-instance, not checked in)
+extensions/
+
+# Brainstorm sessions
+.superpowers/
+
+# Local Codex/Claude agent skills (per-machine, not part of repo)
+.agents/
+
+# Datasette dashboard — contains hashed credentials and live runtime logs
+dashboard/
+
+# macOS metadata
+.DS_Store

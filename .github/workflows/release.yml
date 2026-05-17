@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Validate release tag
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const tag = process.env.GITHUB_REF_NAME;
+          const expected = `v${pkg.version}`;
+          if (tag !== expected) {
+            console.error(`Release tag ${tag} does not match package version ${expected}`);
+            process.exit(1);
+          }
+          NODE
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Install agent runner dependencies
+        if: hashFiles('agent/runner/package.json') != ''
+        working-directory: agent/runner
+        run: npm ci
+
+      - name: Build agent runner
+        if: hashFiles('agent/runner/package.json') != ''
+        working-directory: agent/runner
+        run: npm run build
+
+      - name: Check shell scripts
+        run: bash -n scripts/*.sh
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          cp scripts/install.sh release-assets/install.sh
+          chmod +x release-assets/install.sh
+          cd release-assets
+          shasum -a 256 install.sh > install.sh.sha256
+          cat > release-notes.md <<'EOF'
+          Skoobi release.
+
+          Assets:
+          - `install.sh`
+          - `install.sh.sha256`
+
+          This workflow does not publish npm packages, create a Homebrew tap,
+          or touch any production runtime instance.
+          EOF
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            release-assets/install.sh \
+            release-assets/install.sh.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Skoobi $GITHUB_REF_NAME" \
+            --notes-file release-assets/release-notes.md \
+            --verify-tag
