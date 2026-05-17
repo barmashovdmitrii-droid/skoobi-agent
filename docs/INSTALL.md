@@ -33,19 +33,19 @@ That is important because Skoobi uses cwd as its state root.
 Review `install.sh` before piping it to `bash`.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/skoobi-agent/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/barmashovdmitrii-droid/skoobi-agent/main/scripts/install.sh | bash
 ```
 
 or:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/OWNER/skoobi-agent/main/scripts/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/barmashovdmitrii-droid/skoobi-agent/main/scripts/install.sh)
 ```
 
 Useful flags:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/OWNER/skoobi-agent/main/scripts/install.sh) \
+bash <(curl -fsSL https://raw.githubusercontent.com/barmashovdmitrii-droid/skoobi-agent/main/scripts/install.sh) \
   --prefix "$HOME/.skoobi" \
   --instance default
 ```
@@ -53,7 +53,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/OWNER/skoobi-agent/main/scri
 ## Linux One-Command Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/skoobi-agent/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/barmashovdmitrii-droid/skoobi-agent/main/scripts/install.sh | bash
 ```
 
 The installer writes a user systemd unit:
@@ -76,11 +76,11 @@ return 404. Authenticate GitHub access first, then fetch the installer through
 `gh api` and pass the SSH repo URL to the installer:
 
 ```bash
-gh api repos/OWNER/skoobi-agent/contents/scripts/install.sh \
+gh api repos/barmashovdmitrii-droid/skoobi-agent/contents/scripts/install.sh \
   --jq '.content' \
   | base64 --decode \
   | bash -s -- \
-      --repo git@github.com:OWNER/skoobi-agent.git
+      --repo git@github.com:barmashovdmitrii-droid/skoobi-agent.git
 ```
 
 `gh api` downloads the private `scripts/install.sh` through your authenticated
@@ -91,7 +91,7 @@ your SSH access to the private repository.
 Alternatively, clone the repository and run the local installer:
 
 ```bash
-git clone git@github.com:OWNER/skoobi-agent.git
+git clone git@github.com:barmashovdmitrii-droid/skoobi-agent.git
 cd skoobi-agent
 scripts/install.sh
 ```
@@ -115,7 +115,7 @@ npm exec --yes create-skoobi@latest
 Planned, not published yet:
 
 ```bash
-brew install OWNER/skoobi/skoobi
+brew install barmashovdmitrii-droid/skoobi/skoobi
 ```
 
 ## Requirements

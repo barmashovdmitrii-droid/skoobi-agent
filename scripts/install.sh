@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_DEFAULT="https://github.com/OWNER/skoobi-agent.git"
+REPO_DEFAULT="https://github.com/barmashovdmitrii-droid/skoobi-agent.git"
 REF_DEFAULT="main"
 APP_NAME="skoobi-agent"
 VERSION="1.2.14"
@@ -42,8 +42,8 @@ Skoobi installer
 
 Usage:
   scripts/install.sh [options]
-  curl -fsSL https://github.com/OWNER/skoobi-agent/releases/latest/download/install.sh | bash
-  bash <(curl -fsSL https://github.com/OWNER/skoobi-agent/releases/latest/download/install.sh)
+  curl -fsSL https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/latest/download/install.sh | bash
+  bash <(curl -fsSL https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/latest/download/install.sh)
 
 Options:
   --prefix <path>        Install prefix (default: ~/.skoobi)
@@ -255,7 +255,7 @@ resolve_default_repo_from_checkout() {
   for remote_name in skoobi-private origin; do
     remote_url="$(git -C "$CHECKOUT_DIR" remote get-url "$remote_name" 2>/dev/null || true)"
     case "$remote_url" in
-      *OWNER/skoobi-agent.git*)
+      *barmashovdmitrii-droid/skoobi-agent.git*)
         REPO="$remote_url"
         return 0
         ;;

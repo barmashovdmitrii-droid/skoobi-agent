@@ -20,13 +20,13 @@ Review `scripts/install.sh` before piping remote shell into `bash`.
 Future public release command:
 
 ```bash
-curl -fsSL https://github.com/OWNER/skoobi-agent/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/latest/download/install.sh | bash
 ```
 
 or:
 
 ```bash
-bash <(curl -fsSL https://github.com/OWNER/skoobi-agent/releases/latest/download/install.sh)
+bash <(curl -fsSL https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/latest/download/install.sh)
 ```
 
 The installer uses an app/instance layout:
@@ -36,7 +36,7 @@ The installer uses an app/instance layout:
 ~/.skoobi/instances/default/         # .env, store, groups, logs, data
 ```
 
-Set `--repo git@github.com:OWNER/skoobi-agent.git` when installing from a private fork or when using a custom repository location.
+Set `--repo git@github.com:barmashovdmitrii-droid/skoobi-agent.git` when installing from a private fork or when using a custom repository location.
 
 See [Install](docs/INSTALL.md) for macOS/Linux service management, update, and uninstall commands.
 

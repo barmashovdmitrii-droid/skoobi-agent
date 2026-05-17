@@ -3,13 +3,13 @@
 Potential tap:
 
 ```text
-OWNER/homebrew-skoobi
+barmashovdmitrii-droid/homebrew-skoobi
 ```
 
 Potential install command:
 
 ```bash
-brew install OWNER/skoobi/skoobi
+brew install barmashovdmitrii-droid/skoobi/skoobi
 ```
 
 ## Formula
@@ -25,8 +25,8 @@ The formula should install from a GitHub release tarball:
 ```ruby
 class Skoobi < Formula
   desc "Telegram-first Skoobi assistant runtime"
-  homepage "https://github.com/OWNER/skoobi-agent"
-  url "https://github.com/OWNER/skoobi-agent/archive/refs/tags/vX.Y.Z.tar.gz"
+  homepage "https://github.com/barmashovdmitrii-droid/skoobi-agent"
+  url "https://github.com/barmashovdmitrii-droid/skoobi-agent/archive/refs/tags/vX.Y.Z.tar.gz"
   sha256 "..."
   license "..."
 

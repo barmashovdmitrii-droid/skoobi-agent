@@ -8,7 +8,7 @@ Homebrew tap from this document alone.
 The current one-line installer uses `main`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/skoobi-agent/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/barmashovdmitrii-droid/skoobi-agent/main/scripts/install.sh | bash
 ```
 
 That is convenient during private development, but it is not ideal for a stable
@@ -18,7 +18,7 @@ it can be tied to a tag, changelog, checksum, and tested build.
 Future release command:
 
 ```bash
-curl -fsSL https://github.com/OWNER/skoobi-agent/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/latest/download/install.sh | bash
 ```
 
 Users should still review `install.sh` before piping it to `bash`.
@@ -59,11 +59,11 @@ No npm package is published yet.
 Planned command:
 
 ```bash
-brew install OWNER/skoobi/skoobi
+brew install barmashovdmitrii-droid/skoobi/skoobi
 ```
 
 The future tap can live in a repository such as
-`OWNER/homebrew-skoobi` and include
+`barmashovdmitrii-droid/homebrew-skoobi` and include
 `Formula/skoobi.rb`. The formula should install from a tagged GitHub release
 tarball with a pinned SHA-256 checksum.
 

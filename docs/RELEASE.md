@@ -36,7 +36,7 @@ After the workflow finishes, check the release:
 
 ```bash
 gh release view "v$(node -p "require('./package.json').version")" \
-  --repo OWNER/skoobi-agent
+  --repo barmashovdmitrii-droid/skoobi-agent
 ```
 
 Download and verify `install.sh`:
@@ -47,7 +47,7 @@ mkdir -p /tmp/skoobi-release-check
 cd /tmp/skoobi-release-check
 
 gh release download "v$VERSION" \
-  --repo OWNER/skoobi-agent \
+  --repo barmashovdmitrii-droid/skoobi-agent \
   --pattern 'install.sh*'
 
 shasum -a 256 -c install.sh.sha256
@@ -60,7 +60,7 @@ bash -n install.sh
 Review the installer before piping it to `bash`.
 
 ```bash
-curl -fsSL https://github.com/OWNER/skoobi-agent/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/latest/download/install.sh | bash
 ```
 
 For a private repository, use authenticated GitHub CLI download:
@@ -70,17 +70,17 @@ mkdir -p /tmp/skoobi-release-install
 cd /tmp/skoobi-release-install
 
 gh release download \
-  --repo OWNER/skoobi-agent \
+  --repo barmashovdmitrii-droid/skoobi-agent \
   --pattern install.sh
 
 bash install.sh \
-  --repo git@github.com:OWNER/skoobi-agent.git
+  --repo git@github.com:barmashovdmitrii-droid/skoobi-agent.git
 ```
 
 If your SSH config uses a host alias, pass that clone URL instead:
 
 ```bash
---repo git@github.com:OWNER/skoobi-agent.git
+--repo git@github.com:barmashovdmitrii-droid/skoobi-agent.git
 ```
 
 ## Roll Back A Release
@@ -93,7 +93,7 @@ Delete the bad release and remote tag:
 ```bash
 BAD_VERSION="vX.Y.Z"
 gh release delete "$BAD_VERSION" \
-  --repo OWNER/skoobi-agent \
+  --repo barmashovdmitrii-droid/skoobi-agent \
   --cleanup-tag \
   --yes
 ```
@@ -107,7 +107,7 @@ git tag -d "$BAD_VERSION" || true
 Verify that `latest` points back to the previous good release:
 
 ```bash
-gh release view --repo OWNER/skoobi-agent
+gh release view --repo barmashovdmitrii-droid/skoobi-agent
 ```
 
 For an installed instance, update or reinstall from the previous good tag:
