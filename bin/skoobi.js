@@ -153,8 +153,6 @@ function logs(paths) {
   const files = [
     path.join(paths.logsDir, 'service.out.log'),
     path.join(paths.logsDir, 'service.err.log'),
-    path.join(paths.logsDir, 'service.out.log'),
-    path.join(paths.logsDir, 'service.err.log'),
   ].filter((file) => fs.existsSync(file));
   if (files.length === 0) {
     console.log(`No log files found in ${paths.logsDir}`);

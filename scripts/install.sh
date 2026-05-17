@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_DEFAULT="https://github.com/barmashovdmitrii-droid/skoobi-agent.git"
 REF_DEFAULT="main"
 APP_NAME="skoobi-agent"
-VERSION="1.2.16"
+VERSION="1.2.17"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P || pwd)"
 CHECKOUT_DIR="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd -P || true)"
 
@@ -581,8 +581,8 @@ health_check() {
     return 0
   fi
   log "Health:"
-  if [[ -f "$INSTANCE_DIR/store/messages' + '.db" ]]; then
-    log "  DB exists: $INSTANCE_DIR/store/messages' + '.db"
+  if [[ -f "$INSTANCE_DIR/store/messages.db" ]]; then
+    log "  DB exists: $INSTANCE_DIR/store/messages.db"
   else
     log "  DB not created yet. It should appear after first service startup."
   fi

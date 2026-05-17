@@ -783,7 +783,6 @@ async function runQuery(
     WORKSPACE_GLOBAL,
     ...uniqueExtraDirs,
     '/',
-    '/Users/example',
     '/tmp',
     '/private/tmp',
     '/var/folders',

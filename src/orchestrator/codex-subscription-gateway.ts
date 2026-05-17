@@ -480,7 +480,7 @@ function classifyCodexFailure(
   if (
     combined.includes('timeout') ||
     combined.includes('temporarily unavailable') ||
-    combined.includes(' 5')
+    /\b5\d{2}\b/.test(combined)
   ) {
     return new CodexSubscriptionRuntimeError(
       'Codex CLI transient failure',
