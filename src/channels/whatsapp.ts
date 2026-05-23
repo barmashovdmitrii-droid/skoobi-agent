@@ -327,17 +327,19 @@ export class WhatsAppChannel implements Channel {
     if (!this.opts.registerGroup) return;
     const existing = this.opts.registeredGroups()[chatJid];
     if (existing) return;
+    const phone = chatJid.slice(3);
+    const folder = `${this.opts.defaultFolder}__wa_${phone}`;
     const group: RegisteredGroup = {
       name: displayName || chatJid,
-      folder: this.opts.defaultFolder,
+      folder,
       trigger: '',
       added_at: new Date().toISOString(),
       requiresTrigger: false,
     };
     this.opts.registerGroup(chatJid, group);
     logger.info(
-      { chatJid, folder: this.opts.defaultFolder },
-      'WhatsApp: auto-registered chat → default folder',
+      { chatJid, folder },
+      'WhatsApp: auto-registered chat → per-customer folder',
     );
   }
 

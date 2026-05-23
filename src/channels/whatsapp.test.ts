@@ -5,7 +5,9 @@ import {
   extractMessageText,
   normalizeWhatsappPhone,
   skoobiJidFromBaileysJid,
+  WhatsAppChannel,
 } from './whatsapp.js';
+import type { NewMessage, RegisteredGroup } from '../orchestrator/types.js';
 
 describe('normalizeWhatsappPhone', () => {
   it('strips +, spaces, parens, dashes', () => {
@@ -111,5 +113,52 @@ describe('detectMediaKind', () => {
         message: { conversation: 'plain' },
       } as any),
     ).toBeNull();
+  });
+});
+
+function createHarness() {
+  const groups: Record<string, RegisteredGroup> = {};
+  const messages: NewMessage[] = [];
+  const metadata: Array<{
+    jid: string;
+    displayName?: string;
+    channel?: string;
+  }> = [];
+  const channel = new WhatsAppChannel({
+    authDir: '/tmp/skoobi-wa-test-auth',
+    defaultFolder: 'main',
+    onMessage: (_jid, message) => messages.push(message),
+    onChatMetadata: (jid, _timestamp, displayName, channelName) => {
+      metadata.push({ jid, displayName, channel: channelName });
+    },
+    registeredGroups: () => groups,
+    registerGroup: (jid, group) => {
+      groups[jid] = group;
+    },
+  });
+  return { channel, groups, messages, metadata };
+}
+
+describe('WhatsAppChannel inbound handling', () => {
+  it('uses per-chat unique folder, not the shared defaultFolder', () => {
+    const { channel, groups } = createHarness();
+
+    (channel as any).handleInbound({
+      key: {
+        id: 'm1',
+        fromMe: false,
+        remoteJid: '77010000000@s.whatsapp.net',
+      },
+      message: { conversation: 'hello' },
+      pushName: 'Customer',
+      messageTimestamp: 1_700_000_000,
+    });
+
+    expect(groups['wa:77010000000']).toMatchObject({
+      name: 'Customer',
+      folder: 'main__wa_77010000000',
+      requiresTrigger: false,
+    });
+    expect(groups['wa:77010000000'].folder).not.toBe('main');
   });
 });
