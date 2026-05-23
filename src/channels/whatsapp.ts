@@ -388,7 +388,12 @@ export class WhatsAppChannel implements Channel {
     if (!this.socket || !this.connected) {
       throw new Error('WhatsApp: socket not connected');
     }
+    logger.info(
+      { jid, target, length: text.length },
+      'WhatsApp: sendMessage attempt',
+    );
     await this.socket.sendMessage(target, { text });
+    logger.info({ jid, target, length: text.length }, 'WhatsApp: message sent');
   }
 
   isConnected(): boolean {
