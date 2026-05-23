@@ -67,7 +67,10 @@ describe('MessageRouter', () => {
     const slack = mockChannel('slack', 'C');
     const router = createMessageRouter([slack]);
 
-    router.addPreHook(async () => ({ action: 'drop' as const, reason: 'blocked' }));
+    router.addPreHook(async () => ({
+      action: 'drop' as const,
+      reason: 'blocked',
+    }));
 
     await router.route({
       chatJid: 'C123',
@@ -184,24 +187,30 @@ describe('MessageRouter', () => {
     const slack = mockChannel('slack', 'C');
     const router = createMessageRouter([slack]);
 
-    await expect(router.route({
-      chatJid: 'unknown-jid',
-      text: 'hello',
-      triggerType: 'agent-response',
-    })).rejects.toThrow('No connected channel for JID');
+    await expect(
+      router.route({
+        chatJid: 'unknown-jid',
+        text: 'hello',
+        triggerType: 'agent-response',
+      }),
+    ).rejects.toThrow('No connected channel for JID');
 
     expect(slack.sendMessage).not.toHaveBeenCalled();
   });
 
   it('throws when the owning channel fails delivery', async () => {
     const slack = mockChannel('slack', 'C');
-    vi.mocked(slack.sendMessage).mockRejectedValueOnce(new Error('send failed'));
+    vi.mocked(slack.sendMessage).mockRejectedValueOnce(
+      new Error('send failed'),
+    );
     const router = createMessageRouter([slack]);
 
-    await expect(router.route({
-      chatJid: 'C123',
-      text: 'hello',
-      triggerType: 'agent-response',
-    })).rejects.toThrow('send failed');
+    await expect(
+      router.route({
+        chatJid: 'C123',
+        text: 'hello',
+        triggerType: 'agent-response',
+      }),
+    ).rejects.toThrow('send failed');
   });
 });

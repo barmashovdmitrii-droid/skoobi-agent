@@ -74,10 +74,7 @@ export async function downloadTelegramPhoto(
     await downloadUrl(dlUrl, dest);
 
     const stat = await fs.stat(dest);
-    logger.info(
-      { fileId, dest, bytes: stat.size },
-      'Saved Telegram photo',
-    );
+    logger.info({ fileId, dest, bytes: stat.size }, 'Saved Telegram photo');
     return dest;
   } catch (err) {
     logger.error({ err, fileId }, 'Telegram photo download failed');

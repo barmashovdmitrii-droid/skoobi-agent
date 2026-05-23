@@ -2,7 +2,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import crypto from 'crypto';
 import http from 'http';
 import { verifySignature, startWebhookServer } from './server.js';
-import type { IngestionEnvelope, MessageIngestion } from '../orchestrator/types.js';
+import type {
+  IngestionEnvelope,
+  MessageIngestion,
+} from '../orchestrator/types.js';
 
 describe('verifySignature', () => {
   const secret = 'test-secret-key';
@@ -52,7 +55,9 @@ describe('webhook server HTTP', () => {
         { hostname: '127.0.0.1', port, path: urlPath, method, headers },
         (res) => {
           let data = '';
-          res.on('data', (chunk: string) => { data += chunk; });
+          res.on('data', (chunk: string) => {
+            data += chunk;
+          });
           res.on('end', () => {
             resolve({ status: res.statusCode!, body: JSON.parse(data) });
           });
@@ -85,7 +90,8 @@ describe('webhook server HTTP', () => {
     server = startWebhookServer(0, secret, {
       ingestion: createMockIngestion(),
       findGroupByFolder: (folder) => {
-        if (folder === 'test-group') return { jid: 'test-jid@g.us', name: 'Test Group' };
+        if (folder === 'test-group')
+          return { jid: 'test-jid@g.us', name: 'Test Group' };
         return undefined;
       },
     });
@@ -123,7 +129,8 @@ describe('webhook server HTTP', () => {
   it('returns 401 for invalid signature', async () => {
     const body = JSON.stringify({ prompt: 'test' });
     const res = await makeRequest(port, 'POST', '/webhook/test-group', body, {
-      'x-signature': 'badsignature00000000000000000000000000000000000000000000000000000',
+      'x-signature':
+        'badsignature00000000000000000000000000000000000000000000000000000',
       'content-type': 'application/json',
     });
     expect(res.status).toBe(401);

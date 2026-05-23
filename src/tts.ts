@@ -36,7 +36,8 @@ const PROVIDER = (
 const LOCAL_VOICE = process.env.TTS_VOICE || ttsEnv.TTS_VOICE || 'Milena';
 const OPENAI_VOICE =
   process.env.TTS_VOICE_OPENAI || ttsEnv.TTS_VOICE_OPENAI || 'nova';
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ttsEnv.OPENAI_API_KEY || '';
+const OPENAI_API_KEY =
+  process.env.OPENAI_API_KEY || ttsEnv.OPENAI_API_KEY || '';
 const SAY_BIN = process.env.SAY_BIN || ttsEnv.SAY_BIN || '/usr/bin/say';
 const FFMPEG_BIN =
   process.env.FFMPEG_BIN ||

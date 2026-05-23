@@ -61,7 +61,9 @@ const channel = new WhatsAppChannel({
 async function main() {
   logger.info({ authDir }, 'SMOKE: starting WhatsApp channel');
   await channel.connect();
-  logger.info('SMOKE: connect() resolved — waiting for messages (Ctrl+C to exit)');
+  logger.info(
+    'SMOKE: connect() resolved — waiting for messages (Ctrl+C to exit)',
+  );
 }
 
 process.on('SIGINT', async () => {

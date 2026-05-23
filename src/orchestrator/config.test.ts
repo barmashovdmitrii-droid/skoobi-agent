@@ -35,6 +35,8 @@ describe('config path resolution', () => {
   it('derives DATA_DIR from STATE_ROOT', async () => {
     const config = await import('./config.js');
     expect(config.DATA_DIR).toContain('data');
-    expect(config.DATA_DIR).toBe(require('path').resolve(process.cwd(), 'data'));
+    expect(config.DATA_DIR).toBe(
+      require('path').resolve(process.cwd(), 'data'),
+    );
   });
 });

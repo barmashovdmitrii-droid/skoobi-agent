@@ -173,7 +173,12 @@ async function extractWithTextutil(filePath: string): Promise<string> {
 
 export async function extractDocumentPreview(
   filePath: string,
-): Promise<Pick<TelegramDocumentResult, 'preview' | 'extractedChars' | 'extractionStatus'>> {
+): Promise<
+  Pick<
+    TelegramDocumentResult,
+    'preview' | 'extractedChars' | 'extractionStatus'
+  >
+> {
   try {
     const stat = await fs.stat(filePath);
     if (stat.size > MAX_EXTRACT_BYTES) {
@@ -186,7 +191,9 @@ export async function extractDocumentPreview(
 
     const ext = path.extname(filePath).toLowerCase();
     let text: string | null = null;
-    if (['.txt', '.md', '.csv', '.tsv', '.json', '.xml', '.html'].includes(ext)) {
+    if (
+      ['.txt', '.md', '.csv', '.tsv', '.json', '.xml', '.html'].includes(ext)
+    ) {
       text = await extractPlainText(filePath);
     } else if (ext === '.pdf') {
       text = await extractPdfText(filePath);
@@ -260,7 +267,8 @@ export async function processTelegramDocument(
 
     const remotePath = String(fileInfo.result.file_path);
     const ext = extensionFor(remotePath, originalName);
-    const stem = originalName.replace(/\.[^.]+$/, '').slice(0, 80) || 'document';
+    const stem =
+      originalName.replace(/\.[^.]+$/, '').slice(0, 80) || 'document';
     const ts = new Date().toISOString().replace(/[:.]/g, '-');
     const dest = path.join(
       receivedDir,

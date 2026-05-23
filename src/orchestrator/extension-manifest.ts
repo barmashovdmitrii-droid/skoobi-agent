@@ -14,7 +14,7 @@ export interface ExtensionManifest {
     dbSchema?: boolean;
     envKeys?: string[];
     containerEnvKeys?: string[];
-    allowedDomains?: string[];   // Network domains this extension needs (merged into sandbox settings)
+    allowedDomains?: string[]; // Network domains this extension needs (merged into sandbox settings)
   };
   skills?: string[];
   agents?: string[];
@@ -33,12 +33,21 @@ export interface LoadResult {
   error?: string;
 }
 
-export function validateManifest(data: unknown): { valid: boolean; error?: string; manifest?: ExtensionManifest } {
-  if (!data || typeof data !== 'object') return { valid: false, error: 'Manifest is not an object' };
+export function validateManifest(data: unknown): {
+  valid: boolean;
+  error?: string;
+  manifest?: ExtensionManifest;
+} {
+  if (!data || typeof data !== 'object')
+    return { valid: false, error: 'Manifest is not an object' };
   const d = data as Record<string, unknown>;
-  if (typeof d.name !== 'string' || !d.name) return { valid: false, error: 'Missing or invalid "name"' };
-  if (typeof d.version !== 'string') return { valid: false, error: 'Missing or invalid "version"' };
-  if (d.type !== 'channel' && d.type !== 'extension') return { valid: false, error: '"type" must be "channel" or "extension"' };
-  if (typeof d.entry !== 'string' || !d.entry) return { valid: false, error: 'Missing or invalid "entry"' };
+  if (typeof d.name !== 'string' || !d.name)
+    return { valid: false, error: 'Missing or invalid "name"' };
+  if (typeof d.version !== 'string')
+    return { valid: false, error: 'Missing or invalid "version"' };
+  if (d.type !== 'channel' && d.type !== 'extension')
+    return { valid: false, error: '"type" must be "channel" or "extension"' };
+  if (typeof d.entry !== 'string' || !d.entry)
+    return { valid: false, error: 'Missing or invalid "entry"' };
   return { valid: true, manifest: data as ExtensionManifest };
 }

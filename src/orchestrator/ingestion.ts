@@ -26,9 +26,7 @@ export interface IngestionDeps {
   enqueueMessageCheck: (chatJid: string) => void;
 }
 
-export function createMessageIngestion(
-  deps: IngestionDeps,
-): MessageIngestion {
+export function createMessageIngestion(deps: IngestionDeps): MessageIngestion {
   const preHooks: IngestionPreHook[] = [];
   const postHooks: ((envelope: IngestionEnvelope) => void)[] = [];
 
