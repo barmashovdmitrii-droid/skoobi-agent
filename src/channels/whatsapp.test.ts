@@ -161,4 +161,32 @@ describe('WhatsAppChannel inbound handling', () => {
     });
     expect(groups['wa:77010000000'].folder).not.toBe('main');
   });
+
+  it('falls back to remoteJidAlt when remoteJid is a LID', () => {
+    const { channel, messages, metadata } = createHarness();
+
+    (channel as any).handleInbound({
+      key: {
+        id: 'm1',
+        fromMe: false,
+        remoteJid: '123456789@lid',
+        remoteJidAlt: '77010000000@s.whatsapp.net',
+      },
+      message: { conversation: 'hello from lid' },
+      pushName: 'LID Customer',
+      messageTimestamp: 1_700_000_000,
+    });
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      chat_jid: 'wa:77010000000',
+      sender: '77010000000',
+      content: 'hello from lid',
+    });
+    expect(metadata[0]).toMatchObject({
+      jid: 'wa:77010000000',
+      displayName: 'LID Customer',
+      channel: 'whatsapp',
+    });
+  });
 });

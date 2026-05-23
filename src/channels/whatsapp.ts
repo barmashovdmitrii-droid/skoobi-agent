@@ -272,8 +272,7 @@ export class WhatsAppChannel implements Channel {
   private handleInbound(msg: WAMessage): void {
     if (msg.key.fromMe) return;
     if (!msg.message) return;
-    const remoteJid = msg.key.remoteJid ?? '';
-    const chatJid = skoobiJidFromBaileysJid(remoteJid);
+    const chatJid = this.extractChatJid(msg);
     if (!chatJid) {
       // Skip groups (@g.us), broadcasts, status updates, etc.
       return;
@@ -319,9 +318,23 @@ export class WhatsAppChannel implements Channel {
   }
 
   /**
-   * Auto-register this chat against the channel's `defaultFolder` so the
-   * orchestrator has a tenant to route through. Users can later override the
-   * routing via `groups/<folder>/tenant.json`.
+   * Prefer phone-number JIDs over Linked Identity (LID) JIDs. Baileys can put
+   * the PN JID in remoteJidAlt for modern 1:1 chats whose primary remoteJid is
+   * `@lid`.
+   */
+  private extractChatJid(msg: WAMessage): string | null {
+    const primary = msg.key.remoteJid ?? '';
+    const alt = (msg.key as any).remoteJidAlt as string | undefined;
+    if (alt && alt.endsWith('@s.whatsapp.net')) {
+      return skoobiJidFromBaileysJid(alt);
+    }
+    return skoobiJidFromBaileysJid(primary);
+  }
+
+  /**
+   * Auto-register this chat against a per-customer folder so the orchestrator
+   * has an isolated tenant namespace. Users can later override the routing via
+   * `groups/<folder>/tenant.json`.
    */
   private ensureGroupRegistered(chatJid: string, displayName: string): void {
     if (!this.opts.registerGroup) return;
