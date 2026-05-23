@@ -90,8 +90,34 @@ export function baileysJidFromSkoobiJid(jid: string): string | null {
   return digits ? `${digits}@s.whatsapp.net` : null;
 }
 
+function unwrapMessage(m: any): any {
+  if (!m) return m;
+  if (m.ephemeralMessage?.message) {
+    return unwrapMessage(m.ephemeralMessage.message);
+  }
+  if (m.viewOnceMessage?.message) {
+    return unwrapMessage(m.viewOnceMessage.message);
+  }
+  if (m.viewOnceMessageV2?.message) {
+    return unwrapMessage(m.viewOnceMessageV2.message);
+  }
+  if (m.viewOnceMessageV2Extension?.message) {
+    return unwrapMessage(m.viewOnceMessageV2Extension.message);
+  }
+  if (m.documentWithCaptionMessage?.message) {
+    return unwrapMessage(m.documentWithCaptionMessage.message);
+  }
+  if (m.editedMessage?.message) {
+    return unwrapMessage(m.editedMessage.message);
+  }
+  if (m.protocolMessage?.editedMessage) {
+    return unwrapMessage(m.protocolMessage.editedMessage);
+  }
+  return m;
+}
+
 export function extractMessageText(msg: WAMessage): string {
-  const m = msg.message;
+  const m = unwrapMessage(msg.message);
   if (!m) return '';
   return (
     m.conversation ??
@@ -104,7 +130,7 @@ export function extractMessageText(msg: WAMessage): string {
 }
 
 export function detectMediaKind(msg: WAMessage): string | null {
-  const m = msg.message;
+  const m = unwrapMessage(msg.message);
   if (!m) return null;
   if (m.imageMessage) return 'image';
   if (m.videoMessage) return 'video';

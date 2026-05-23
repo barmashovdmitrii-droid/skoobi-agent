@@ -87,6 +87,54 @@ describe('extractMessageText', () => {
       '',
     );
   });
+  it('extracts text from ephemeralMessage wrapper', () => {
+    expect(
+      extractMessageText({
+        key: { id: '1' },
+        message: {
+          ephemeralMessage: {
+            message: { conversation: 'wrapped' },
+          },
+        },
+      } as any),
+    ).toBe('wrapped');
+  });
+  it('extracts text from viewOnceMessage wrapper', () => {
+    expect(
+      extractMessageText({
+        key: { id: '1' },
+        message: {
+          viewOnceMessage: {
+            message: { extendedTextMessage: { text: 'view once' } },
+          },
+        },
+      } as any),
+    ).toBe('view once');
+  });
+  it('extracts text from viewOnceMessageV2 wrapper', () => {
+    expect(
+      extractMessageText({
+        key: { id: '1' },
+        message: {
+          viewOnceMessageV2: {
+            message: { conversation: 'view once v2' },
+          },
+        },
+      } as any),
+    ).toBe('view once v2');
+  });
+  it('extracts caption from documentWithCaptionMessage', () => {
+    expect(
+      extractMessageText({
+        key: { id: '1' },
+        message: {
+          documentWithCaptionMessage: {
+            message: { documentMessage: { caption: 'doc caption' } },
+          },
+        },
+      } as any),
+    ).toBe('doc caption');
+  });
 });
 
 describe('detectMediaKind', () => {
@@ -113,6 +161,18 @@ describe('detectMediaKind', () => {
         message: { conversation: 'plain' },
       } as any),
     ).toBeNull();
+  });
+  it('detects media kind through ephemeralMessage', () => {
+    expect(
+      detectMediaKind({
+        key: { id: '1' },
+        message: {
+          ephemeralMessage: {
+            message: { imageMessage: { caption: 'photo' } },
+          },
+        },
+      } as any),
+    ).toBe('image');
   });
 });
 
