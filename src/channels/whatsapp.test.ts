@@ -176,7 +176,9 @@ describe('detectMediaKind', () => {
   });
 });
 
-function createHarness() {
+function createHarness(
+  opts: { autoRegisterMode?: 'all' | 'business_hint' } = {},
+) {
   const groups: Record<string, RegisteredGroup> = {};
   const messages: NewMessage[] = [];
   const metadata: Array<{
@@ -187,6 +189,7 @@ function createHarness() {
   const channel = new WhatsAppChannel({
     authDir: '/tmp/skoobi-wa-test-auth',
     defaultFolder: 'main',
+    autoRegisterMode: opts.autoRegisterMode,
     onMessage: (_jid, message) => messages.push(message),
     onChatMetadata: (jid, _timestamp, displayName, channelName) => {
       metadata.push({ jid, displayName, channel: channelName });
@@ -247,6 +250,61 @@ describe('WhatsAppChannel inbound handling', () => {
       jid: 'wa:77010000000',
       displayName: 'LID Customer',
       channel: 'whatsapp',
+    });
+  });
+
+  it('ignores unregistered chats without a business hint in business_hint mode', () => {
+    const { channel, groups, messages, metadata } = createHarness({
+      autoRegisterMode: 'business_hint',
+    });
+
+    (channel as any).handleInbound({
+      key: {
+        id: 'm1',
+        fromMe: false,
+        remoteJid: '77755729697@s.whatsapp.net',
+      },
+      message: { conversation: 'Однокурсник🔥' },
+      pushName: 'Aigul AUBAKIROVA',
+      messageTimestamp: 1_700_000_000,
+    });
+
+    expect(groups['wa:77755729697']).toBeUndefined();
+    expect(messages).toHaveLength(0);
+    expect(metadata).toEqual([
+      {
+        jid: 'wa:77755729697',
+        displayName: 'Aigul AUBAKIROVA',
+        channel: 'whatsapp',
+      },
+    ]);
+  });
+
+  it('auto-registers business-like chats in business_hint mode', () => {
+    const { channel, groups, messages } = createHarness({
+      autoRegisterMode: 'business_hint',
+    });
+
+    (channel as any).handleInbound({
+      key: {
+        id: 'm1',
+        fromMe: false,
+        remoteJid: '77010000000@s.whatsapp.net',
+      },
+      message: { conversation: 'Мне нужна фара на Киа Сид 2010 года' },
+      pushName: 'Parts Customer',
+      messageTimestamp: 1_700_000_000,
+    });
+
+    expect(groups['wa:77010000000']).toMatchObject({
+      name: 'Parts Customer',
+      folder: 'main__wa_77010000000',
+      requiresTrigger: false,
+    });
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      chat_jid: 'wa:77010000000',
+      content: 'Мне нужна фара на Киа Сид 2010 года',
     });
   });
 });

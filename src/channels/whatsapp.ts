@@ -30,6 +30,7 @@ import qrTerminal from 'qrcode-terminal';
 import QRCode from 'qrcode';
 
 import { DATA_DIR } from '../orchestrator/config.js';
+import { shouldCreateAutopartsRequest } from '../integrations/autoparts-payload.js';
 import { readEnvFile } from '../orchestrator/env.js';
 import { logger } from '../orchestrator/logger.js';
 import {
@@ -59,6 +60,7 @@ const TYPING_MAX_DURATION_MS = 5 * 60 * 1000;
 export interface WhatsAppChannelOpts {
   authDir: string;
   defaultFolder: string;
+  autoRegisterMode?: 'all' | 'business_hint';
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
@@ -313,6 +315,24 @@ export class WhatsAppChannel implements Channel {
         : Date.now(),
     ).toISOString();
 
+    if (
+      !this.opts.registeredGroups()[chatJid] &&
+      !this.shouldAutoRegisterChat(text, mediaKind)
+    ) {
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        pushName || phone,
+        'whatsapp',
+        false,
+      );
+      logger.info(
+        { chatJid, pushName, mediaKind, preview: text.slice(0, 80) },
+        'WhatsApp: unregistered chat ignored without business hint',
+      );
+      return;
+    }
+
     this.ensureGroupRegistered(chatJid, pushName);
     this.opts.onChatMetadata(
       chatJid,
@@ -356,6 +376,18 @@ export class WhatsAppChannel implements Channel {
       return skoobiJidFromBaileysJid(alt);
     }
     return skoobiJidFromBaileysJid(primary);
+  }
+
+  private shouldAutoRegisterChat(
+    text: string,
+    mediaKind?: string | null,
+  ): boolean {
+    if ((this.opts.autoRegisterMode || 'all') === 'all') return true;
+    return shouldCreateAutopartsRequest({
+      text,
+      content: text || (mediaKind ? `[${mediaKind}]` : ''),
+      mediaKind,
+    });
   }
 
   /**
@@ -458,6 +490,7 @@ registerChannel('whatsapp', (opts: ChannelOpts) => {
     'WHATSAPP_CHANNEL_ENABLED',
     'WHATSAPP_AUTH_DIR',
     'WHATSAPP_DEFAULT_FOLDER',
+    'WHATSAPP_AUTO_REGISTER_MODE',
   ]);
   const enabled =
     (process.env.WHATSAPP_CHANNEL_ENABLED ||
@@ -475,9 +508,14 @@ registerChannel('whatsapp', (opts: ChannelOpts) => {
     process.env.WHATSAPP_DEFAULT_FOLDER ||
     envVars.WHATSAPP_DEFAULT_FOLDER ||
     'main';
+  const autoRegisterMode =
+    process.env.WHATSAPP_AUTO_REGISTER_MODE ||
+    envVars.WHATSAPP_AUTO_REGISTER_MODE;
   return new WhatsAppChannel({
     authDir,
     defaultFolder,
+    autoRegisterMode:
+      autoRegisterMode === 'business_hint' ? 'business_hint' : 'all',
     onMessage: opts.onMessage,
     onChatMetadata: opts.onChatMetadata,
     registeredGroups: opts.registeredGroups,

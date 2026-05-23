@@ -280,6 +280,7 @@ function currentTenantRegistry(): TenantRegistry {
 function recordAutopartsWhatsAppInbound(message: NewMessage): void {
   if (!autopartsWhatsAppBridge) return;
   if (!message.chat_jid.startsWith('wa:')) return;
+  if (registeredGroups[message.chat_jid]?.requiresTrigger !== false) return;
   autopartsWhatsAppBridge
     .recordInbound({
       chatJid: message.chat_jid,
