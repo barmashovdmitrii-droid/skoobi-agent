@@ -49,6 +49,30 @@ describe('tenant instruction loader', () => {
     expect(path.basename(findTenantInstructions(dir)!)).toBe('SKOOBI.md');
   });
 
+  it('loads instructions.md as tenant instructions', () => {
+    const dir = makeTmpDir();
+    fs.writeFileSync(path.join(dir, 'instructions.md'), 'plain instructions');
+
+    expect(loadTenantInstructions(dir)).toMatchObject({
+      filename: 'instructions.md',
+      content: 'plain instructions',
+    });
+  });
+
+  it('falls back to parent folder instructions for inherited customer folders', () => {
+    const root = makeTmpDir();
+    const parent = path.join(root, 'main');
+    const child = path.join(root, 'main__wa_77010000000');
+    fs.mkdirSync(parent, { recursive: true });
+    fs.mkdirSync(child, { recursive: true });
+    fs.writeFileSync(path.join(parent, 'instructions.md'), 'shared prompt');
+
+    expect(loadTenantInstructions(child)).toMatchObject({
+      filename: 'instructions.md',
+      content: 'shared prompt',
+    });
+  });
+
   it('injects AGENT.md without duplicating CLAUDE.md system context', () => {
     const dir = makeTmpDir();
     const folder = path.basename(dir);

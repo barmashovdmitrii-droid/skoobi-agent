@@ -960,6 +960,17 @@ async function processGroupMessages(
         timestamp: new Date().toISOString(),
       },
     });
+    logger.info(
+      {
+        chatJid,
+        tenantId: tenantForRun.tenant_id,
+        groupFolder: agentGroup.folder,
+        replyJid,
+        runtime: 'skoobi_live',
+        liveSelectionReason,
+      },
+      'runtime_selected',
+    );
 
     let liveRun: Awaited<ReturnType<typeof runLiveModelTurn>> | undefined;
     let liveThrownError: unknown;
