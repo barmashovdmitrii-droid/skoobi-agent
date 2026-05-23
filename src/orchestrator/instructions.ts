@@ -7,6 +7,7 @@ import type { AgentConfig, RegisteredGroup } from './types.js';
 export const TENANT_INSTRUCTION_FILENAMES = [
   'AGENT.md',
   'SKOOBI.md',
+  'instructions.md',
   'CLAUDE.md',
 ] as const;
 
@@ -20,12 +21,21 @@ export interface TenantInstructions {
 }
 
 export function findTenantInstructions(groupDir: string): string | null {
-  for (const filename of TENANT_INSTRUCTION_FILENAMES) {
-    const candidate = path.join(groupDir, filename);
-    try {
-      if (fs.statSync(candidate).isFile()) return candidate;
-    } catch {
-      /* absent or unreadable candidates are simply skipped */
+  const dirs = [groupDir];
+  const folder = path.basename(groupDir);
+  const inheritedFolder = folder.includes('__') ? folder.split('__')[0] : null;
+  if (inheritedFolder) {
+    dirs.push(path.join(path.dirname(groupDir), inheritedFolder));
+  }
+
+  for (const dir of dirs) {
+    for (const filename of TENANT_INSTRUCTION_FILENAMES) {
+      const candidate = path.join(dir, filename);
+      try {
+        if (fs.statSync(candidate).isFile()) return candidate;
+      } catch {
+        /* absent or unreadable candidates are simply skipped */
+      }
     }
   }
   return null;
@@ -42,10 +52,18 @@ export function loadTenantInstructions(
   return { filePath, filename, content };
 }
 
-function shouldInjectIntoAgentConfig(instructions: TenantInstructions): boolean {
+function shouldInjectIntoAgentConfig(
+  instructions: TenantInstructions,
+): boolean {
   // The Claude Agent SDK already loads CLAUDE.md from cwd. Inject only the new
   // compatibility names so legacy CLAUDE.md behaviour stays unchanged.
   return instructions.filename !== 'CLAUDE.md';
+}
+
+export function shouldInjectIntoModelPrompt(
+  instructions: TenantInstructions,
+): boolean {
+  return Boolean(instructions.content.trim());
 }
 
 export function agentConfigWithTenantInstructions(

@@ -21,6 +21,11 @@ import {
   type ModelRole,
 } from './model-gateway.js';
 import {
+  loadTenantInstructions,
+  shouldInjectIntoModelPrompt,
+} from './instructions.js';
+import { logger } from './logger.js';
+import {
   chargeQuotaUsage,
   quotaIdempotencyKey,
   type ChargeQuotaResult,
@@ -234,6 +239,22 @@ function modelUsagePayload(
   };
 }
 
+function loadTenantInstructionText(tenant: TenantRecord): string | null {
+  try {
+    const instructions = loadTenantInstructions(
+      resolveGroupFolderPath(tenant.folder),
+    );
+    if (!instructions || !shouldInjectIntoModelPrompt(instructions)) {
+      return null;
+    }
+    return `<tenant_instructions source="${instructions.filename}">
+${instructions.content}
+</tenant_instructions>`;
+  } catch {
+    return null;
+  }
+}
+
 export function loadLiveCanaryConfig(
   overrides: Partial<LiveCanaryConfig> = {},
 ): LiveCanaryConfig {
@@ -329,6 +350,14 @@ export function buildLiveModelRequest(input: {
     senderId: input.senderId,
     senderIdentity: input.senderIdentity,
   };
+  const tenantInstructions = loadTenantInstructionText(input.tenant);
+  const systemContent = [
+    'You are Skoobi Core running in live canary mode for one low-risk guest tenant. Answer with text only unless a listed safe tool is genuinely needed. You do not decide permissions: every tool call is authorized by Skoobi PolicyEngine. Never request shell, filesystem, MCP, owner, network, or hidden tools.',
+    tenantInstructions,
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join('\n\n');
+
   return {
     tenant_id: input.tenant.tenant_id,
     session_id: sessionId,
@@ -336,8 +365,7 @@ export function buildLiveModelRequest(input: {
     messages: [
       {
         role: 'system',
-        content:
-          'You are Skoobi Core running in live canary mode for one low-risk Telegram guest tenant. Answer with text only unless a listed safe tool is genuinely needed. You do not decide permissions: every tool call is authorized by Skoobi PolicyEngine. Never request shell, filesystem, MCP, owner, network, or hidden tools.',
+        content: systemContent,
       },
       {
         role: 'user',
@@ -419,6 +447,17 @@ export async function runLiveModelTurn(
       (result) => !result.decision.allowed,
     ).length;
     const answerText = answerTextFromResponse(response, toolResults);
+    logger.info(
+      {
+        tenantId: input.tenant.tenant_id,
+        channel: input.tenant.channel,
+        chatId: input.tenant.chat_id,
+        latencyMs,
+        answerLength: answerText.length,
+        providerModel: response.usage?.provider_model,
+      },
+      'Live model response',
+    );
 
     const traceId = recordModelTrace({
       tenant: input.tenant,

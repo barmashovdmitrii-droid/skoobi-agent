@@ -8,7 +8,11 @@ import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
 import { logger } from './logger.js';
-import { validateManifest, type ExtensionManifest, type LoadResult } from './extension-manifest.js';
+import {
+  validateManifest,
+  type ExtensionManifest,
+  type LoadResult,
+} from './extension-manifest.js';
 
 // CODE_ROOT is where the ClaudeClaw code lives (for finding extensions/)
 // In dev mode: process.cwd()
@@ -32,15 +36,19 @@ export async function loadExtensions(): Promise<LoadResult[]> {
 
   const entries = fs.readdirSync(extensionsDir, { withFileTypes: true });
   const extensionDirs = entries
-    .filter(e => e.isDirectory() && e.name.startsWith('claudeclaw-'))
-    .map(e => e.name)
+    .filter((e) => e.isDirectory() && e.name.startsWith('claudeclaw-'))
+    .map((e) => e.name)
     .sort();
 
   for (const dirName of extensionDirs) {
     const manifestPath = path.join(extensionsDir, dirName, 'manifest.json');
 
     if (!fs.existsSync(manifestPath)) {
-      results.push({ name: dirName, status: 'failed', error: 'No manifest.json found' });
+      results.push({
+        name: dirName,
+        status: 'failed',
+        error: 'No manifest.json found',
+      });
       continue;
     }
 
@@ -49,13 +57,21 @@ export async function loadExtensions(): Promise<LoadResult[]> {
       const { valid, error, manifest } = validateManifest(raw);
 
       if (!valid || !manifest) {
-        results.push({ name: dirName, status: 'failed', error: `Invalid manifest: ${error}` });
+        results.push({
+          name: dirName,
+          status: 'failed',
+          error: `Invalid manifest: ${error}`,
+        });
         continue;
       }
 
       const entryPath = path.join(extensionsDir, dirName, manifest.entry);
       if (!fs.existsSync(entryPath)) {
-        results.push({ name: dirName, status: 'failed', error: `Entry file not found: ${manifest.entry}` });
+        results.push({
+          name: dirName,
+          status: 'failed',
+          error: `Entry file not found: ${manifest.entry}`,
+        });
         continue;
       }
 
@@ -63,16 +79,26 @@ export async function loadExtensions(): Promise<LoadResult[]> {
       await import(pathToFileURL(entryPath).href);
 
       results.push({ name: manifest.name, status: 'loaded' });
-      logger.info({ extension: manifest.name, type: manifest.type, version: manifest.version }, 'Extension loaded');
+      logger.info(
+        {
+          extension: manifest.name,
+          type: manifest.type,
+          version: manifest.version,
+        },
+        'Extension loaded',
+      );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       results.push({ name: dirName, status: 'failed', error: message });
-      logger.error({ extension: dirName, error: message }, 'Failed to load extension');
+      logger.error(
+        { extension: dirName, error: message },
+        'Failed to load extension',
+      );
     }
   }
 
-  const loaded = results.filter(r => r.status === 'loaded').length;
-  const failed = results.filter(r => r.status === 'failed').length;
+  const loaded = results.filter((r) => r.status === 'loaded').length;
+  const failed = results.filter((r) => r.status === 'failed').length;
   if (loaded > 0 || failed > 0) {
     logger.info({ loaded, failed }, 'Extension loading complete');
   }

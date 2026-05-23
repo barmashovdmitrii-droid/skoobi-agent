@@ -45,7 +45,9 @@ function resolveAllowlistPath(filename: string): string {
   return skoobi;
 }
 
-export const MOUNT_ALLOWLIST_PATH = resolveAllowlistPath('mount-allowlist.json');
+export const MOUNT_ALLOWLIST_PATH = resolveAllowlistPath(
+  'mount-allowlist.json',
+);
 export const SENDER_ALLOWLIST_PATH = resolveAllowlistPath(
   'sender-allowlist.json',
 );
@@ -95,9 +97,7 @@ export const IDLE_TIMEOUT = parseInt(
 export const RUNNER_IDLE_WAIT_MS = Math.max(
   1000,
   parseInt(
-    process.env.RUNNER_IDLE_WAIT_MS ||
-      envConfig.RUNNER_IDLE_WAIT_MS ||
-      '15000',
+    process.env.RUNNER_IDLE_WAIT_MS || envConfig.RUNNER_IDLE_WAIT_MS || '15000',
     10,
   ) || 15000,
 );
@@ -122,8 +122,12 @@ export const TRIGGER_PATTERN = new RegExp(
 
 // Webhook server configuration
 const webhookEnv = readEnvFile(['WEBHOOK_PORT', 'WEBHOOK_SECRET']);
-export const WEBHOOK_PORT = parseInt(process.env.WEBHOOK_PORT || webhookEnv.WEBHOOK_PORT || '3100', 10);
-export const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || webhookEnv.WEBHOOK_SECRET || '';
+export const WEBHOOK_PORT = parseInt(
+  process.env.WEBHOOK_PORT || webhookEnv.WEBHOOK_PORT || '3100',
+  10,
+);
+export const WEBHOOK_SECRET =
+  process.env.WEBHOOK_SECRET || webhookEnv.WEBHOOK_SECRET || '';
 
 // Runtime selection: 'container' (default, Apple Container / Docker) or 'sandbox' (srt)
 export const DEFAULT_RUNTIME: 'container' | 'sandbox' =

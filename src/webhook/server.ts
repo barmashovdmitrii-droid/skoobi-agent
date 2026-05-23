@@ -5,7 +5,9 @@ import type { MessageIngestion } from '../orchestrator/types.js';
 
 export interface WebhookDeps {
   ingestion: MessageIngestion;
-  findGroupByFolder: (folder: string) => { jid: string; name: string } | undefined;
+  findGroupByFolder: (
+    folder: string,
+  ) => { jid: string; name: string } | undefined;
   /** Send a message directly to a registered group's chat without spawning
    * an agent. Used for owner-approved canned replies routed via webhook. */
   sendDirect?: (folder: string, text: string) => Promise<void>;
@@ -25,7 +27,11 @@ const MAX_BODY_BYTES = 256 * 1024;
 
 type RateEntry = { count: number; resetAt: number };
 
-function checkRate(map: Map<string, RateEntry>, key: string, limit: number): boolean {
+function checkRate(
+  map: Map<string, RateEntry>,
+  key: string,
+  limit: number,
+): boolean {
   const now = Date.now();
   const entry = map.get(key);
   if (!entry || now > entry.resetAt) {
@@ -37,7 +43,11 @@ function checkRate(map: Map<string, RateEntry>, key: string, limit: number): boo
   return true;
 }
 
-export function verifySignature(secret: string, payload: string, signature: string): boolean {
+export function verifySignature(
+  secret: string,
+  payload: string,
+  signature: string,
+): boolean {
   const expected = crypto
     .createHmac('sha256', secret)
     .update(payload)
@@ -52,14 +62,18 @@ export function verifySignature(secret: string, payload: string, signature: stri
   }
 }
 
-function readBody(req: IncomingMessage, maxBytes: number): Promise<string | null> {
+function readBody(
+  req: IncomingMessage,
+  maxBytes: number,
+): Promise<string | null> {
   return new Promise((resolve, reject) => {
     let data = '';
     let bytes = 0;
     let aborted = false;
     req.on('data', (chunk: Buffer | string) => {
       if (aborted) return;
-      const len = typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
+      const len =
+        typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
       bytes += len;
       if (bytes > maxBytes) {
         aborted = true;
@@ -69,12 +83,18 @@ function readBody(req: IncomingMessage, maxBytes: number): Promise<string | null
       }
       data += chunk;
     });
-    req.on('end', () => { if (!aborted) resolve(data); });
+    req.on('end', () => {
+      if (!aborted) resolve(data);
+    });
     req.on('error', reject);
   });
 }
 
-function sendJson(res: ServerResponse, status: number, body: Record<string, unknown>): void {
+function sendJson(
+  res: ServerResponse,
+  status: number,
+  body: Record<string, unknown>,
+): void {
   res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(body));
 }

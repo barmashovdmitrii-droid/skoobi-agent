@@ -2812,8 +2812,7 @@ export class TelegramChannel implements Channel {
         fileToggle = '';
       }
       const effective = envToggle || fileToggle || 'on';
-      const chatId =
-        process.env.BRIEF_CHAT_ID || env.BRIEF_CHAT_ID || '0';
+      const chatId = process.env.BRIEF_CHAT_ID || env.BRIEF_CHAT_ID || '0';
       let lastLog = 'n/a';
       try {
         const logLines = fs

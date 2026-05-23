@@ -41,7 +41,12 @@ function entry(over: Partial<MediaEntry>): MediaEntry {
 describe('classifyEntry', () => {
   it('keeps pinned entries regardless of age', () => {
     const r = classifyEntry(
-      entry({ keep: true, type: 'voice', has_transcript: true, created_at: '2020-01-01T00:00:00Z' }),
+      entry({
+        keep: true,
+        type: 'voice',
+        has_transcript: true,
+        created_at: '2020-01-01T00:00:00Z',
+      }),
       baseConfig,
       NOW,
     );
@@ -51,7 +56,11 @@ describe('classifyEntry', () => {
 
   it('keeps photos that still need a caption', () => {
     const r = classifyEntry(
-      entry({ type: 'photo', has_caption: false, created_at: '2020-01-01T00:00:00Z' }),
+      entry({
+        type: 'photo',
+        has_caption: false,
+        created_at: '2020-01-01T00:00:00Z',
+      }),
       baseConfig,
       NOW,
     );
@@ -61,7 +70,11 @@ describe('classifyEntry', () => {
 
   it('keeps voice that still needs a transcript', () => {
     const r = classifyEntry(
-      entry({ type: 'voice', has_transcript: false, created_at: '2020-01-01T00:00:00Z' }),
+      entry({
+        type: 'voice',
+        has_transcript: false,
+        created_at: '2020-01-01T00:00:00Z',
+      }),
       baseConfig,
       NOW,
     );
@@ -71,7 +84,11 @@ describe('classifyEntry', () => {
 
   it('keeps video-note that still needs a transcript', () => {
     const r = classifyEntry(
-      entry({ type: 'video-note', has_transcript: false, created_at: '2020-01-01T00:00:00Z' }),
+      entry({
+        type: 'video-note',
+        has_transcript: false,
+        created_at: '2020-01-01T00:00:00Z',
+      }),
       baseConfig,
       NOW,
     );
@@ -85,7 +102,9 @@ describe('classifyEntry', () => {
         type: 'voice',
         has_transcript: true,
         // 30d ago — well past 7d voice TTL
-        created_at: new Date(NOW.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString(),
+        created_at: new Date(
+          NOW.getTime() - 30 * 24 * 60 * 60 * 1000,
+        ).toISOString(),
       }),
       baseConfig,
       NOW,
@@ -99,7 +118,9 @@ describe('classifyEntry', () => {
       entry({
         type: 'photo',
         has_caption: true,
-        created_at: new Date(NOW.getTime() - 5 * 24 * 60 * 60 * 1000).toISOString(),
+        created_at: new Date(
+          NOW.getTime() - 5 * 24 * 60 * 60 * 1000,
+        ).toISOString(),
       }),
       baseConfig,
       NOW,
@@ -133,14 +154,18 @@ describe('applyPerUserBytes', () => {
           size_bytes: 4000,
           type: 'voice',
           has_transcript: true,
-          created_at: new Date(NOW.getTime() - 1 * 24 * 60 * 60 * 1000).toISOString(),
+          created_at: new Date(
+            NOW.getTime() - 1 * 24 * 60 * 60 * 1000,
+          ).toISOString(),
         }),
         entry({
           basename: 'b',
           size_bytes: 4000,
           type: 'voice',
           has_transcript: true,
-          created_at: new Date(NOW.getTime() - 2 * 24 * 60 * 60 * 1000).toISOString(),
+          created_at: new Date(
+            NOW.getTime() - 2 * 24 * 60 * 60 * 1000,
+          ).toISOString(),
         }),
         entry({
           basename: 'c',
@@ -148,7 +173,9 @@ describe('applyPerUserBytes', () => {
           type: 'voice',
           has_transcript: true,
           // OLDEST among the three within-ttl entries
-          created_at: new Date(NOW.getTime() - 3 * 24 * 60 * 60 * 1000).toISOString(),
+          created_at: new Date(
+            NOW.getTime() - 3 * 24 * 60 * 60 * 1000,
+          ).toISOString(),
         }),
       ],
       baseConfig,
@@ -212,7 +239,9 @@ describe('applyGlobalBytes', () => {
           size_bytes: 10_000,
           type: 'voice',
           has_transcript: true,
-          created_at: new Date(NOW.getTime() - 1 * 24 * 60 * 60 * 1000).toISOString(),
+          created_at: new Date(
+            NOW.getTime() - 1 * 24 * 60 * 60 * 1000,
+          ).toISOString(),
         }),
       ],
       baseConfig,
@@ -225,14 +254,18 @@ describe('applyGlobalBytes', () => {
           size_bytes: 10_000,
           type: 'voice',
           has_transcript: true,
-          created_at: new Date(NOW.getTime() - 5 * 24 * 60 * 60 * 1000).toISOString(),
+          created_at: new Date(
+            NOW.getTime() - 5 * 24 * 60 * 60 * 1000,
+          ).toISOString(),
         }),
         entry({
           basename: 'b2',
           size_bytes: 10_000,
           type: 'voice',
           has_transcript: true,
-          created_at: new Date(NOW.getTime() - 3 * 24 * 60 * 60 * 1000).toISOString(),
+          created_at: new Date(
+            NOW.getTime() - 3 * 24 * 60 * 60 * 1000,
+          ).toISOString(),
         }),
       ],
       baseConfig,

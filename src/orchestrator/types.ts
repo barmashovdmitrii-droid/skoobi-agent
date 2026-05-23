@@ -66,12 +66,29 @@ export interface RegisteredGroup {
 export type SkoobiRuntimeMode = 'claude_sdk' | 'skoobi_shadow' | 'skoobi_live';
 
 export interface SenderIdentity {
-  channel: 'telegram';
+  channel: 'telegram' | 'whatsapp';
   chat_id: string;
+  /** Telegram numeric user id. Set when channel === 'telegram'. */
   telegram_user_id: string;
+  /** WhatsApp phone digits (E.164 without +). Set when channel === 'whatsapp'. */
+  whatsapp_phone?: string;
   username_hint?: string;
   display_name_hint?: string;
   is_owner_sender: boolean;
+}
+
+/**
+ * Returns the per-user identifier for a sender, regardless of channel.
+ * Falls back through telegram_user_id → whatsapp_phone → chat_id so existing
+ * single-user-per-chat semantics keep working.
+ */
+export function senderIdentityUserId(identity: SenderIdentity): string {
+  return (
+    identity.telegram_user_id ||
+    identity.whatsapp_phone ||
+    identity.chat_id ||
+    ''
+  );
 }
 
 export interface NewMessage {
@@ -81,6 +98,7 @@ export interface NewMessage {
   sender_name: string;
   content: string;
   timestamp: string;
+  media_kind?: string | null;
   is_from_me?: boolean;
   is_bot_message?: boolean;
   tenant_id?: string;

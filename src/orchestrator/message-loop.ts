@@ -59,6 +59,7 @@ import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import {
   findChannel,
+  formatOutbound,
   formatMessages,
   prependRecentConversationContext,
 } from './router.js';
@@ -141,6 +142,7 @@ import {
 import { logger } from './logger.js';
 import { logAgentRun } from '../cost-tracking/index.js';
 import { startWebhookServer } from '../webhook/server.js';
+import { createAutopartsWhatsAppBridgeFromEnv } from '../integrations/autoparts-payload.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -269,9 +271,51 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+const autopartsWhatsAppBridge = createAutopartsWhatsAppBridgeFromEnv();
 
 function currentTenantRegistry(): TenantRegistry {
   return TenantRegistry.fromRegisteredGroups(registeredGroups);
+}
+
+function recordAutopartsWhatsAppInbound(message: NewMessage): void {
+  if (!autopartsWhatsAppBridge) return;
+  if (!message.chat_jid.startsWith('wa:')) return;
+  if (registeredGroups[message.chat_jid]?.requiresTrigger !== false) return;
+  autopartsWhatsAppBridge
+    .recordInbound({
+      chatJid: message.chat_jid,
+      phone: message.sender,
+      pushName: message.sender_name,
+      text: message.content,
+      content: message.content,
+      mediaKind: message.media_kind,
+      whatsappMessageId: message.id,
+      timestamp: message.timestamp,
+    })
+    .catch((err) =>
+      logger.warn(
+        { err, chatJid: message.chat_jid },
+        'autoparts_backend_error',
+      ),
+    );
+}
+
+function recordAutopartsWhatsAppOutbound(envelope: OutboundEnvelope): void {
+  if (!autopartsWhatsAppBridge) return;
+  if (!envelope.chatJid.startsWith('wa:')) return;
+  const text = formatOutbound(envelope.text);
+  if (!text) return;
+  autopartsWhatsAppBridge
+    .recordOutbound({
+      chatJid: envelope.chatJid,
+      text,
+    })
+    .catch((err) =>
+      logger.warn(
+        { err, chatJid: envelope.chatJid },
+        'autoparts_backend_error',
+      ),
+    );
 }
 
 function errorPayload(err: unknown): Record<string, unknown> {
@@ -289,7 +333,7 @@ function recordEventSafely(input: {
   payload: Record<string, unknown>;
 }): void {
   if (!input.chatJid.startsWith('tg:')) return;
-  const tenant = currentTenantRegistry().resolveTelegramJid(input.chatJid);
+  const tenant = currentTenantRegistry().resolveJid(input.chatJid);
   if (!tenant) return;
   try {
     recordTenantEvent({
@@ -452,7 +496,7 @@ async function maybeBlockTelegramQuota(input: {
   if (!input.chatJid.startsWith('tg:')) {
     return { blocked: false, delivered: false };
   }
-  const tenant = currentTenantRegistry().resolveTelegramJid(input.chatJid);
+  const tenant = currentTenantRegistry().resolveJid(input.chatJid);
   const channelUserId = quotaUserIdForMessages(input.messages);
   if (!tenant || !channelUserId) {
     return { blocked: false, delivered: false, channelUserId };
@@ -752,7 +796,7 @@ async function processGroupMessages(
     anonymizeSenderNames: !isMainGroup,
   });
   const promptSenderId = quotaUserIdForMessages(missedMessages);
-  const promptTenant = currentTenantRegistry().resolveTelegramJid(chatJid);
+  const promptTenant = currentTenantRegistry().resolveJid(chatJid);
   const memoryContext = !isMainGroup
     ? loadGroupMemoryContext(GROUPS_DIR, group.folder, {
         senderId: promptSenderId,
@@ -960,6 +1004,17 @@ async function processGroupMessages(
         timestamp: new Date().toISOString(),
       },
     });
+    logger.info(
+      {
+        chatJid,
+        tenantId: tenantForRun.tenant_id,
+        groupFolder: agentGroup.folder,
+        replyJid,
+        runtime: 'skoobi_live',
+        liveSelectionReason,
+      },
+      'runtime_selected',
+    );
 
     let liveRun: Awaited<ReturnType<typeof runLiveModelTurn>> | undefined;
     let liveThrownError: unknown;
@@ -2164,7 +2219,7 @@ export async function main(): Promise<void> {
   // Channel callbacks (shared by all channels)
   const channelOpts = {
     onMessage: (chatJid: string, msg: NewMessage) => {
-      const tenant = currentTenantRegistry().resolveTelegramJid(chatJid);
+      const tenant = currentTenantRegistry().resolveJid(chatJid);
       const enrichedMsg: NewMessage = {
         ...msg,
         tenant_id: msg.tenant_id || tenant?.tenant_id,
@@ -2210,6 +2265,7 @@ export async function main(): Promise<void> {
         }
       }
       storeMessage(enrichedMsg);
+      recordAutopartsWhatsAppInbound(enrichedMsg);
     },
     onChatMetadata: (
       chatJid: string,
@@ -2304,6 +2360,7 @@ export async function main(): Promise<void> {
     if (envelope.chatJid.startsWith('tg:')) {
       recordTelegramOutboundEvent(envelope);
     }
+    recordAutopartsWhatsAppOutbound(envelope);
   });
 
   // Start subsystems (independently of connection handler)

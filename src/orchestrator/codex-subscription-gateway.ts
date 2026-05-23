@@ -9,6 +9,7 @@ import type {
   ModelRequest,
   ModelResponse,
 } from './model-gateway.js';
+import { logger } from './logger.js';
 
 export type CodexSubscriptionConfig = {
   enabled: boolean;
@@ -565,6 +566,15 @@ export class CodexSubscriptionModelGateway implements ModelGateway {
       model: input.model,
       imagePaths,
     });
+    logger.info(
+      {
+        command: this.config.command,
+        model: input.model,
+        imageCount: imagePaths.length,
+        scratch: path.basename(input.scratchDir),
+      },
+      'codex subprocess starting',
+    );
     const result = await this.runner.run({
       command: this.config.command,
       args,

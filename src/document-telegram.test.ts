@@ -15,7 +15,10 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-async function writeFixtureWorkbook(filePath: string, dir: string): Promise<void> {
+async function writeFixtureWorkbook(
+  filePath: string,
+  dir: string,
+): Promise<void> {
   const root = path.join(dir, 'xlsx-src');
   await fs.mkdir(path.join(root, '_rels'), { recursive: true });
   await fs.mkdir(path.join(root, 'xl', '_rels'), { recursive: true });

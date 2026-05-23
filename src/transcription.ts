@@ -22,10 +22,7 @@ import {
   WHISPER_FALLBACKS,
   resolveBinary,
 } from './lib/binary-paths.js';
-import {
-  folderAbsFromMediaPath,
-  updateMediaEntry,
-} from './media-manifest.js';
+import { folderAbsFromMediaPath, updateMediaEntry } from './media-manifest.js';
 
 const execFileAsync = promisify(execFile);
 

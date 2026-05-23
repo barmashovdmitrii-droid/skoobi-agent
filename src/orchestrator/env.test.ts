@@ -15,7 +15,10 @@ describe('readEnvFile', () => {
   });
 
   it('reads from CLAUDECLAW_ENV_FILE when set', async () => {
-    const tmpEnv = path.join(process.env.TMPDIR || '/tmp', 'test-claudeclaw.env');
+    const tmpEnv = path.join(
+      process.env.TMPDIR || '/tmp',
+      'test-claudeclaw.env',
+    );
     fs.writeFileSync(tmpEnv, 'TEST_KEY=from_env_file\n');
     process.env.CLAUDECLAW_ENV_FILE = tmpEnv;
 

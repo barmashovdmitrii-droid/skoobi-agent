@@ -16,7 +16,9 @@ function mockDeps(overrides?: Partial<IngestionDeps>): IngestionDeps {
   };
 }
 
-function webhookEnvelope(overrides?: Partial<IngestionEnvelope>): IngestionEnvelope {
+function webhookEnvelope(
+  overrides?: Partial<IngestionEnvelope>,
+): IngestionEnvelope {
   return {
     groupFolder: 'test-group',
     chatJid: 'test-jid@g.us',
@@ -46,7 +48,9 @@ describe('MessageIngestion', () => {
     });
     const ingestion = createMessageIngestion(deps);
 
-    const result = await ingestion.ingest(webhookEnvelope({ bypassTrigger: true }));
+    const result = await ingestion.ingest(
+      webhookEnvelope({ bypassTrigger: true }),
+    );
 
     expect(result).toBe(true);
     expect(deps.checkTrigger).not.toHaveBeenCalled();
@@ -70,7 +74,10 @@ describe('MessageIngestion', () => {
     const deps = mockDeps();
     const ingestion = createMessageIngestion(deps);
 
-    ingestion.addPreHook(async () => ({ action: 'drop' as const, reason: 'blocked' }));
+    ingestion.addPreHook(async () => ({
+      action: 'drop' as const,
+      reason: 'blocked',
+    }));
 
     const result = await ingestion.ingest(webhookEnvelope());
 

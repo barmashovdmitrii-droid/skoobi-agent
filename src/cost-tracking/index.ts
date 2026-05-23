@@ -25,7 +25,10 @@ registerExtension({
 });
 
 // Anthropic pricing (USD per million tokens) — update as pricing changes
-const PRICING: Record<string, { input: number; output: number; cacheRead: number }> = {
+const PRICING: Record<
+  string,
+  { input: number; output: number; cacheRead: number }
+> = {
   sonnet: { input: 3, output: 15, cacheRead: 0.3 },
   opus: { input: 15, output: 75, cacheRead: 0.3 },
   haiku: { input: 0.25, output: 1.25, cacheRead: 0.03 },
@@ -38,7 +41,9 @@ function estimateCost(
   cacheReadTokens: number,
 ): number {
   const key = (model || 'sonnet').toLowerCase();
-  const tier = Object.entries(PRICING).find(([k]) => key.includes(k))?.[1] || PRICING.sonnet;
+  const tier =
+    Object.entries(PRICING).find(([k]) => key.includes(k))?.[1] ||
+    PRICING.sonnet;
   return (
     (inputTokens / 1_000_000) * tier.input +
     (outputTokens / 1_000_000) * tier.output +
@@ -68,26 +73,32 @@ export function logAgentRun(record: AgentRunRecord): void {
       record.outputTokens,
       record.cacheReadTokens,
     );
-    getDb().prepare(
-      `INSERT INTO agent_runs (group_folder, chat_jid, trigger_type, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, estimated_cost_usd, duration_ms, turns, model, status, run_at)
+    getDb()
+      .prepare(
+        `INSERT INTO agent_runs (group_folder, chat_jid, trigger_type, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, estimated_cost_usd, duration_ms, turns, model, status, run_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      record.groupFolder,
-      record.chatJid,
-      record.triggerType,
-      record.inputTokens,
-      record.outputTokens,
-      record.cacheCreationTokens,
-      record.cacheReadTokens,
-      cost,
-      record.durationMs,
-      record.turns,
-      record.model || null,
-      record.status,
-      new Date().toISOString(),
-    );
+      )
+      .run(
+        record.groupFolder,
+        record.chatJid,
+        record.triggerType,
+        record.inputTokens,
+        record.outputTokens,
+        record.cacheCreationTokens,
+        record.cacheReadTokens,
+        cost,
+        record.durationMs,
+        record.turns,
+        record.model || null,
+        record.status,
+        new Date().toISOString(),
+      );
     logger.debug(
-      { group: record.groupFolder, cost: cost.toFixed(4), tokens: record.inputTokens + record.outputTokens },
+      {
+        group: record.groupFolder,
+        cost: cost.toFixed(4),
+        tokens: record.inputTokens + record.outputTokens,
+      },
       'Agent run logged',
     );
   } catch (err) {
