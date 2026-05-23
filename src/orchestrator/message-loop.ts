@@ -59,6 +59,7 @@ import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import {
   findChannel,
+  formatOutbound,
   formatMessages,
   prependRecentConversationContext,
 } from './router.js';
@@ -141,6 +142,7 @@ import {
 import { logger } from './logger.js';
 import { logAgentRun } from '../cost-tracking/index.js';
 import { startWebhookServer } from '../webhook/server.js';
+import { createAutopartsWhatsAppBridgeFromEnv } from '../integrations/autoparts-payload.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -269,9 +271,50 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+const autopartsWhatsAppBridge = createAutopartsWhatsAppBridgeFromEnv();
 
 function currentTenantRegistry(): TenantRegistry {
   return TenantRegistry.fromRegisteredGroups(registeredGroups);
+}
+
+function recordAutopartsWhatsAppInbound(message: NewMessage): void {
+  if (!autopartsWhatsAppBridge) return;
+  if (!message.chat_jid.startsWith('wa:')) return;
+  autopartsWhatsAppBridge
+    .recordInbound({
+      chatJid: message.chat_jid,
+      phone: message.sender,
+      pushName: message.sender_name,
+      text: message.content,
+      content: message.content,
+      mediaKind: message.media_kind,
+      whatsappMessageId: message.id,
+      timestamp: message.timestamp,
+    })
+    .catch((err) =>
+      logger.warn(
+        { err, chatJid: message.chat_jid },
+        'autoparts_backend_error',
+      ),
+    );
+}
+
+function recordAutopartsWhatsAppOutbound(envelope: OutboundEnvelope): void {
+  if (!autopartsWhatsAppBridge) return;
+  if (!envelope.chatJid.startsWith('wa:')) return;
+  const text = formatOutbound(envelope.text);
+  if (!text) return;
+  autopartsWhatsAppBridge
+    .recordOutbound({
+      chatJid: envelope.chatJid,
+      text,
+    })
+    .catch((err) =>
+      logger.warn(
+        { err, chatJid: envelope.chatJid },
+        'autoparts_backend_error',
+      ),
+    );
 }
 
 function errorPayload(err: unknown): Record<string, unknown> {
@@ -2221,6 +2264,7 @@ export async function main(): Promise<void> {
         }
       }
       storeMessage(enrichedMsg);
+      recordAutopartsWhatsAppInbound(enrichedMsg);
     },
     onChatMetadata: (
       chatJid: string,
@@ -2315,6 +2359,7 @@ export async function main(): Promise<void> {
     if (envelope.chatJid.startsWith('tg:')) {
       recordTelegramOutboundEvent(envelope);
     }
+    recordAutopartsWhatsAppOutbound(envelope);
   });
 
   // Start subsystems (independently of connection handler)

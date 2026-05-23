@@ -337,6 +337,7 @@ export class WhatsAppChannel implements Channel {
       sender_name: pushName || phone,
       content: text || (mediaKind ? `[${mediaKind}]` : ''),
       timestamp,
+      media_kind: mediaKind,
       is_from_me: false,
       sender_identity: senderIdentity,
     };

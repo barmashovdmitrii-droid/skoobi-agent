@@ -98,6 +98,7 @@ export interface NewMessage {
   sender_name: string;
   content: string;
   timestamp: string;
+  media_kind?: string | null;
   is_from_me?: boolean;
   is_bot_message?: boolean;
   tenant_id?: string;
