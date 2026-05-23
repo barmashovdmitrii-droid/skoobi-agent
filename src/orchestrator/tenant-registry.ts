@@ -317,6 +317,18 @@ export class TenantRegistry {
     return chatId ? this.resolveWhatsappChat(chatId) : undefined;
   }
 
+  /**
+   * Channel-agnostic JID resolver. Dispatches by JID prefix:
+   *   tg:NNN  → resolveTelegramJid
+   *   wa:NNN  → resolveWhatsappJid
+   * Returns undefined for unknown prefixes or unregistered chats.
+   */
+  resolveJid(jid: string): TenantRecord | undefined {
+    if (jid.startsWith('tg:')) return this.resolveTelegramJid(jid);
+    if (jid.startsWith('wa:')) return this.resolveWhatsappJid(jid);
+    return undefined;
+  }
+
   resolveTenant(tenantId: string): TenantRecord | undefined {
     return this.byTenantId.get(tenantId);
   }

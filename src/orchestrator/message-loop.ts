@@ -289,7 +289,7 @@ function recordEventSafely(input: {
   payload: Record<string, unknown>;
 }): void {
   if (!input.chatJid.startsWith('tg:')) return;
-  const tenant = currentTenantRegistry().resolveTelegramJid(input.chatJid);
+  const tenant = currentTenantRegistry().resolveJid(input.chatJid);
   if (!tenant) return;
   try {
     recordTenantEvent({
@@ -452,7 +452,7 @@ async function maybeBlockTelegramQuota(input: {
   if (!input.chatJid.startsWith('tg:')) {
     return { blocked: false, delivered: false };
   }
-  const tenant = currentTenantRegistry().resolveTelegramJid(input.chatJid);
+  const tenant = currentTenantRegistry().resolveJid(input.chatJid);
   const channelUserId = quotaUserIdForMessages(input.messages);
   if (!tenant || !channelUserId) {
     return { blocked: false, delivered: false, channelUserId };
@@ -752,7 +752,7 @@ async function processGroupMessages(
     anonymizeSenderNames: !isMainGroup,
   });
   const promptSenderId = quotaUserIdForMessages(missedMessages);
-  const promptTenant = currentTenantRegistry().resolveTelegramJid(chatJid);
+  const promptTenant = currentTenantRegistry().resolveJid(chatJid);
   const memoryContext = !isMainGroup
     ? loadGroupMemoryContext(GROUPS_DIR, group.folder, {
         senderId: promptSenderId,
@@ -2164,7 +2164,7 @@ export async function main(): Promise<void> {
   // Channel callbacks (shared by all channels)
   const channelOpts = {
     onMessage: (chatJid: string, msg: NewMessage) => {
-      const tenant = currentTenantRegistry().resolveTelegramJid(chatJid);
+      const tenant = currentTenantRegistry().resolveJid(chatJid);
       const enrichedMsg: NewMessage = {
         ...msg,
         tenant_id: msg.tenant_id || tenant?.tenant_id,
