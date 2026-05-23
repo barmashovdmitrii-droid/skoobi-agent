@@ -11,14 +11,19 @@ import type {
 } from './types.js';
 
 export interface TenantApprovedSender {
-  telegram_user_id: string;
+  /** Telegram numeric user id (legacy field, kept for compatibility). */
+  telegram_user_id?: string;
+  /** WhatsApp phone digits (E.164 without +). */
+  whatsapp_phone?: string;
   role?: string;
 }
+
+export type TenantChannel = 'telegram' | 'whatsapp';
 
 export interface TenantJson {
   tenant_id?: string;
   folder?: string;
-  channel?: 'telegram';
+  channel?: TenantChannel;
   chat_id?: string;
   mode?: string;
   language?: string;
@@ -33,7 +38,7 @@ export interface TenantJson {
 export interface TenantRecord {
   tenant_id: string;
   folder: string;
-  channel: 'telegram';
+  channel: TenantChannel;
   chat_id: string;
   mode: string;
   runtime: SkoobiRuntimeMode;
@@ -55,6 +60,8 @@ export interface TenantRegistryOptions {
 export interface OwnerAllowlistConfig {
   telegram_user_ids: Set<string>;
   telegram_chat_ids: Set<string>;
+  /** Owner WhatsApp phone numbers (E.164 digits, no +). */
+  whatsapp_phones?: Set<string>;
 }
 
 const RUNTIME_MODES = new Set<SkoobiRuntimeMode>([
@@ -66,6 +73,7 @@ const RUNTIME_MODES = new Set<SkoobiRuntimeMode>([
 const OWNER_ALLOWLIST_ENV_KEYS = [
   'OWNER_TELEGRAM_USER_IDS',
   'OWNER_TELEGRAM_CHAT_IDS',
+  'OWNER_WHATSAPP_PHONES',
 ];
 
 export function parseSkoobiRuntimeMode(value: unknown): SkoobiRuntimeMode {
@@ -91,6 +99,24 @@ export function defaultTelegramTenantId(chatId: string): string {
   return `tg_chat_${safe || 'unknown'}`;
 }
 
+/** WhatsApp JIDs in Skoobi are `wa:<digits>` where digits are E.164 without `+`. */
+export function whatsappJidToChatId(jid: string): string | null {
+  if (!jid.startsWith('wa:')) return null;
+  const value = jid.slice(3);
+  return value.replace(/[^0-9]/g, '') || null;
+}
+
+export function defaultWhatsappTenantId(chatId: string): string {
+  const safe = chatId.trim().replace(/[^A-Za-z0-9_-]/g, '_');
+  return `wa_chat_${safe || 'unknown'}`;
+}
+
+function detectChannelFromJid(jid: string): TenantChannel | null {
+  if (jid.startsWith('tg:')) return 'telegram';
+  if (jid.startsWith('wa:')) return 'whatsapp';
+  return null;
+}
+
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
@@ -113,11 +139,17 @@ function approvedSenders(value: unknown): TenantApprovedSender[] | undefined {
       if (!item || typeof item !== 'object') return null;
       const raw = item as Record<string, unknown>;
       const telegramUserId = stringValue(raw.telegram_user_id);
-      if (!telegramUserId) return null;
+      const whatsappPhone = stringValue(raw.whatsapp_phone)?.replace(
+        /[^0-9]/g,
+        '',
+      );
+      if (!telegramUserId && !whatsappPhone) return null;
       const role = stringValue(raw.role);
-      return role
-        ? { telegram_user_id: telegramUserId, role }
-        : { telegram_user_id: telegramUserId };
+      const entry: TenantApprovedSender = {};
+      if (telegramUserId) entry.telegram_user_id = telegramUserId;
+      if (whatsappPhone) entry.whatsapp_phone = whatsappPhone;
+      if (role) entry.role = role;
+      return entry;
     })
     .filter((item): item is TenantApprovedSender => item !== null);
 }
@@ -129,7 +161,7 @@ export function parseTenantJson(raw: unknown): TenantJson {
 
   const obj = raw as Record<string, unknown>;
   const channel = stringValue(obj.channel);
-  if (channel && channel !== 'telegram') {
+  if (channel && channel !== 'telegram' && channel !== 'whatsapp') {
     throw new Error(`Unsupported tenant channel: ${channel}`);
   }
 
@@ -141,7 +173,7 @@ export function parseTenantJson(raw: unknown): TenantJson {
   return {
     tenant_id: stringValue(obj.tenant_id),
     folder: stringValue(obj.folder),
-    channel: channel === 'telegram' ? 'telegram' : undefined,
+    channel: (channel as TenantChannel | undefined) ?? undefined,
     chat_id: stringValue(obj.chat_id),
     mode: stringValue(obj.mode),
     language: stringValue(obj.language),
@@ -166,7 +198,12 @@ function loadTenantJson(
   jid: string,
   group: RegisteredGroup,
 ): TenantJson | null {
-  const chatId = telegramJidToChatId(jid);
+  const expectedChannel = detectChannelFromJid(jid);
+  if (!expectedChannel) return null;
+  const chatId =
+    expectedChannel === 'whatsapp'
+      ? whatsappJidToChatId(jid)
+      : telegramJidToChatId(jid);
   if (!chatId) return null;
 
   const groupDir = resolveGroupDir(groupsDir, group.folder);
@@ -181,7 +218,7 @@ function loadTenantJson(
     return null;
   }
 
-  if (parsed.channel && parsed.channel !== 'telegram') return null;
+  if (parsed.channel && parsed.channel !== expectedChannel) return null;
   if (parsed.chat_id && parsed.chat_id !== chatId) return null;
   if (parsed.folder && parsed.folder !== group.folder) return null;
 
@@ -193,14 +230,23 @@ function tenantRecordFromGroup(
   jid: string,
   group: RegisteredGroup,
 ): TenantRecord | null {
-  const chatId = telegramJidToChatId(jid);
+  const channel = detectChannelFromJid(jid);
+  if (!channel) return null;
+  const chatId =
+    channel === 'whatsapp'
+      ? whatsappJidToChatId(jid)
+      : telegramJidToChatId(jid);
   if (!chatId) return null;
 
   const tenant = loadTenantJson(groupsDir, jid, group);
+  const defaultTenantId =
+    channel === 'whatsapp'
+      ? defaultWhatsappTenantId(chatId)
+      : defaultTelegramTenantId(chatId);
   return {
-    tenant_id: tenant?.tenant_id || defaultTelegramTenantId(chatId),
+    tenant_id: tenant?.tenant_id || defaultTenantId,
     folder: group.folder,
-    channel: 'telegram',
+    channel,
     chat_id: chatId,
     mode: tenant?.mode || (group.isMain ? 'owner' : 'guest'),
     runtime: parseSkoobiRuntimeMode(tenant?.runtime),
@@ -216,6 +262,7 @@ function tenantRecordFromGroup(
 
 export class TenantRegistry {
   private readonly byTelegramChatId = new Map<string, TenantRecord>();
+  private readonly byWhatsappChatId = new Map<string, TenantRecord>();
   private readonly byTenantId = new Map<string, TenantRecord>();
 
   static fromRegisteredGroups(
@@ -227,17 +274,26 @@ export class TenantRegistry {
     for (const [jid, group] of Object.entries(groups)) {
       const record = tenantRecordFromGroup(groupsDir, jid, group);
       if (!record) continue;
-      if (
-        !registry.byTelegramChatId.has(record.chat_id) ||
-        !isTelegramThreadJid(jid)
-      ) {
-        registry.byTelegramChatId.set(record.chat_id, record);
-      }
-      if (
-        !registry.byTenantId.has(record.tenant_id) ||
-        !isTelegramThreadJid(jid)
-      ) {
-        registry.byTenantId.set(record.tenant_id, record);
+      if (record.channel === 'telegram') {
+        if (
+          !registry.byTelegramChatId.has(record.chat_id) ||
+          !isTelegramThreadJid(jid)
+        ) {
+          registry.byTelegramChatId.set(record.chat_id, record);
+        }
+        if (
+          !registry.byTenantId.has(record.tenant_id) ||
+          !isTelegramThreadJid(jid)
+        ) {
+          registry.byTenantId.set(record.tenant_id, record);
+        }
+      } else if (record.channel === 'whatsapp') {
+        if (!registry.byWhatsappChatId.has(record.chat_id)) {
+          registry.byWhatsappChatId.set(record.chat_id, record);
+        }
+        if (!registry.byTenantId.has(record.tenant_id)) {
+          registry.byTenantId.set(record.tenant_id, record);
+        }
       }
     }
     return registry;
@@ -250,6 +306,15 @@ export class TenantRegistry {
   resolveTelegramJid(jid: string): TenantRecord | undefined {
     const chatId = telegramJidToChatId(jid);
     return chatId ? this.resolveTelegramChat(chatId) : undefined;
+  }
+
+  resolveWhatsappChat(chatId: string | number): TenantRecord | undefined {
+    return this.byWhatsappChatId.get(String(chatId));
+  }
+
+  resolveWhatsappJid(jid: string): TenantRecord | undefined {
+    const chatId = whatsappJidToChatId(jid);
+    return chatId ? this.resolveWhatsappChat(chatId) : undefined;
   }
 
   resolveTenant(tenantId: string): TenantRecord | undefined {
@@ -286,6 +351,15 @@ function stringSet(value: unknown): Set<string> {
 export function parseOwnerAllowlistConfig(
   raw: Record<string, unknown>,
 ): OwnerAllowlistConfig {
+  const phones = stringSet(
+    raw.whatsapp_phones ?? raw.whatsappPhones ?? raw.OWNER_WHATSAPP_PHONES,
+  );
+  // Normalize to digits only.
+  const normalizedPhones = new Set<string>();
+  for (const phone of phones) {
+    const digits = phone.replace(/[^0-9]/g, '');
+    if (digits) normalizedPhones.add(digits);
+  }
   return {
     telegram_user_ids: stringSet(
       raw.telegram_user_ids ??
@@ -297,6 +371,7 @@ export function parseOwnerAllowlistConfig(
         raw.telegramChatIds ??
         raw.OWNER_TELEGRAM_CHAT_IDS,
     ),
+    whatsapp_phones: normalizedPhones,
   };
 }
 
@@ -307,6 +382,8 @@ export function loadOwnerAllowlistFromEnv(): OwnerAllowlistConfig {
       process.env.OWNER_TELEGRAM_USER_IDS || envConfig.OWNER_TELEGRAM_USER_IDS,
     OWNER_TELEGRAM_CHAT_IDS:
       process.env.OWNER_TELEGRAM_CHAT_IDS || envConfig.OWNER_TELEGRAM_CHAT_IDS,
+    OWNER_WHATSAPP_PHONES:
+      process.env.OWNER_WHATSAPP_PHONES || envConfig.OWNER_WHATSAPP_PHONES,
   });
 }
 
@@ -342,5 +419,31 @@ export function createTelegramSenderIdentity(args: {
       telegramUserId.length > 0 &&
       ownerAllowlist.telegram_user_ids.has(telegramUserId) &&
       chatAllowed,
+  };
+}
+
+/**
+ * Build a SenderIdentity for an inbound WhatsApp message.
+ * `phone` is normalized to digits only (E.164 without +).
+ */
+export function createWhatsAppSenderIdentity(args: {
+  phone: string;
+  displayNameHint?: string;
+  ownerAllowlist?: OwnerAllowlistConfig;
+}): SenderIdentity {
+  const phone = String(args.phone || '').replace(/[^0-9]/g, '');
+  const ownerAllowlist =
+    args.ownerAllowlist ||
+    parseOwnerAllowlistConfig({
+      whatsapp_phones: [],
+    });
+  const allow = ownerAllowlist.whatsapp_phones ?? new Set<string>();
+  return {
+    channel: 'whatsapp',
+    chat_id: phone,
+    telegram_user_id: '',
+    whatsapp_phone: phone,
+    display_name_hint: args.displayNameHint,
+    is_owner_sender: phone.length > 0 && allow.has(phone),
   };
 }
