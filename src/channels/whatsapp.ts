@@ -154,21 +154,23 @@ export class WhatsAppChannel implements Channel {
       'WhatsApp: starting socket',
     );
 
+    // Baileys' internal logger is noisy. Use a self-referential no-op shim so
+    // `logger.child()` returns the same shim (otherwise Baileys calls
+    // `logger.child({...}).debug(...)` and explodes with "Cannot read x of undefined").
+    const noopLogger: any = {
+      level: 'warn',
+      fatal: () => {},
+      error: () => {},
+      warn: () => {},
+      info: () => {},
+      debug: () => {},
+      trace: () => {},
+    };
+    noopLogger.child = () => noopLogger;
+
     const sock = makeWASocket({
       auth: state,
-      // Baileys' internal logger is noisy. Pass a no-op compatible shim that
-      // ignores routine debug spam — we surface our own events via Skoobi's
-      // logger.
-      logger: {
-        level: 'warn',
-        fatal: () => {},
-        error: () => {},
-        warn: () => {},
-        info: () => {},
-        debug: () => {},
-        trace: () => {},
-        child: () => sock.logger,
-      } as any,
+      logger: noopLogger,
       browser: Browsers.macOS('Desktop'),
       syncFullHistory: false,
       markOnlineOnConnect: true,
