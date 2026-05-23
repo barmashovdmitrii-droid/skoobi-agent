@@ -383,6 +383,7 @@ export class WhatsAppChannel implements Channel {
     mediaKind?: string | null,
   ): boolean {
     if ((this.opts.autoRegisterMode || 'all') === 'all') return true;
+    if (!text.trim()) return false;
     return shouldCreateAutopartsRequest({
       text,
       content: text || (mediaKind ? `[${mediaKind}]` : ''),

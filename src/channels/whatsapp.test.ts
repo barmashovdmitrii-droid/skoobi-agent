@@ -280,6 +280,33 @@ describe('WhatsAppChannel inbound handling', () => {
     ]);
   });
 
+  it('does not auto-register media-only first messages in business_hint mode', () => {
+    const { channel, groups, messages, metadata } = createHarness({
+      autoRegisterMode: 'business_hint',
+    });
+
+    (channel as any).handleInbound({
+      key: {
+        id: 'm1',
+        fromMe: false,
+        remoteJid: '77014274773@s.whatsapp.net',
+      },
+      message: { audioMessage: {} },
+      pushName: 'Актау',
+      messageTimestamp: 1_700_000_000,
+    });
+
+    expect(groups['wa:77014274773']).toBeUndefined();
+    expect(messages).toHaveLength(0);
+    expect(metadata).toEqual([
+      {
+        jid: 'wa:77014274773',
+        displayName: 'Актау',
+        channel: 'whatsapp',
+      },
+    ]);
+  });
+
   it('auto-registers business-like chats in business_hint mode', () => {
     const { channel, groups, messages } = createHarness({
       autoRegisterMode: 'business_hint',
