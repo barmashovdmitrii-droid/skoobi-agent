@@ -5,8 +5,8 @@ Linux. It keeps conversations and runtime state on your computer, uses an
 authenticated local Codex CLI by default, and runs owner tools inside an
 isolated sandbox.
 
-The `2.0.0` line is a major architecture update and is currently a release
-candidate. Review the release notes before upgrading an older installation.
+The `2.0.0` line is the stable release of the new workspace architecture.
+Review the release notes before upgrading an older installation.
 
 ## Quick start
 
@@ -87,7 +87,7 @@ uses the absolute Codex path found during installation.
 ### 4. Download and verify the release installer
 
 ```bash
-VERSION=v2.0.0-rc.3
+VERSION=v2.0.0
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh"
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh.sha256"
 ```
@@ -111,8 +111,20 @@ bash install.sh
 ```
 
 The installer asks for an assistant name and then for the Telegram token. Token
-input is hidden. Do not put the token directly in a shell command or pipe a
-moving branch into a shell.
+input is hidden. Before activating the service, the installer validates the
+token format and authenticates it with Telegram's `getMe` endpoint. Do not put
+the token directly in a shell command or pipe a moving branch into a shell.
+
+For an unattended install, capture the token without putting it in shell
+history, export it only for the installer, and use `--yes`:
+
+```bash
+read -r -s SKOOBI_TELEGRAM_BOT_TOKEN
+printf '\n'
+export SKOOBI_TELEGRAM_BOT_TOKEN
+SKOOBI_ASSISTANT_NAME=Skoobi bash install.sh --yes
+unset SKOOBI_TELEGRAM_BOT_TOKEN
+```
 
 ### 5. Initialize your private owner chat
 
@@ -184,9 +196,9 @@ the existing instance `.env`. The low-level `skoobi update` command is intended
 for advanced, commit-pinned maintenance and requires both an explicit Git ref
 and its exact 40-character commit ID.
 
-An upgrade from `2.0.0-rc.2` to `2.0.0-rc.3` uses the normal verified
-`bash install.sh` path; `--reconfigure` is not needed. An upgrade from
-`2.0.0-rc.1` needs one explicit, checksum-verified
+An upgrade from `2.0.0-rc.2` or `2.0.0-rc.3` to `2.0.0` uses the normal
+verified `bash install.sh` path; `--reconfigure` is not needed. An upgrade
+from `2.0.0-rc.1` needs one explicit, checksum-verified
 `bash install.sh --reconfigure` run. Follow the rc.1 migration steps in
 [docs/INSTALL.md](docs/INSTALL.md#upgrading-from-200-rc1); do not enable the
 Codex profile blindly on an installation that uses another provider.

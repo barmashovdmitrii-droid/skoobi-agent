@@ -120,7 +120,7 @@ directly in a shell command.
 Download both assets from the tagged release:
 
 ```bash
-VERSION=v2.0.0-rc.3
+VERSION=v2.0.0
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh"
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh.sha256"
 ```
@@ -153,7 +153,23 @@ The installer asks for:
 - the Telegram bot token, using hidden terminal input.
 
 It also checks the required tools and Codex login before activating the new
-release.
+release. The Telegram token must have the expected Bot API format and pass a
+live `getMe` authentication check before the managed service can start.
+
+For an unattended install, read the token without exposing it in shell history,
+export it only for the installer, and use `--yes`:
+
+```bash
+read -r -s SKOOBI_TELEGRAM_BOT_TOKEN
+printf '\n'
+export SKOOBI_TELEGRAM_BOT_TOKEN
+SKOOBI_ASSISTANT_NAME=Skoobi bash install.sh --yes
+unset SKOOBI_TELEGRAM_BOT_TOKEN
+```
+
+The default provider is Codex. Set `SKOOBI_INSTALL_PROVIDER` explicitly to
+`codex`, `claude`, or `openai` only when selecting or changing the managed
+provider profile.
 
 ### 5. Initialize the first owner
 
@@ -233,7 +249,9 @@ preferred shell profile yourself if you want it to persist.
 
 A normal installer rerun preserves the existing instance `.env`. Use
 `--reconfigure` only when you intentionally want the installer to update that
-configuration.
+configuration. During reconfiguration, the existing provider, custom
+OpenAI-compatible base URL, and pinned Codex executable are preserved unless
+`SKOOBI_INSTALL_PROVIDER` explicitly selects a different profile.
 
 ## Common operations
 
@@ -268,8 +286,8 @@ bash install.sh
 ```
 
 The installer preserves the existing instance `.env` unless you explicitly
-pass `--reconfigure`. An upgrade from `2.0.0-rc.2` to `2.0.0-rc.3` uses this
-normal path and does not need `--reconfigure`.
+pass `--reconfigure`. An upgrade from `2.0.0-rc.2` or `2.0.0-rc.3` to `2.0.0`
+uses this normal path and does not need `--reconfigure`.
 
 The low-level updater is available for advanced, commit-pinned maintenance:
 
@@ -293,8 +311,8 @@ rc.1 Codex profile therefore keeps owner live mode disabled and does not gain
 the new owner-route flags automatically.
 
 For an rc.1 installation that uses the default Codex profile, download and
-verify the rc.3 `install.sh` and `install.sh.sha256` assets exactly as shown in
-step 4 above. Then run the verified installer explicitly:
+verify the stable `v2.0.0` `install.sh` and `install.sh.sha256` assets exactly
+as shown in step 4 above. Then run the verified installer explicitly:
 
 ```bash
 bash install.sh --reconfigure
@@ -321,7 +339,7 @@ up the instance and review that legacy registration explicitly before retrying.
 This migration recipe intentionally selects the managed Codex profile. If the
 rc.1 installation uses Claude, an OpenAI-compatible endpoint, or custom runtime
 settings, do not apply this Codex reconfiguration blindly. Preserve the
-configuration, review the rc.3 keys in `.env.example`, and enable only the
+configuration, review the `2.0.0` keys in `.env.example`, and enable only the
 provider route you intend to use.
 
 Use `--force --yes` only when you explicitly want an owner-only backup of

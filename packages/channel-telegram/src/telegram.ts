@@ -4630,6 +4630,13 @@ export class TelegramChannel implements Channel {
         );
         if (!onStartFired) {
           // Pre-onStart failure: startup never succeeded, reject connect().
+          const failedBot = this.bot;
+          this.bot = null;
+          try {
+            void Promise.resolve(failedBot?.stop()).catch(() => {});
+          } catch {
+            // A client that failed during initialization may also reject stop.
+          }
           reject(err);
           return;
         }

@@ -108,23 +108,14 @@ run() {
   fi
 }
 
-acquire_operation_lock() {
-  LOCK_DIR="$PREFIX/.skoobi-operation.lock"
-  if [[ "$DRY_RUN" == "1" ]]; then
-    log "[dry-run] acquire exclusive installer operation lock"
-    return 0
-  fi
-  mkdir "$LOCK_DIR" 2>/dev/null ||
-    die "Another Skoobi install, update, or uninstall operation is in progress"
-  LOCK_HELD=1
-}
-
-release_operation_lock() {
-  [[ "$LOCK_HELD" == "1" ]] || return 0
-  rmdir "$LOCK_DIR" ||
-    die "Could not release the installer operation lock"
-  LOCK_HELD=0
-}
+OPERATION_LOCK_LIBRARY="$(
+  cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P
+)/operation-lock.sh"
+[[ -f "$OPERATION_LOCK_LIBRARY" && ! -L "$OPERATION_LOCK_LIBRARY" ]] ||
+  die "Operation lock library not found or unsafe"
+# shellcheck source=operation-lock.sh
+source "$OPERATION_LOCK_LIBRARY"
+unset OPERATION_LOCK_LIBRARY
 
 ensure_git_home() {
   if [[ -z "$GIT_HOME" ]]; then
@@ -391,6 +382,9 @@ assert_managed_paths() {
     die "Refusing to remove a symlinked service file"
   [[ ! -e "$service_file" || -f "$service_file" ]] ||
     die "Refusing to remove a non-regular service file"
+  if [[ -e "$CLI_LINK" || -L "$CLI_LINK" ]]; then
+    assert_home_directory_chain ".local/bin"
+  fi
 }
 
 assert_home_directory_chain() {
@@ -438,6 +432,8 @@ confirm_force() {
     return 0
   }
   local answer=""
+  [[ -t 0 ]] ||
+    die "Forced uninstall confirmation requires a terminal; pass --yes only after reviewing the removal"
   read -r -p "Back up/quarantine app contents and continue? [y/N]: " answer || true
   [[ "$answer" =~ ^(y|Y|yes|YES)$ ]] ||
     die "Forced uninstall was not confirmed"
@@ -452,6 +448,8 @@ confirm_purge() {
     if [[ "${#PURGE_ENV_BACKUPS[@]}" -gt 0 ]]; then
       log "It will also delete ${#PURGE_ENV_BACKUPS[@]} validated instance .env backup(s)."
     fi
+    [[ -t 0 ]] ||
+      die "Purge confirmation requires a terminal or SKOOBI_PURGE_CONFIRMATION"
     read -r -p "Type DELETE Skoobi data to continue: " confirmation || true
   fi
   [[ "$confirmation" == "DELETE Skoobi data" ]] ||
@@ -577,12 +575,50 @@ remove_service_file() {
   fi
 }
 
+read_cli_link_target() {
+  local output="" status=0 sentinel=$'\034'
+  output="$(
+    readlink -n "$CLI_LINK" 2>/dev/null
+    status=$?
+    printf '%s' "$sentinel"
+    exit "$status"
+  )" || return 1
+  [[ "$output" == *"$sentinel" ]] || return 1
+  printf '%s' "${output%"$sentinel"}"
+}
+
+installer_cli_alias_is_owned() {
+  local value="$1" suffix="/app/$APP_NAME/bin/skoobi.js"
+  local candidate_prefix="" candidate_physical=""
+  [[ -n "$value" ]] || return 1
+  case "$value" in
+    *$'\n'*|*$'\r'*) return 1 ;;
+  esac
+  [[ "$value" == /* && "$value" == *"$suffix" ]] || return 1
+  candidate_prefix="${value%"$suffix"}"
+  [[ -n "$candidate_prefix" && -d "$candidate_prefix" &&
+      ! -L "$candidate_prefix" ]] || return 1
+  candidate_physical="$(cd -- "$candidate_prefix" && pwd -P)" || return 1
+  [[ "$candidate_physical" == "$PREFIX" ]]
+}
+
 remove_owned_cli_link() {
   [[ -L "$CLI_LINK" ]] || return 0
-  local current_target
-  current_target="$(readlink "$CLI_LINK" 2>/dev/null || true)"
+  local current_target="" verified_target=""
+  local owned=0
+  current_target="$(read_cli_link_target 2>/dev/null || true)"
   if [[ "$current_target" == "$CLI_TARGET" ]]; then
-    run rm -f "$CLI_LINK"
+    owned=1
+  elif installer_cli_alias_is_owned "$current_target"; then
+    owned=1
+  fi
+  if [[ "$owned" == "1" ]]; then
+    verified_target="$(read_cli_link_target 2>/dev/null || true)"
+    if [[ "$verified_target" != "$current_target" ]]; then
+      log "Preserving CLI symlink because it changed during ownership verification."
+      return 0
+    fi
+    run rm -f -- "$CLI_LINK"
     log "Removed owned Skoobi CLI symlink."
   else
     log "Preserving CLI symlink not owned by this installation."
@@ -629,8 +665,7 @@ cleanup() {
   status="$1"
   [[ -z "$GIT_HOME" || ! -e "$GIT_HOME" ]] || rm -rf "$GIT_HOME"
   if [[ "$LOCK_HELD" == "1" ]]; then
-    rmdir "$LOCK_DIR" >/dev/null 2>&1 || true
-    LOCK_HELD=0
+    release_operation_lock >/dev/null 2>&1 || true
   fi
   return "$status"
 }
@@ -642,7 +677,7 @@ main() {
   log "instance: $INSTANCE_DIR"
 
   assert_managed_paths
-  acquire_operation_lock
+  acquire_operation_lock uninstall
   run mkdir -p "$BACKUP_DIR"
   run chmod 700 "$PREFIX" "$BACKUP_DIR"
   [[ "$DRY_RUN" == "1" ]] || assess_app
@@ -687,7 +722,8 @@ main() {
     log "Safety backups preserved in: $BACKUP_DIR"
     log "Use --purge only after backup and exact confirmation."
   fi
-  release_operation_lock
+  release_operation_lock ||
+    die "Could not release the uninstaller operation lock"
   log "Skoobi uninstall complete."
 }
 

@@ -586,6 +586,7 @@ describe('TelegramChannel', () => {
       const channel = new TelegramChannel('test-token', opts);
 
       await expect(channel.connect()).rejects.toThrow('401: Unauthorized');
+      expect(channel.isConnected()).toBe(false);
       expect(loggerMock.error).toHaveBeenCalledWith(
         expect.objectContaining({
           err: expect.objectContaining({ message: '401: Unauthorized' }),

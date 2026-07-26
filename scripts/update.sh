@@ -153,16 +153,14 @@ run() {
   fi
 }
 
-acquire_operation_lock() {
-  LOCK_DIR="$PREFIX/.skoobi-operation.lock"
-  if [[ "$DRY_RUN" == "1" ]]; then
-    log "[dry-run] acquire exclusive installer operation lock"
-    return 0
-  fi
-  mkdir "$LOCK_DIR" 2>/dev/null ||
-    die "Another Skoobi install, update, or uninstall operation is in progress"
-  LOCK_HELD=1
-}
+OPERATION_LOCK_LIBRARY="$(
+  cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P
+)/operation-lock.sh"
+[[ -f "$OPERATION_LOCK_LIBRARY" && ! -L "$OPERATION_LOCK_LIBRARY" ]] ||
+  die "Operation lock library not found or unsafe"
+# shellcheck source=operation-lock.sh
+source "$OPERATION_LOCK_LIBRARY"
+unset OPERATION_LOCK_LIBRARY
 
 ensure_git_home() {
   if [[ -z "$GIT_HOME" ]]; then
@@ -471,6 +469,8 @@ confirm_force() {
     return 0
   }
   local answer=""
+  [[ -t 0 ]] ||
+    die "Forced update confirmation requires a terminal; pass --yes only after reviewing the backup and replacement"
   read -r -p "Back up owner changes and replace the app release? [y/N]: " answer || true
   [[ "$answer" =~ ^(y|Y|yes|YES)$ ]] ||
     die "Forced update was not confirmed"
@@ -944,9 +944,7 @@ rollback_release() {
     rmdir "$OLD_RELEASE_ROOT" >/dev/null 2>&1 || true
   fi
   if [[ "$LOCK_HELD" == "1" ]]; then
-    if rmdir "$LOCK_DIR" >/dev/null 2>&1; then
-      LOCK_HELD=0
-    fi
+    release_operation_lock >/dev/null 2>&1 || true
   fi
   set -e
   return "$status"
@@ -977,9 +975,7 @@ cleanup_exit_artifacts() {
     fi
   fi
   if [[ "$LOCK_HELD" == "1" ]]; then
-    if rmdir "$LOCK_DIR" >/dev/null 2>&1; then
-      LOCK_HELD=0
-    else
+    if ! release_operation_lock >/dev/null 2>&1; then
       err "Could not release the updater operation lock: $LOCK_DIR"
       cleanup_failed=1
     fi
@@ -1013,7 +1009,7 @@ main() {
     die "Instance not found"
 
   if [[ "$DRY_RUN" == "0" ]]; then
-    acquire_operation_lock
+    acquire_operation_lock update
     validate_origin
     if ! valid_marker; then
       [[ "$ADOPT_MANAGED" == "1" ]] ||
@@ -1024,7 +1020,7 @@ main() {
       die "Managed app contains unsupported Git submodules"
   fi
   if [[ "$DRY_RUN" == "1" ]]; then
-    acquire_operation_lock
+    acquire_operation_lock update
   fi
 
   log "Updating Skoobi app"
