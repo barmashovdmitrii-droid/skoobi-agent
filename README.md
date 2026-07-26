@@ -165,6 +165,12 @@ skoobi restart
 skoobi update
 ```
 
+An upgrade from `2.0.0-rc.1` needs one explicit, checksum-verified
+`install.sh --reconfigure` run because the updater intentionally preserves
+`.env`. Follow the rc.1 migration steps in
+[docs/INSTALL.md](docs/INSTALL.md#upgrading-from-200-rc1); do not enable the
+Codex profile blindly on an installation that uses another provider.
+
 See [docs/INSTALL.md](docs/INSTALL.md) for source installation, lifecycle
 details, legacy migration, and troubleshooting.
 

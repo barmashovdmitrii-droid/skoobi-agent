@@ -500,6 +500,93 @@ describe('Skoobi installer scripts', () => {
     expect(restrictedResult.stderr).not.toContain('invalid');
   });
 
+  it('rejects legacy main rows that do not preserve owner-only runtime invariants', () => {
+    const incompatibleRows = [
+      { requiresTrigger: 1, runtime: 'sandbox' },
+      { requiresTrigger: 0, runtime: 'container' },
+      { requiresTrigger: null, runtime: 'sandbox' },
+      { requiresTrigger: 0, runtime: null },
+    ];
+
+    for (const incompatible of incompatibleRows) {
+      const state = createOwnerCliState({
+        ownerIds: '123456789',
+        mainJid: 'tg:123456789',
+      });
+      const database = new Database(state.dbFile);
+      database
+        .prepare(
+          `UPDATE registered_groups
+           SET requires_trigger = ?, runtime = ?
+           WHERE jid = 'tg:123456789'`,
+        )
+        .run(incompatible.requiresTrigger, incompatible.runtime);
+      database.close();
+      const beforeEnv = fs.readFileSync(state.envFile, 'utf8');
+      const beforeRows = ownerRows(state.dbFile);
+
+      const result = runOwnerCli(state, '123456789');
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(
+        'existing main registration is not owner-ready',
+      );
+      expect(ownerRows(state.dbFile)).toEqual(beforeRows);
+      expect(fs.readFileSync(state.envFile, 'utf8')).toBe(beforeEnv);
+      expect(fs.existsSync(path.join(state.groupsDir, 'telegram_main'))).toBe(
+        false,
+      );
+    }
+  });
+
+  it('doctor rejects an incompatible legacy owner registration', () => {
+    const state = createOwnerCliState({
+      ownerIds: '123456789',
+      mainJid: 'tg:123456789',
+    });
+    const database = new Database(state.dbFile);
+    database
+      .prepare(
+        `UPDATE registered_groups
+         SET requires_trigger = 1, runtime = 'container'
+         WHERE jid = 'tg:123456789'`,
+      )
+      .run();
+    database.close();
+    const fake = makeFakeCommands({
+      node: 'printf "v22.14.0\\n"',
+      npm: 'printf "10.0.0\\n"',
+      git: 'printf "git version 2.0.0\\n"',
+      sqlite3: 'printf "3.0.0\\n"',
+      curl: 'printf "curl 8.0.0\\n"',
+      rg: 'printf "ripgrep 14.0.0\\n"',
+      bwrap: 'printf "bubblewrap 0.10.0\\n"',
+      socat: 'printf "socat version 1.8.0\\n"',
+      codex:
+        '[[ "$*" == "login status" ]] && exit 0; printf "codex-cli test\\n"',
+    });
+    const doctor = runResult(
+      process.execPath,
+      [
+        'bin/skoobi.js',
+        'doctor',
+        '--prefix',
+        state.prefix,
+        '--instance',
+        state.instance,
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: tempDir('skoobi-doctor-home-'),
+          PATH: fake.bin,
+        },
+      },
+    );
+    expect(doctor.status).not.toBe(0);
+    expect(doctor.stdout).toContain('telegram owner: problem');
+    expect(doctor.stdout).toContain('overall: needs attention');
+  });
+
   it('refuses unsafe owner paths and a concurrent Skoobi operation', () => {
     const locked = createOwnerCliState();
     fs.mkdirSync(path.join(locked.prefix, '.skoobi-operation.lock'), {

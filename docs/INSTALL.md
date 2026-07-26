@@ -243,6 +243,44 @@ The updater refuses a dirty application checkout. It builds in a private
 staging directory and does not replace the active release unless the build
 succeeds.
 
+### Upgrading from 2.0.0-rc.1
+
+A normal `skoobi update` deliberately preserves the existing instance `.env`.
+The rc.1 Codex profile therefore keeps owner live mode disabled and does not
+gain the new owner-route flags automatically.
+
+For an rc.1 installation that uses the default Codex profile, download and
+verify the rc.2 `install.sh` and `install.sh.sha256` assets exactly as shown in
+step 4 above. Then run the verified installer explicitly:
+
+```bash
+bash install.sh --reconfigure
+```
+
+When prompted, enter the existing assistant name if you customized it. A
+nonempty Telegram token is retained. The installer creates an owner-only
+backup of the old `.env`, reapplies the managed sandbox/Codex profile, keeps
+guest live mode disabled, and writes the rc.2 owner-route flags.
+
+Next, send `/chatid` in the private bot chat and use the exact returned value:
+
+```bash
+skoobi owner init tg:123456789
+skoobi restart
+skoobi doctor
+```
+
+Owner initialization is idempotent for an already compatible registration. If
+it reports that an existing main registration is not owner-ready, Skoobi leaves
+that row and the `.env` unchanged. Do not delete or silently rewrite it; back
+up the instance and review that legacy registration explicitly before retrying.
+
+This migration recipe intentionally selects the managed Codex profile. If the
+rc.1 installation uses Claude, an OpenAI-compatible endpoint, or custom runtime
+settings, do not apply this Codex reconfiguration blindly. Preserve the
+configuration, review the rc.2 keys in `.env.example`, and enable only the
+provider route you intend to use.
+
 Use `--force --yes` only when you explicitly want an owner-only backup of
 tracked, untracked, ignored, and symlinked application changes followed by
 replacement of the active release. Git submodules and FIFO, socket, or device

@@ -10,6 +10,8 @@ All notable public changes to Skoobi Agent are documented here.
 - Verified the pinned sandbox runtime without `npx` or network resolution.
 - Expanded dependency, authentication, owner, and runtime health checks.
 - Added an English five-minute Quick Start and troubleshooting guide.
+- Documented the required explicit rc.1 Codex-profile reconfiguration; a
+  normal update continues to preserve the existing private `.env`.
 
 ## 2.0.0-rc.1
 

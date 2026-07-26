@@ -357,7 +357,7 @@ function assertSchema(database) {
 function mainRows(database) {
   return database
     .prepare(
-      `SELECT jid, folder, requires_trigger
+      `SELECT jid, folder, requires_trigger, runtime
        FROM registered_groups
        WHERE is_main = 1
        ORDER BY jid`,
@@ -379,17 +379,22 @@ function validateRegistrationState(database, jid) {
 
   const jidRow = database
     .prepare(
-      `SELECT jid, folder, is_main
+      `SELECT jid, folder, requires_trigger, is_main, runtime
        FROM registered_groups
        WHERE jid = ?`,
     )
     .get(jid);
-  if (
-    jidRow &&
-    (jidRow.folder !== OWNER_FOLDER || Number(jidRow.is_main) !== 1)
-  ) {
+  if (jidRow && (jidRow.folder !== OWNER_FOLDER || jidRow.is_main !== 1)) {
     throw new Error(
       'This Telegram identity already has a different registration; refusing to replace it',
+    );
+  }
+  if (
+    jidRow &&
+    (jidRow.requires_trigger !== 0 || jidRow.runtime !== 'sandbox')
+  ) {
+    throw new Error(
+      'The existing main registration is not owner-ready; refusing to modify it',
     );
   }
 
@@ -530,8 +535,8 @@ function ownerRegistrationReady(database, jid) {
   return (
     row?.jid === jid &&
     row.folder === OWNER_FOLDER &&
-    Number(row.requires_trigger) === 0 &&
-    Number(row.is_main) === 1 &&
+    row.requires_trigger === 0 &&
+    row.is_main === 1 &&
     row.runtime === 'sandbox' &&
     mainRows(database).length === 1
   );
@@ -695,6 +700,8 @@ export function inspectTelegramOwner(paths) {
     const matching =
       mains.length === 1 &&
       mains[0].folder === OWNER_FOLDER &&
+      mains[0].requires_trigger === 0 &&
+      mains[0].runtime === 'sandbox' &&
       [...ownerIds].some(
         (userId) =>
           mains[0].jid === jidForPrivateUser(userId, botId) &&
