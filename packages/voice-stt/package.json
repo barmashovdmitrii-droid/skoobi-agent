@@ -1,0 +1,21 @@
+{
+  "name": "@skoobi/voice-stt",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Skoobi brick: speech-to-text (local whisper transcription + Telegram voice download helper)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@skoobi/shared": "*"
+  }
+}

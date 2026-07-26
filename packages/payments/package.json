@@ -1,0 +1,37 @@
+{
+  "name": "@skoobi/payments",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Provider-neutral payment ports, validated plan catalogs, and subscription lifecycle helpers",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./payment-gateway": {
+      "types": "./dist/payment-gateway.d.ts",
+      "default": "./dist/payment-gateway.js"
+    },
+    "./payment-service": {
+      "types": "./dist/payment-service.d.ts",
+      "default": "./dist/payment-service.js"
+    },
+    "./payment-plans": {
+      "types": "./dist/payment-plans.d.ts",
+      "default": "./dist/payment-plans.js"
+    },
+    "./payment-activation": {
+      "types": "./dist/payment-activation.d.ts",
+      "default": "./dist/payment-activation.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@skoobi/shared": "*"
+  }
+}

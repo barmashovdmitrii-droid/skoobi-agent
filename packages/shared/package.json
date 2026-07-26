@@ -1,0 +1,71 @@
+{
+  "name": "@skoobi/shared",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Skoobi shared brick: logger (with process-level keep-alive handlers), .env reader, log redaction",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./logger": {
+      "types": "./dist/logger.d.ts",
+      "default": "./dist/logger.js"
+    },
+    "./env": {
+      "types": "./dist/env.d.ts",
+      "default": "./dist/env.js"
+    },
+    "./log-sanitize": {
+      "types": "./dist/log-sanitize.d.ts",
+      "default": "./dist/log-sanitize.js"
+    },
+    "./media-manifest": {
+      "types": "./dist/media-manifest.d.ts",
+      "default": "./dist/media-manifest.js"
+    },
+    "./telegram-jid": {
+      "types": "./dist/telegram-jid.d.ts",
+      "default": "./dist/telegram-jid.js"
+    },
+    "./telegram-identity": {
+      "types": "./dist/telegram-identity.d.ts",
+      "default": "./dist/telegram-identity.js"
+    },
+    "./channel-types": {
+      "types": "./dist/channel-types.d.ts",
+      "default": "./dist/channel-types.js"
+    },
+    "./group-folder": {
+      "types": "./dist/group-folder.d.ts",
+      "default": "./dist/group-folder.js"
+    },
+    "./private-admin": {
+      "types": "./dist/private-admin.d.ts",
+      "default": "./dist/private-admin.js"
+    },
+    "./safe-child-write": {
+      "types": "./dist/safe-child-write.d.ts",
+      "default": "./dist/safe-child-write.js"
+    },
+    "./binary-paths": {
+      "types": "./dist/binary-paths.d.ts",
+      "default": "./dist/binary-paths.js"
+    },
+    "./assistant-name": {
+      "types": "./dist/assistant-name.d.ts",
+      "default": "./dist/assistant-name.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0",
+    "yaml": "^2.8.3"
+  }
+}

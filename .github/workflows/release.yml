@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions: {}
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Validate release tag
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const tag = process.env.GITHUB_REF_NAME;
+          const strictSemver = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?$/;
+          if (typeof pkg.version !== 'string' || !strictSemver.test(pkg.version)) {
+            console.error('Package version must be strict SemVer without build metadata');
+            process.exit(1);
+          }
+          const expected = `v${pkg.version}`;
+          if (tag !== expected) {
+            console.error(`Release tag ${tag} does not match package version ${expected}`);
+            process.exit(1);
+          }
+          NODE
+
+      - name: Validate release ancestry
+        run: |
+          SOURCE_COMMIT="$(git rev-parse --verify "$GITHUB_SHA^{commit}")"
+          if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]]; then
+            git fetch --no-tags --prune --unshallow origin \
+              '+refs/heads/main:refs/remotes/origin/main'
+          else
+            git fetch --no-tags --prune origin \
+              '+refs/heads/main:refs/remotes/origin/main'
+          fi
+          if ! git merge-base --is-ancestor \
+            "$SOURCE_COMMIT" refs/remotes/origin/main; then
+            echo "Release tag commit is not reachable from origin/main" >&2
+            exit 1
+          fi
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install agent runner dependencies
+        run: npm ci --prefix agent/runner
+
+      - name: Test
+        run: npm test
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Check shell scripts
+        run: bash -n scripts/*.sh
+
+  publish:
+    needs: verify
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+    steps:
+      - name: Checkout immutable release source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Validate immutable release source
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const tag = process.env.GITHUB_REF_NAME;
+          const strictSemver = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?$/;
+          if (typeof pkg.version !== 'string' || !strictSemver.test(pkg.version)) {
+            console.error('Package version must be strict SemVer without build metadata');
+            process.exit(1);
+          }
+          if (tag !== `v${pkg.version}`) {
+            console.error('Release tag does not match package version');
+            process.exit(1);
+          }
+          NODE
+          SOURCE_COMMIT="$(git rev-parse --verify "$GITHUB_SHA^{commit}")"
+          test "$(git rev-parse --verify HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          git fetch --no-tags --prune origin \
+            '+refs/heads/main:refs/remotes/origin/main'
+          git merge-base --is-ancestor \
+            "$SOURCE_COMMIT" refs/remotes/origin/main
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets release-input
+          SOURCE_COMMIT="$(git rev-parse --verify "$GITHUB_SHA^{commit}")"
+          test "$(git rev-parse --verify HEAD)" = "$SOURCE_COMMIT"
+          if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GITHUB_SHA did not resolve to a 40-hex commit" >&2
+            exit 1
+          fi
+          git show "$SOURCE_COMMIT:scripts/install.sh" \
+            > release-input/install.sh
+          git show "$SOURCE_COMMIT:package.json" \
+            > release-input/package.json
+          git show "$SOURCE_COMMIT:scripts/prepare-release-installer.mjs" \
+            > release-input/prepare-release-installer.mjs
+          node release-input/prepare-release-installer.mjs \
+            --installer release-input/install.sh \
+            --package release-input/package.json \
+            --tag "$GITHUB_REF_NAME" \
+            --commit "$SOURCE_COMMIT"
+          mv release-input/install.sh release-assets/install.sh
+          chmod +x release-assets/install.sh
+          cd release-assets
+          shasum -a 256 install.sh > install.sh.sha256
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_flags=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            release_flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            release-assets/install.sh \
+            release-assets/install.sh.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Skoobi $GITHUB_REF_NAME" \
+            --generate-notes \
+            "${release_flags[@]}" \
+            --verify-tag

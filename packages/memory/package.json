@@ -1,0 +1,37 @@
+{
+  "name": "@skoobi/memory",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Skoobi brick: file-based memory — group/shared-user context loaders, curator digest, legacy user-memory migration",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./memory-context": {
+      "types": "./dist/memory-context.d.ts",
+      "default": "./dist/memory-context.js"
+    },
+    "./memory-curator": {
+      "types": "./dist/memory-curator.d.ts",
+      "default": "./dist/memory-curator.js"
+    },
+    "./memory-provenance": {
+      "types": "./dist/memory-provenance.d.ts",
+      "default": "./dist/memory-provenance.js"
+    },
+    "./user-memory-migration": {
+      "types": "./dist/user-memory-migration.d.ts",
+      "default": "./dist/user-memory-migration.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@skoobi/shared": "*"
+  }
+}

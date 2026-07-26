@@ -1,0 +1,27 @@
+{
+  "name": "@skoobi/billing",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Skoobi brick: billing — internal credit accounting (user quota accounts, usage ledger, adjustments, plan limits, RU status formatting). Owns the user_quota_accounts/usage_ledger/quota_adjustments tables; the db handle is injected via createQuotaSchema. Separate from @skoobi/payments (external payment API).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./quota": {
+      "types": "./dist/quota.d.ts",
+      "default": "./dist/quota.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@skoobi/shared": "*",
+    "better-sqlite3": "^11.8.1",
+    "yaml": "^2.8.3"
+  }
+}

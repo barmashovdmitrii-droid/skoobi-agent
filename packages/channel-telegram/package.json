@@ -1,0 +1,68 @@
+{
+  "name": "@skoobi/channel-telegram",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Skoobi brick: Telegram channel — grammY bot (TelegramChannel + injected core host) and media ingestion glue (photo/audio/video/document download+extract, storage admin)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./photo-telegram": {
+      "types": "./dist/photo-telegram.d.ts",
+      "default": "./dist/photo-telegram.js"
+    },
+    "./audio-telegram": {
+      "types": "./dist/audio-telegram.d.ts",
+      "default": "./dist/audio-telegram.js"
+    },
+    "./video-telegram": {
+      "types": "./dist/video-telegram.d.ts",
+      "default": "./dist/video-telegram.js"
+    },
+    "./document-telegram": {
+      "types": "./dist/document-telegram.d.ts",
+      "default": "./dist/document-telegram.js"
+    },
+    "./admin-storage": {
+      "types": "./dist/admin-storage.d.ts",
+      "default": "./dist/admin-storage.js"
+    },
+    "./telegram": {
+      "types": "./dist/telegram.d.ts",
+      "default": "./dist/telegram.js"
+    },
+    "./telegram-bot-config": {
+      "types": "./dist/telegram-bot-config.d.ts",
+      "default": "./dist/telegram-bot-config.js"
+    },
+    "./wiring": {
+      "types": "./dist/wiring.d.ts",
+      "default": "./dist/wiring.js"
+    },
+    "./photo-caption": {
+      "types": "./dist/photo-caption.d.ts",
+      "default": "./dist/photo-caption.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@skoobi/memory": "*",
+    "@skoobi/payments": "*",
+    "@skoobi/shared": "*",
+    "@skoobi/voice-stt": "*",
+    "@skoobi/voice-tts": "*",
+    "grammy": "^1.39.3",
+    "mammoth": "^1.12.0",
+    "pdf-parse": "^2.4.5",
+    "read-excel-file": "^9.0.9",
+    "@skoobi/core": "*",
+    "@skoobi/billing": "*",
+    "@anthropic-ai/sdk": "^0.91.1"
+  }
+}

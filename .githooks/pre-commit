@@ -1,0 +1,130 @@
+#!/bin/bash
+# Pre-commit hook: Block commits containing secrets or project-specific identifiers
+# Patterns to catch: passwords, connection strings, API keys, internal hostnames
+
+set -uo pipefail
+umask 077
+
+PATTERNS=(
+  'xoxb-[0-9]'           # Slack bot tokens
+  'xapp-[0-9]'           # Slack app tokens
+  'sk-''ant-'            # Anthropic API keys
+  'sk-[a-zA-Z0-9]{20,}'  # Generic API keys
+  'gh[pousr]_[a-zA-Z0-9]{20,}' # GitHub tokens
+  'github_pat_[a-zA-Z0-9_]{20,}' # GitHub fine-grained tokens
+  '-----BEGIN (ENCRYPTED |RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----'
+  'password.*=.*[a-f0-9]{16,}'  # Passwords in assignments
+  'https?://[^/[:space:]:@]+:[^@[:space:]/]+@' # URLs with credentials
+  'proxy\.rlwy\.net'     # Railway proxy hosts
+)
+
+# Tier 1 privacy: block paths that contain user data even if .gitignore is
+# bypassed by an explicit `git add -f`.
+BLOCKED_PATHS=(
+  '(^|/)groups/'
+  '(^|/)store/'
+  '(^|/)logs/'
+  '(^|/)data/ipc/'
+  '(^|/)(received|output)/'
+  '(^|/)(auth|credentials|secrets|sessions)/'
+  '(^|/)\.env($|\.)'
+  '(^|/)\.envrc($|\.)'
+  '(^|/)[^/]+\.env($|\.)'
+  '(^|/)\.(aws|claude|codex|docker|gnupg|kube|ssh)/'
+  '(^|/)\.(git-credentials|netrc|npmrc|pypirc)$'
+  '(^|/)[^/]*(application_default_credentials|auth|cookie|credential|secret|session|token)[^/]*\.json$'
+  '(^|/)client_secret[^/]*\.json$'
+  '(^|/)[^/]*service-account[^/]*\.json$'
+  '(^|/)id_(rsa|ed25519)[^/]*$'
+  '(^|/)[^/]+\.(pem|key|p12|pfx|log|bak|backup|zip|tar|tgz|7z|jsonl|ndjson)$'
+  '(^|/)[^/]*\.(db|sqlite|sqlite3)(-(wal|shm|journal))?$'
+)
+
+TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/skoobi-precommit.XXXXXX")" || {
+  echo "Commit blocked: cannot create a private temporary directory."
+  exit 1
+}
+trap 'rm -rf -- "$TEMP_ROOT"' EXIT HUP INT TERM
+STAGED_LIST="$TEMP_ROOT/staged-paths"
+PATCH_FILE="$TEMP_ROOT/staged.patch"
+
+if ! git --no-pager diff --cached --name-only --diff-filter=ACMRT -z \
+  >"$STAGED_LIST"; then
+  echo "Commit blocked: cannot inspect staged paths."
+  exit 1
+fi
+
+STAGED_FILES=()
+while IFS= read -r -d '' file; do
+  STAGED_FILES+=("$file")
+done <"$STAGED_LIST"
+
+[ "${#STAGED_FILES[@]}" -eq 0 ] && exit 0
+
+# Reject staged paths under privacy-sensitive trees.
+PATH_BLOCKED=0
+for file in "${STAGED_FILES[@]}"; do
+  # .env.example is documentation and must stay commit-able, but every real
+  # env file remains blocked by the patterns below.
+  if [ "$file" = ".env.example" ] ||
+    [ "$file" = "public-release/overlay/.env.example" ]; then
+    continue
+  fi
+  for blocked in "${BLOCKED_PATHS[@]}"; do
+    if [[ "$file" =~ $blocked ]]; then
+      printf 'BLOCKED: %q matches privacy-sensitive path rule.\n' "$file"
+      PATH_BLOCKED=1
+    fi
+  done
+done
+
+if [ $PATH_BLOCKED -ne 0 ]; then
+  echo "================================================================"
+  echo "Commit blocked: privacy-sensitive paths cannot be checked in."
+  echo "These paths hold per-user data (groups/), live DB (store/*.db*),"
+  echo "logs, env files, or local IPC sockets."
+  echo "================================================================"
+  exit 1
+fi
+
+FOUND=0
+for file in "${STAGED_FILES[@]}"; do
+  # Skip binary files and .env (already gitignored)
+  case "$file" in
+    *.png|*.jpg|*.jpeg|*.gif|*.ico|*.webp)
+      continue
+      ;;
+  esac
+
+  if ! git --no-pager diff --cached --no-ext-diff --no-textconv -- "$file" \
+    >"$PATCH_FILE"; then
+    printf 'Commit blocked: cannot inspect staged content for %q.\n' "$file"
+    exit 1
+  fi
+
+  for pattern_index in "${!PATTERNS[@]}"; do
+    pattern="${PATTERNS[$pattern_index]}"
+    if grep -qE "^\+.*$pattern" "$PATCH_FILE"; then
+      printf 'BLOCKED: potential secret in %q (rule %d).\n' \
+        "$file" "$((pattern_index + 1))"
+      FOUND=1
+    else
+      grep_status=$?
+      if [ "$grep_status" -ne 1 ]; then
+        echo "Commit blocked: secret scan failed."
+        exit 1
+      fi
+    fi
+  done
+done
+
+if [ $FOUND -ne 0 ]; then
+  echo "================================================================"
+  echo "Commit blocked: potential secrets detected in staged files."
+  echo "Move secrets to .env and use env var references instead."
+  echo "To bypass (if false positive): git commit --no-verify"
+  echo "================================================================"
+  exit 1
+fi
+
+exit 0

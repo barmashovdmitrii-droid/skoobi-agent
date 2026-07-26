@@ -1,0 +1,55 @@
+{
+  "name": "@skoobi/providers",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Skoobi brick: AI provider connections — Codex CLI, OpenAI-compatible HTTP (incl. Ollama preset), circuit breaker, failover policy, search gateway",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./model-gateway": {
+      "types": "./dist/model-gateway.d.ts",
+      "default": "./dist/model-gateway.js"
+    },
+    "./codex-subscription-gateway": {
+      "types": "./dist/codex-subscription-gateway.d.ts",
+      "default": "./dist/codex-subscription-gateway.js"
+    },
+    "./search-gateway": {
+      "types": "./dist/search-gateway.d.ts",
+      "default": "./dist/search-gateway.js"
+    },
+    "./image-gateway": {
+      "types": "./dist/image-gateway.d.ts",
+      "default": "./dist/image-gateway.js"
+    },
+    "./provider-circuit-breaker": {
+      "types": "./dist/provider-circuit-breaker.d.ts",
+      "default": "./dist/provider-circuit-breaker.js"
+    },
+    "./provider-failover": {
+      "types": "./dist/provider-failover.d.ts",
+      "default": "./dist/provider-failover.js"
+    },
+    "./truthfulness": {
+      "types": "./dist/truthfulness.d.ts",
+      "default": "./dist/truthfulness.js"
+    },
+    "./provider": {
+      "types": "./dist/provider.d.ts",
+      "default": "./dist/provider.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@skoobi/shared": "*",
+    "better-sqlite3": "^11.8.1",
+    "yaml": "^2.8.3"
+  }
+}

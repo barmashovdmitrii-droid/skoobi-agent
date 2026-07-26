@@ -1,0 +1,26 @@
+{
+  "name": "@skoobi/dashboard",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Skoobi brick: локальная веб-панель (мониторинг + управление модулями, на русском). Read-only чтение той же SQLite, логов и launchd; действия — только из жёсткого allowlist с аудитом. Слушает строго 127.0.0.1, вход по токену SKOOBI_DASHBOARD_TOKEN.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@skoobi/shared": "*",
+    "better-sqlite3": "^11.8.1"
+  }
+}

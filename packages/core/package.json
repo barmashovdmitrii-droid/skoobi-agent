@@ -1,0 +1,187 @@
+{
+  "name": "@skoobi/core",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Skoobi core: the orchestrator family (db/event-store/tenant-registry/queues/registries/ipc/scheduler/engine wiring/message loop), moved as a family — the package mirrors the old src/ layout (orchestrator/, later runtimes/, cost-tracking/, webhook/) so mutual relative imports stay untouched. Root src keeps re-export stubs + the main-instance assembly.",
+  "type": "module",
+  "main": "./dist/orchestrator/index.js",
+  "types": "./dist/orchestrator/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/orchestrator/index.d.ts",
+      "default": "./dist/orchestrator/index.js"
+    },
+    "./types": {
+      "types": "./dist/orchestrator/types.d.ts",
+      "default": "./dist/orchestrator/types.js"
+    },
+    "./config": {
+      "types": "./dist/orchestrator/config.d.ts",
+      "default": "./dist/orchestrator/config.js"
+    },
+    "./timezone": {
+      "types": "./dist/orchestrator/timezone.d.ts",
+      "default": "./dist/orchestrator/timezone.js"
+    },
+    "./router": {
+      "types": "./dist/orchestrator/router.d.ts",
+      "default": "./dist/orchestrator/router.js"
+    },
+    "./channel-registry": {
+      "types": "./dist/orchestrator/channel-registry.d.ts",
+      "default": "./dist/orchestrator/channel-registry.js"
+    },
+    "./tenant-registry": {
+      "types": "./dist/orchestrator/tenant-registry.d.ts",
+      "default": "./dist/orchestrator/tenant-registry.js"
+    },
+    "./event-store": {
+      "types": "./dist/orchestrator/event-store.d.ts",
+      "default": "./dist/orchestrator/event-store.js"
+    },
+    "./db": {
+      "types": "./dist/orchestrator/db.d.ts",
+      "default": "./dist/orchestrator/db.js"
+    },
+    "./whatsapp-observer": {
+      "types": "./dist/orchestrator/whatsapp-observer.d.ts",
+      "default": "./dist/orchestrator/whatsapp-observer.js"
+    },
+    "./ingestion": {
+      "types": "./dist/orchestrator/ingestion.d.ts",
+      "default": "./dist/orchestrator/ingestion.js"
+    },
+    "./calendar-adapter": {
+      "types": "./dist/orchestrator/calendar-adapter.d.ts",
+      "default": "./dist/orchestrator/calendar-adapter.js"
+    },
+    "./group-queue": {
+      "types": "./dist/orchestrator/group-queue.d.ts",
+      "default": "./dist/orchestrator/group-queue.js"
+    },
+    "./process-tree": {
+      "types": "./dist/orchestrator/process-tree.d.ts",
+      "default": "./dist/orchestrator/process-tree.js"
+    },
+    "./skill-registry": {
+      "types": "./dist/orchestrator/skill-registry.d.ts",
+      "default": "./dist/orchestrator/skill-registry.js"
+    },
+    "./run-activity": {
+      "types": "./dist/orchestrator/run-activity.d.ts",
+      "default": "./dist/orchestrator/run-activity.js"
+    },
+    "./instructions": {
+      "types": "./dist/orchestrator/instructions.d.ts",
+      "default": "./dist/orchestrator/instructions.js"
+    },
+    "./persona-registry": {
+      "types": "./dist/orchestrator/persona-registry.d.ts",
+      "default": "./dist/orchestrator/persona-registry.js"
+    },
+    "./mount-security": {
+      "types": "./dist/orchestrator/mount-security.d.ts",
+      "default": "./dist/orchestrator/mount-security.js"
+    },
+    "./credential-proxy": {
+      "types": "./dist/orchestrator/credential-proxy.d.ts",
+      "default": "./dist/orchestrator/credential-proxy.js"
+    },
+    "./extensions": {
+      "types": "./dist/orchestrator/extensions.d.ts",
+      "default": "./dist/orchestrator/extensions.js"
+    },
+    "./extension-manifest": {
+      "types": "./dist/orchestrator/extension-manifest.d.ts",
+      "default": "./dist/orchestrator/extension-manifest.js"
+    },
+    "./extension-loader": {
+      "types": "./dist/orchestrator/extension-loader.d.ts",
+      "default": "./dist/orchestrator/extension-loader.js"
+    },
+    "./sender-allowlist": {
+      "types": "./dist/orchestrator/sender-allowlist.d.ts",
+      "default": "./dist/orchestrator/sender-allowlist.js"
+    },
+    "./remote-control": {
+      "types": "./dist/orchestrator/remote-control.d.ts",
+      "default": "./dist/orchestrator/remote-control.js"
+    },
+    "./transcript-sweep": {
+      "types": "./dist/orchestrator/transcript-sweep.d.ts",
+      "default": "./dist/orchestrator/transcript-sweep.js"
+    },
+    "./transcript-rotation": {
+      "types": "./dist/orchestrator/transcript-rotation.d.ts",
+      "default": "./dist/orchestrator/transcript-rotation.js"
+    },
+    "./outbound-router": {
+      "types": "./dist/orchestrator/outbound-router.d.ts",
+      "default": "./dist/orchestrator/outbound-router.js"
+    },
+    "./ipc": {
+      "types": "./dist/orchestrator/ipc.d.ts",
+      "default": "./dist/orchestrator/ipc.js"
+    },
+    "./task-scheduler": {
+      "types": "./dist/orchestrator/task-scheduler.d.ts",
+      "default": "./dist/orchestrator/task-scheduler.js"
+    },
+    "./live-mode": {
+      "types": "./dist/orchestrator/live-mode.d.ts",
+      "default": "./dist/orchestrator/live-mode.js"
+    },
+    "./shadow-mode": {
+      "types": "./dist/orchestrator/shadow-mode.d.ts",
+      "default": "./dist/orchestrator/shadow-mode.js"
+    },
+    "./tool-registry": {
+      "types": "./dist/orchestrator/tool-registry.d.ts",
+      "default": "./dist/orchestrator/tool-registry.js"
+    },
+    "./runtimes/sandbox-runner": {
+      "types": "./dist/runtimes/sandbox-runner.d.ts",
+      "default": "./dist/runtimes/sandbox-runner.js"
+    },
+    "./runtimes/container-runner": {
+      "types": "./dist/runtimes/container-runner.d.ts",
+      "default": "./dist/runtimes/container-runner.js"
+    },
+    "./runtimes/container-runtime": {
+      "types": "./dist/runtimes/container-runtime.d.ts",
+      "default": "./dist/runtimes/container-runtime.js"
+    },
+    "./message-loop": {
+      "types": "./dist/orchestrator/message-loop.d.ts",
+      "default": "./dist/orchestrator/message-loop.js"
+    },
+    "./cost-tracking": {
+      "types": "./dist/cost-tracking/index.d.ts",
+      "default": "./dist/cost-tracking/index.js"
+    },
+    "./webhook": {
+      "types": "./dist/webhook/index.d.ts",
+      "default": "./dist/webhook/index.js"
+    },
+    "./webhook/server": {
+      "types": "./dist/webhook/server.d.ts",
+      "default": "./dist/webhook/server.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@skoobi/shared": "*",
+    "@skoobi/billing": "*",
+    "@skoobi/providers": "*",
+    "better-sqlite3": "^11.8.1",
+    "googleapis": "^173.0.0",
+    "pino": "^9.6.0",
+    "@skoobi/memory": "*",
+    "cron-parser": "^5.5.0",
+    "yaml": "^2.8.3",
+    "zod": "^4.3.6",
+    "@skoobi/payments": "*"
+  }
+}

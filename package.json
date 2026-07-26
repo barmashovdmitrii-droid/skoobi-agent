@@ -1,0 +1,85 @@
+{
+  "name": "skoobi-agent",
+  "version": "2.0.0-rc.1",
+  "private": true,
+  "description": "Telegram-first personal assistant runtime with isolated agent execution, memory, tools, and optional local integrations.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/barmashovdmitrii-droid/skoobi-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/barmashovdmitrii-droid/skoobi-agent/issues"
+  },
+  "homepage": "https://github.com/barmashovdmitrii-droid/skoobi-agent#readme",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "skoobi": "bin/skoobi.js"
+  },
+  "scripts": {
+    "build": "bash scripts/with-node22.sh sh -c 'npm run build:packages && npm run build:agent-runner && tsc && npm run build:apps'",
+    "build:agent-runner": "bash scripts/with-node22.sh npm --prefix agent/runner run build",
+    "build:apps": "bash scripts/with-node22.sh sh -c 'npm run build -w @skoobi/app-art-bot && npm run build -w @skoobi/app-dashboard'",
+    "start": "bash scripts/with-node22.sh node dist/service.js",
+    "dev": "bash scripts/with-node22.sh tsx src/service.ts",
+    "typecheck": "bash scripts/with-node22.sh sh -c 'npm run build:packages && npm run typecheck:agent-runner && tsc -p tsconfig.typecheck.json'",
+    "typecheck:agent-runner": "bash scripts/with-node22.sh npm --prefix agent/runner run build -- --noEmit",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "format:fix": "prettier --write \"src/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\"",
+    "prepare": "husky",
+    "auth:whatsapp": "bash scripts/with-node22.sh npm run auth -w @skoobi/channel-whatsapp",
+    "test": "bash scripts/with-node22.sh vitest run",
+    "test:watch": "bash scripts/with-node22.sh vitest",
+    "build:packages": "bash scripts/with-node22.sh sh -c 'npm run build -w @skoobi/shared && npm run build -w @skoobi/providers && npm run build -w @skoobi/billing && npm run build -w @skoobi/payments && npm run build -w @skoobi/memory && npm run build -w @skoobi/voice-stt && npm run build -w @skoobi/voice-tts && npm run build -w @skoobi/core && npm run build -w @skoobi/channel-telegram && npm run build -w @skoobi/channel-whatsapp && npm run build -w @skoobi/dashboard'"
+  },
+  "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "^0.0.42",
+    "@anthropic-ai/sdk": "^0.91.1",
+    "@azure/identity": "^4.13.1",
+    "@azure/search-documents": "^12.2.0",
+    "@cloudflare/workers-types": "^4.20260425.1",
+    "@mistralai/mistralai": "^2.2.1",
+    "@qdrant/js-client-rest": "^1.17.0",
+    "@supabase/supabase-js": "^2.104.1",
+    "better-sqlite3": "^11.8.1",
+    "cloudflare": "^5.2.0",
+    "compromise": "^14.15.0",
+    "cron-parser": "^5.5.0",
+    "googleapis": "^173.0.0",
+    "grammy": "^1.39.3",
+    "groq-sdk": "^1.1.2",
+    "mammoth": "^1.12.0",
+    "pdf-parse": "^2.4.5",
+    "pg": "^8.20.0",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0",
+    "read-excel-file": "^9.0.9",
+    "redis": "^5.12.1",
+    "yaml": "^2.8.3",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.0",
+    "@vitest/coverage-v8": "^4.0.18",
+    "husky": "^9.1.7",
+    "prettier": "^3.8.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.18"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "overrides": {
+    "gaxios": "^7.3.0",
+    "postcss": "^8.5.23",
+    "shell-quote": "^1.10.0"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ]
+}

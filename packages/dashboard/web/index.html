@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Скуби · личный помощник</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐾</text></svg>"
+    />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">С</span>
+        <div>
+          <h1>Скуби</h1>
+          <p id="subtitle">Личный помощник на Mac mini</p>
+        </div>
+      </div>
+      <span id="health-pill" class="pill">загружаю…</span>
+    </header>
+
+    <nav id="tabs" aria-label="Разделы Скуби">
+      <button data-tab="pult" class="active">
+        <span aria-hidden="true">⌂</span>Обзор
+      </button>
+      <button data-tab="chats"><span aria-hidden="true">◫</span>Диалоги</button>
+      <button data-tab="modules">
+        <span aria-hidden="true">✦</span>Возможности
+      </button>
+      <button data-tab="google"><span aria-hidden="true">G</span>Google</button>
+      <button data-tab="tasks"><span aria-hidden="true">✓</span>Задачи</button>
+      <button data-tab="log"><span aria-hidden="true">≡</span>Журнал</button>
+    </nav>
+
+    <main>
+      <section id="tab-pult">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Сейчас</p>
+            <h2>Всё важное одним взглядом</h2>
+          </div>
+          <p>Состояние Скуби, задачи и последние события.</p>
+        </div>
+        <div id="services" class="cards"></div>
+        <div id="numbers" class="metrics"></div>
+        <div id="errors-wrap" hidden>
+          <h2>Что за ошибки</h2>
+          <div id="errors" class="list"></div>
+        </div>
+        <h2>Последние события</h2>
+        <div id="events" class="list"></div>
+      </section>
+
+      <section id="tab-chats" hidden>
+        <div class="section-heading dialog-heading">
+          <div>
+            <p class="eyebrow">Единая переписка</p>
+            <h2>Диалоги</h2>
+          </div>
+          <p>Telegram и WhatsApp вместе, включая локальный разбор медиа.</p>
+        </div>
+        <div
+          id="whatsapp-status"
+          class="whatsapp-status"
+          aria-live="polite"
+        ></div>
+        <div id="dialog-stats" class="dialog-stats" aria-live="polite"></div>
+        <div id="dialog-shell" class="dialog-shell">
+          <aside id="dialog-sidebar" class="dialog-sidebar">
+            <div class="dialog-tools">
+              <label class="search-wrap">
+                <span aria-hidden="true">⌕</span>
+                <input
+                  id="dialog-search"
+                  type="search"
+                  aria-label="Поиск по диалогам и сообщениям"
+                  placeholder="Найти диалог или сообщение…"
+                  autocomplete="off"
+                />
+              </label>
+              <div
+                id="dialog-filters"
+                class="filter-chips"
+                role="group"
+                aria-label="Фильтр диалогов"
+              >
+                <button
+                  class="filter-chip active"
+                  data-filter="all"
+                  aria-pressed="true"
+                >
+                  Все
+                </button>
+                <button
+                  class="filter-chip"
+                  data-filter="telegram"
+                  aria-pressed="false"
+                >
+                  Telegram
+                </button>
+                <button
+                  class="filter-chip"
+                  data-filter="whatsapp"
+                  aria-pressed="false"
+                >
+                  WhatsApp
+                </button>
+                <button
+                  class="filter-chip"
+                  data-filter="media"
+                  aria-pressed="false"
+                >
+                  С медиа
+                </button>
+                <button
+                  class="filter-chip"
+                  data-filter="active"
+                  aria-pressed="false"
+                >
+                  За сутки
+                </button>
+                <button
+                  class="filter-chip"
+                  data-filter="important"
+                  aria-pressed="false"
+                >
+                  Важное
+                </button>
+              </div>
+            </div>
+            <div
+              id="dialog-search-results"
+              class="dialog-search-results"
+              aria-live="polite"
+              hidden
+            ></div>
+            <div
+              id="chats"
+              class="dialog-list"
+              aria-label="Список диалогов"
+            ></div>
+          </aside>
+
+          <article id="chat-view" class="dialog-view">
+            <div id="dialog-empty" class="dialog-empty">
+              <span aria-hidden="true">💬</span>
+              <h3>Выбери диалог</h3>
+              <p>
+                Здесь появится переписка и результаты локального разбора
+                голосовых, фото и видео.
+              </p>
+            </div>
+            <div id="dialog-content" class="dialog-content" hidden>
+              <div class="dialog-view-header">
+                <button id="chat-back" class="ghost mobile-back">
+                  ← Диалоги
+                </button>
+                <div class="dialog-title-row">
+                  <div>
+                    <h3 id="chat-title"></h3>
+                    <p id="chat-meta"></p>
+                  </div>
+                  <div class="dialog-header-actions">
+                    <button
+                      id="chat-pin"
+                      class="icon-button"
+                      type="button"
+                      aria-label="Закрепить диалог"
+                      title="Закрепить диалог"
+                    >
+                      ☆
+                    </button>
+                    <button
+                      id="chat-contact"
+                      class="secondary"
+                      type="button"
+                      aria-controls="contact-panel"
+                      aria-expanded="false"
+                    >
+                      Контакт
+                    </button>
+                    <button
+                      id="chat-pause"
+                      class="secondary"
+                      type="button"
+                      hidden
+                    ></button>
+                  </div>
+                </div>
+                <div id="contact-panel" class="contact-panel" hidden>
+                  <div class="contact-section">
+                    <label for="contact-alias">Локальное имя</label>
+                    <div class="contact-form-row">
+                      <input
+                        id="contact-alias"
+                        type="text"
+                        maxlength="80"
+                        autocomplete="off"
+                        placeholder="Например, Рабочий контакт"
+                      />
+                      <button id="contact-alias-save" type="button">
+                        Сохранить
+                      </button>
+                    </div>
+                    <p id="contact-source-name"></p>
+                    <p>Имя хранится только на этом Mac.</p>
+                  </div>
+                  <div class="contact-section">
+                    <span class="contact-label">Связанные диалоги</span>
+                    <div id="contact-links" class="contact-links"></div>
+                    <div class="contact-picker-row">
+                      <div class="contact-picker">
+                        <input
+                          id="contact-link-search"
+                          type="search"
+                          role="combobox"
+                          aria-label="Найти диалог того же контакта"
+                          aria-autocomplete="list"
+                          aria-controls="contact-link-options"
+                          aria-expanded="false"
+                          autocomplete="off"
+                          placeholder="Найти Telegram или WhatsApp…"
+                        />
+                        <div
+                          id="contact-link-options"
+                          class="contact-picker-options"
+                          role="listbox"
+                          aria-label="Подходящие диалоги"
+                          hidden
+                        ></div>
+                      </div>
+                      <button id="contact-link-add" type="button">
+                        Связать
+                      </button>
+                    </div>
+                    <p>
+                      Можно вручную объединить Telegram и WhatsApp одного
+                      человека.
+                    </p>
+                  </div>
+                </div>
+              </div>
+              <div id="history-bar" class="history-bar" hidden>
+                <button id="chat-load-older" class="ghost" type="button">
+                  ↑ Показать более ранние
+                </button>
+                <span id="history-context" class="history-context"></span>
+                <button id="chat-latest" class="ghost" type="button" hidden>
+                  К последним ↓
+                </button>
+              </div>
+              <div
+                id="chat-messages"
+                class="messages dialog-messages"
+                aria-live="polite"
+              ></div>
+              <div id="dialog-readonly" class="dialog-readonly" hidden>
+                Этот диалог доступен для просмотра. Отвечай в самом мессенджере.
+              </div>
+              <div id="chat-compose" class="chat-compose" hidden>
+                <textarea
+                  id="chat-input"
+                  rows="2"
+                  placeholder="Напиши Скуби…"
+                  aria-label="Сообщение Скуби"
+                ></textarea>
+                <button id="chat-send" class="primary">Отправить</button>
+                <p>Ответ появится здесь и в Telegram.</p>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section id="tab-modules" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Что умеет Скуби</p>
+            <h2>Возможности</h2>
+          </div>
+          <p>Актуальные подключения и локальные функции.</p>
+        </div>
+        <div id="modules" class="cards wide"></div>
+        <h2>Обслуживание</h2>
+        <div id="restarts" class="cards"></div>
+      </section>
+
+      <section id="tab-google" hidden>
+        <p class="hint">
+          Google-сервисы Скуби: Диск, Таблицы и скрипты — через Workspace API;
+          напоминания зеркалятся в Календарь. Кнопка «Проверить» отдельно
+          проверяет OAuth+Drive и Календарь. Доступы Sheets/Apps Script показаны
+          как конфигурация, а не как результат живой проверки.
+        </p>
+        <div id="google-cards" class="cards wide"></div>
+        <button id="google-verify" style="margin-top: 12px">
+          Проверить подключение
+        </button>
+      </section>
+
+      <section id="tab-tasks" hidden>
+        <div id="tasks" class="list"></div>
+      </section>
+
+      <section id="tab-log" hidden>
+        <div class="log-controls">
+          <label><input type="checkbox" id="log-errors" /> только ошибки</label>
+          <input type="search" id="log-q" placeholder="фильтр по слову…" />
+        </div>
+        <pre id="log-lines"></pre>
+      </section>
+    </main>
+
+    <div id="toast" hidden></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
