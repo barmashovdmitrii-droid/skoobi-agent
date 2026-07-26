@@ -20,6 +20,7 @@ and dashboard. Review the release notes before upgrading an older installation.
 - Node.js 22 or newer
 - npm
 - git
+- ripgrep (`rg`)
 - the `sqlite3` command-line tool for managed installs
 - native build support if a dependency has no prebuilt binary for your platform
 - a Telegram bot token

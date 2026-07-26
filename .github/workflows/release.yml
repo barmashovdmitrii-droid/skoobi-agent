@@ -28,6 +28,12 @@ jobs:
           node-version: '22'
           cache: npm
 
+      - name: Install runtime test dependencies
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            brew install ripgrep
+          fi
+
       - name: Validate release tag
         run: |
           node - <<'NODE'
