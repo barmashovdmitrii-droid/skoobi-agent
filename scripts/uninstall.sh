@@ -14,6 +14,7 @@ GIT_HOME=""
 OWNER_BACKUP_DONE=0
 LOCK_DIR=""
 LOCK_HELD=0
+PURGE_ENV_BACKUPS=()
 
 log() { printf '%s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -87,6 +88,8 @@ MANAGED_APP_NAME="$APP_NAME"
 INSTANCE_ROOT="$PREFIX/instances"
 INSTANCE_DIR="$INSTANCE_ROOT/$INSTANCE"
 BACKUP_DIR="$PREFIX/backups"
+BACKUP_INSTANCE_ROOT="$BACKUP_DIR/instances"
+INSTANCE_BACKUP_DIR="$BACKUP_INSTANCE_ROOT/$INSTANCE"
 MARKER_FILE="$PREFIX/.skoobi-managed-install"
 SERVICE_LABEL="com.skoobi.$INSTANCE"
 MACOS_PLIST="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
@@ -160,6 +163,21 @@ detect_os() {
   esac
 }
 
+# Return 0 when the job is loaded, 3 only when launchd can prove that the
+# containing user domain is reachable but the label is absent, and 1 when the
+# state is unknown (for example, a transport or permission failure).
+launchd_job_state() {
+  local target="$1" domain="${1%/*}" status
+  if launchctl print "$target" >/dev/null 2>&1; then
+    return 0
+  else
+    status=$?
+  fi
+  [[ "$status" == "113" ]] || return 1
+  launchctl print "$domain" >/dev/null 2>&1 || return 1
+  return 3
+}
+
 marker_content() {
   printf 'format=1\nrepository=%s\napp=%s\n' \
     "$CANONICAL_REPO" "$MANAGED_APP_NAME"
@@ -170,8 +188,48 @@ valid_marker() {
   [[ "$(cat "$MARKER_FILE")" == "$(marker_content)" ]]
 }
 
+sha256_file() {
+  local file="$1" output=""
+  if command -v shasum >/dev/null 2>&1; then
+    output="$(shasum -a 256 <"$file")" || return 1
+  elif command -v sha256sum >/dev/null 2>&1; then
+    output="$(sha256sum <"$file")" || return 1
+  else
+    return 1
+  fi
+  printf '%s' "${output%% *}"
+}
+
+is_husky_generated_file() {
+  local app_root="$1" rel="$2" file="$1/$2" expected_hash="" actual_hash=""
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  case "$rel" in
+    .husky/_/.gitignore)
+      expected_hash="684888c0ebb17f374298b65ee2807526c066094c701bcc7ebbe1c1095f494fc1"
+      ;;
+    .husky/_/h)
+      expected_hash="70200b200ca709b0622784f93839a5b2872333a917a09afddefd7dc2d8cdc680"
+      ;;
+    .husky/_/husky.sh)
+      expected_hash="21122903fca7209a13c991e5be68780636e28f1b8f0ae7ea07ed0065dfe37268"
+      ;;
+    .husky/_/applypatch-msg|.husky/_/commit-msg|.husky/_/post-applypatch|\
+      .husky/_/post-checkout|.husky/_/post-commit|.husky/_/post-merge|\
+      .husky/_/post-rewrite|.husky/_/pre-applypatch|.husky/_/pre-auto-gc|\
+      .husky/_/pre-commit|.husky/_/pre-merge-commit|.husky/_/pre-push|\
+      .husky/_/pre-rebase|.husky/_/prepare-commit-msg)
+      expected_hash="34fe496008be71d8fdd446b2cce81e4bb0406109c130eafc583fbd9fe33244e2"
+      ;;
+    *) return 1 ;;
+  esac
+  actual_hash="$(sha256_file "$file")" || return 1
+  [[ "$actual_hash" == "$expected_hash" ]]
+}
+
 is_ephemeral_ignored_path() {
-  case "$1" in
+  local app_root="$1" rel="$2"
+  is_husky_generated_file "$app_root" "$rel" && return 0
+  case "$rel" in
     node_modules/*|*/node_modules/*|dist/*|*/dist/*|coverage/*|*/coverage/*|\
       .vite/*|*/.vite/*|*.tsbuildinfo|*/.DS_Store|.DS_Store)
       return 0
@@ -187,7 +245,7 @@ has_owner_ignored_files() {
   git_safe -C "$APP_DIR" ls-files --others --ignored --exclude-standard -z >"$listing" ||
     die "Could not inspect ignored files in the managed app"
   while IFS= read -r -d '' rel; do
-    if ! is_ephemeral_ignored_path "$rel"; then
+    if ! is_ephemeral_ignored_path "$APP_DIR" "$rel"; then
       found=0
       break
     fi
@@ -213,15 +271,19 @@ has_gitlinks() {
 }
 
 has_special_files() {
-  local found listing result=1
+  local found rel listing result=1
   ensure_git_home
   listing="$(mktemp "$GIT_HOME/special.XXXXXXXX")"
   find "$APP_DIR" -xdev -path "$APP_DIR/.git" -prune -o \
     \( -type p -o -type s -o -type b -o -type c \) -print0 >"$listing" ||
     die "Could not inspect special files in the managed app"
   while IFS= read -r -d '' found; do
-    result=0
-    break
+    rel="${found#"$APP_DIR"/}"
+    if [[ "$rel" == "$found" ]] ||
+        ! is_ephemeral_ignored_path "$APP_DIR" "$rel"; then
+      result=0
+      break
+    fi
   done <"$listing"
   rm -f "$listing"
   return "$result"
@@ -288,7 +350,7 @@ backup_owner_changes() {
     copy_owner_file "$backup_dir" "$rel"
   done <"$untracked_listing"
   while IFS= read -r -d '' rel; do
-    is_ephemeral_ignored_path "$rel" ||
+    is_ephemeral_ignored_path "$APP_DIR" "$rel" ||
       copy_owner_file "$backup_dir" "$rel"
   done <"$ignored_listing"
   rm -f "$untracked_listing" "$ignored_listing"
@@ -299,6 +361,10 @@ assert_managed_paths() {
   [[ ! -L "$APP_BASE" && ! -L "$APP_DIR" && ! -L "$INSTANCE_ROOT" &&
       ! -L "$INSTANCE_DIR" && ! -L "$BACKUP_DIR" && ! -L "$MARKER_FILE" ]] ||
     die "Refusing to remove through a symlinked managed path"
+  if [[ "$PURGE" == "1" ]]; then
+    [[ ! -L "$BACKUP_INSTANCE_ROOT" && ! -L "$INSTANCE_BACKUP_DIR" ]] ||
+      die "Refusing to purge through a symlinked instance backup path"
+  fi
   case "$APP_DIR" in
     "$APP_BASE/$APP_NAME") ;;
     *) die "Refusing an app path outside the managed layout" ;;
@@ -383,10 +449,55 @@ confirm_purge() {
   if [[ -z "$confirmation" ]]; then
     log "This will permanently delete instance data:"
     log "  $INSTANCE_DIR"
+    if [[ "${#PURGE_ENV_BACKUPS[@]}" -gt 0 ]]; then
+      log "It will also delete ${#PURGE_ENV_BACKUPS[@]} validated instance .env backup(s)."
+    fi
     read -r -p "Type DELETE Skoobi data to continue: " confirmation || true
   fi
   [[ "$confirmation" == "DELETE Skoobi data" ]] ||
     die "Purge confirmation did not match; nothing was removed"
+}
+
+prepare_purge_instance_env_backups() {
+  [[ "$PURGE" == "1" ]] || return 0
+  local backup entry name
+  PURGE_ENV_BACKUPS=()
+  if [[ -e "$INSTANCE_BACKUP_DIR" || -L "$INSTANCE_BACKUP_DIR" ]]; then
+    [[ -d "$INSTANCE_BACKUP_DIR" && ! -L "$INSTANCE_BACKUP_DIR" ]] ||
+      die "Instance backup path is not a safe real directory"
+    for entry in "$INSTANCE_BACKUP_DIR"/* "$INSTANCE_BACKUP_DIR"/.*; do
+      [[ -e "$entry" || -L "$entry" ]] || continue
+      name="$(basename "$entry")"
+      [[ "$name" != "." && "$name" != ".." ]] || continue
+      [[ "$name" =~ ^env\.bak\.[A-Za-z0-9]{8}$ &&
+          -f "$entry" && ! -L "$entry" ]] ||
+        die "Instance backup directory contains an unexpected file; purge stopped before removal"
+      PURGE_ENV_BACKUPS+=("$entry")
+    done
+  fi
+  for backup in "$BACKUP_DIR/${INSTANCE}.env.bak."*; do
+    [[ -e "$backup" || -L "$backup" ]] || continue
+    name="$(basename "$backup")"
+    [[ "$name" =~ ^${INSTANCE}\.env\.bak\.[A-Za-z0-9]{8}$ &&
+        -f "$backup" && ! -L "$backup" ]] ||
+      die "Legacy instance backup path is unexpected; purge stopped before removal"
+    PURGE_ENV_BACKUPS+=("$backup")
+  done
+}
+
+purge_instance_env_backups() {
+  [[ "$PURGE" == "1" ]] || return 0
+  local backup count=0
+  if [[ "${#PURGE_ENV_BACKUPS[@]}" -gt 0 ]]; then
+    for backup in "${PURGE_ENV_BACKUPS[@]}"; do
+      run rm -f -- "$backup"
+      count=$((count + 1))
+    done
+  fi
+  if [[ -d "$INSTANCE_BACKUP_DIR" && ! -L "$INSTANCE_BACKUP_DIR" ]]; then
+    run rmdir "$INSTANCE_BACKUP_DIR"
+  fi
+  log "Removed $count instance .env backup(s)."
 }
 
 stop_service_and_prove() {
@@ -402,23 +513,46 @@ stop_service_and_prove() {
   fi
 
   if [[ "$os_name" == "macos" ]]; then
-    local target
+    local status target
     target="gui/$(id -u)/$SERVICE_LABEL"
     if command -v launchctl >/dev/null 2>&1; then
       launchctl disable "$target" >/dev/null 2>&1 || true
       launchctl bootout "$target" >/dev/null 2>&1 || true
-      ! launchctl print "$target" >/dev/null 2>&1 ||
+      if launchd_job_state "$target"; then
         die "launchd service is still loaded; no files were removed"
+      else
+        status=$?
+        [[ "$status" == "3" ]] ||
+          die "launchd could not prove the service stopped; no files were removed"
+      fi
     elif [[ -e "$MACOS_PLIST" ]]; then
       die "launchctl is required to prove the service stopped"
     fi
   elif [[ "$os_name" == "linux" ]]; then
-    [[ -e "$LINUX_UNIT" ]] || return 0
-    command -v systemctl >/dev/null 2>&1 ||
-      die "systemctl is required to prove the service stopped"
-    systemctl --user disable --now "skoobi-$INSTANCE" >/dev/null 2>&1 ||
-      die "systemd could not stop and disable the service; no files were removed"
+    if ! command -v systemctl >/dev/null 2>&1; then
+      [[ ! -e "$LINUX_UNIT" && ! -L "$LINUX_UNIT" ]] ||
+        die "systemctl is required to prove the service stopped"
+      return 0
+    fi
     local status
+    if systemctl --user is-active --quiet "skoobi-$INSTANCE"; then
+      status=0
+    else
+      status=$?
+    fi
+    if [[ ! -e "$LINUX_UNIT" && ! -L "$LINUX_UNIT" ]]; then
+      case "$status" in
+        3|4) return 0 ;;
+        0)
+          systemctl --user stop "skoobi-$INSTANCE" >/dev/null 2>&1 ||
+            die "systemd could not stop the definition-less service; no files were removed"
+          ;;
+        *) die "systemd could not prove the definition-less service is inactive; no files were removed" ;;
+      esac
+    else
+      systemctl --user disable --now "skoobi-$INSTANCE" >/dev/null 2>&1 ||
+        die "systemd could not stop and disable the service; no files were removed"
+    fi
     if systemctl --user is-active --quiet "skoobi-$INSTANCE"; then
       status=0
     else
@@ -522,6 +656,7 @@ main() {
       log "Verified app has no owner changes; forced removal is unnecessary."
     fi
   fi
+  prepare_purge_instance_env_backups
   confirm_purge
   if [[ "$DRY_RUN" == "0" && -e "$APP_DIR" &&
       "$APP_VERIFIED" != "1" ]]; then
@@ -545,8 +680,11 @@ main() {
 
   if [[ "$PURGE" == "1" ]]; then
     run rm -rf "$INSTANCE_DIR"
+    purge_instance_env_backups
+    log "Other safety backups are preserved in: $BACKUP_DIR"
   else
     log "Instance data preserved: $INSTANCE_DIR"
+    log "Safety backups preserved in: $BACKUP_DIR"
     log "Use --purge only after backup and exact confirmation."
   fi
   release_operation_lock

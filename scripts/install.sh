@@ -6,7 +6,7 @@ CANONICAL_REPO="https://github.com/barmashovdmitrii-droid/skoobi-agent.git"
 REF_DEFAULT="main"
 EXPECTED_COMMIT_DEFAULT=""
 APP_NAME="skoobi-agent"
-VERSION="2.0.0-rc.2"
+VERSION="2.0.0-rc.3"
 
 PREFIX="${SKOOBI_PREFIX:-$HOME/.skoobi}"
 INSTANCE="default"
@@ -28,17 +28,27 @@ OLD_RELEASE_ROOT=""
 CLI_CHANGED=0
 CLI_BACKUP=""
 CLI_MOVED_ASIDE=0
+CLI_CHANGE_ATTEMPTED=0
+CLI_MOVE_ATTEMPTED=0
 SERVICE_CHANGED=0
 SERVICE_BACKUP=""
 SERVICE_EXISTED=0
 SERVICE_WAS_ACTIVE=0
+SERVICE_WAS_ENABLED=0
+SERVICE_WAS_ENABLED_RUNTIME=0
+SERVICE_ENABLEMENT_KNOWN=0
+SERVICE_ACTIVATION_ATTEMPTED=0
+SERVICE_STOP_ATTEMPTED=0
+SERVICE_STOP_CONFIRMED=0
 INSTALL_SUCCEEDED=0
 BUILD_HOME=""
 GIT_HOME=""
 STAGE_ACTIVATION_STARTED=0
 LOCK_DIR=""
 LOCK_HELD=0
+MARKER_CREATED_BY_INSTALL=0
 ENV_BACKUP=""
+ENV_BACKUP_PENDING=""
 ENV_CREATED_BY_INSTALL=0
 
 prefer_node22_path() {
@@ -72,7 +82,7 @@ Options:
   --prefix <path>        Install prefix (default: ~/.skoobi)
   --instance <name>      Instance name (default: default)
   --repo <url>           Must be the canonical public HTTPS repository
-  --ref <branch/tag>     Git branch or tag to install (default: main)
+  --ref <branch/tag>     Git branch or tag (release assets are tag-pinned)
   --expected-commit <id> Require the resolved ref to match this 40-hex commit
   --no-service           Do not create launchd/systemd service
   --no-start             Create service but do not start it
@@ -200,6 +210,8 @@ fi
 INSTANCE_ROOT="$PREFIX/instances"
 INSTANCE_DIR="$INSTANCE_ROOT/$INSTANCE"
 BACKUP_DIR="$PREFIX/backups"
+BACKUP_INSTANCE_ROOT="$BACKUP_DIR/instances"
+INSTANCE_BACKUP_DIR="$BACKUP_INSTANCE_ROOT/$INSTANCE"
 ENV_FILE="$INSTANCE_DIR/.env"
 MARKER_FILE="$PREFIX/.skoobi-managed-install"
 SERVICE_LABEL="com.skoobi.$INSTANCE"
@@ -233,13 +245,6 @@ acquire_operation_lock() {
   mkdir "$LOCK_DIR" 2>/dev/null ||
     die "Another Skoobi install, update, or uninstall operation is in progress"
   LOCK_HELD=1
-}
-
-release_operation_lock() {
-  [[ "$LOCK_HELD" == "1" ]] || return 0
-  rmdir "$LOCK_DIR" ||
-    die "Could not release the installer operation lock"
-  LOCK_HELD=0
 }
 
 ensure_git_home() {
@@ -286,6 +291,7 @@ safe_npm() {
     TMPDIR="${TMPDIR:-/tmp}" \
     LANG="${LANG:-C}" \
     LC_ALL="${LC_ALL:-C}" \
+    HUSKY=0 \
     NPM_CONFIG_CACHE="$BUILD_HOME/npm-cache" \
     NPM_CONFIG_USERCONFIG="$npm_userconfig" \
     NPM_CONFIG_GLOBALCONFIG=/dev/null \
@@ -305,6 +311,21 @@ detect_os() {
   esac
 }
 
+# Return 0 when the job is loaded, 3 only when launchd can prove that the
+# containing user domain is reachable but the label is absent, and 1 when the
+# state is unknown (for example, a transport or permission failure).
+launchd_job_state() {
+  local target="$1" domain="${1%/*}" status
+  if launchctl print "$target" >/dev/null 2>&1; then
+    return 0
+  else
+    status=$?
+  fi
+  [[ "$status" == "113" ]] || return 1
+  launchctl print "$domain" >/dev/null 2>&1 || return 1
+  return 3
+}
+
 node_major() {
   node -p "Number(process.versions.node.split('.')[0])" 2>/dev/null || echo 0
 }
@@ -322,12 +343,28 @@ xml_escape() {
   printf '%s' "$value"
 }
 
-systemd_escape() {
+systemd_exec_escape() {
   local value="$1"
   value="${value//\\/\\\\}"
   value="${value//\"/\\\"}"
   value="${value//\%/%%}"
-  value="${value//\$/\$\$}"
+  printf '%s' "$value"
+}
+
+systemd_environment_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\%/%%}"
+  printf '%s' "$value"
+}
+
+systemd_path_escape() {
+  local value="$1"
+  case "$value" in
+    *$'\n'*|*$'\r'*) die "systemd path must not contain newlines" ;;
+  esac
+  value="${value//\%/%%}"
   printf '%s' "$value"
 }
 
@@ -388,14 +425,14 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart="$(systemd_escape "$node_path")" "$(systemd_escape "$APP_DIR/dist/service.js")"
-WorkingDirectory="$(systemd_escape "$INSTANCE_DIR")"
+ExecStart=":$(systemd_exec_escape "$node_path")" "$(systemd_exec_escape "$APP_DIR/dist/service.js")"
+WorkingDirectory=$(systemd_path_escape "$INSTANCE_DIR")
 Restart=always
 RestartSec=5
 UMask=0077
-Environment="HOME=$(systemd_escape "$HOME")"
-Environment="PATH=$(systemd_escape "$node_dir"):/opt/homebrew/opt/node@22/bin:/usr/local/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$(systemd_escape "$HOME")/.local/bin"
-Environment="SKOOBI_SERVICE_LABEL=$(systemd_escape "$SERVICE_LABEL")"
+Environment="HOME=$(systemd_environment_escape "$HOME")"
+Environment="PATH=$(systemd_environment_escape "$node_dir"):/opt/homebrew/opt/node@22/bin:/usr/local/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$(systemd_environment_escape "$HOME")/.local/bin"
+Environment="SKOOBI_SERVICE_LABEL=$(systemd_environment_escape "$SERVICE_LABEL")"
 
 [Install]
 WantedBy=default.target
@@ -431,8 +468,48 @@ validate_origin() {
     die "Managed app origin is not an allowed canonical HTTPS repository"
 }
 
+sha256_file() {
+  local file="$1" output=""
+  if command -v shasum >/dev/null 2>&1; then
+    output="$(shasum -a 256 <"$file")" || return 1
+  elif command -v sha256sum >/dev/null 2>&1; then
+    output="$(sha256sum <"$file")" || return 1
+  else
+    return 1
+  fi
+  printf '%s' "${output%% *}"
+}
+
+is_husky_generated_file() {
+  local app_root="$1" rel="$2" file="$1/$2" expected_hash="" actual_hash=""
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  case "$rel" in
+    .husky/_/.gitignore)
+      expected_hash="684888c0ebb17f374298b65ee2807526c066094c701bcc7ebbe1c1095f494fc1"
+      ;;
+    .husky/_/h)
+      expected_hash="70200b200ca709b0622784f93839a5b2872333a917a09afddefd7dc2d8cdc680"
+      ;;
+    .husky/_/husky.sh)
+      expected_hash="21122903fca7209a13c991e5be68780636e28f1b8f0ae7ea07ed0065dfe37268"
+      ;;
+    .husky/_/applypatch-msg|.husky/_/commit-msg|.husky/_/post-applypatch|\
+      .husky/_/post-checkout|.husky/_/post-commit|.husky/_/post-merge|\
+      .husky/_/post-rewrite|.husky/_/pre-applypatch|.husky/_/pre-auto-gc|\
+      .husky/_/pre-commit|.husky/_/pre-merge-commit|.husky/_/pre-push|\
+      .husky/_/pre-rebase|.husky/_/prepare-commit-msg)
+      expected_hash="34fe496008be71d8fdd446b2cce81e4bb0406109c130eafc583fbd9fe33244e2"
+      ;;
+    *) return 1 ;;
+  esac
+  actual_hash="$(sha256_file "$file")" || return 1
+  [[ "$actual_hash" == "$expected_hash" ]]
+}
+
 is_ephemeral_ignored_path() {
-  case "$1" in
+  local app_root="$1" rel="$2"
+  is_husky_generated_file "$app_root" "$rel" && return 0
+  case "$rel" in
     node_modules/*|*/node_modules/*|dist/*|*/dist/*|coverage/*|*/coverage/*|\
       .vite/*|*/.vite/*|*.tsbuildinfo|*/.DS_Store|.DS_Store)
       return 0
@@ -448,7 +525,7 @@ has_owner_ignored_files() {
   git_safe -C "$1" ls-files --others --ignored --exclude-standard -z >"$listing" ||
     die "Could not inspect ignored files in the managed app"
   while IFS= read -r -d '' rel; do
-    if ! is_ephemeral_ignored_path "$rel"; then
+    if ! is_ephemeral_ignored_path "$1" "$rel"; then
       found=0
       break
     fi
@@ -591,6 +668,25 @@ check_requirements() {
       require_command launchctl
     else
       require_command systemctl
+    fi
+  fi
+}
+
+warn_if_linux_linger_disabled() {
+  [[ "$NO_SERVICE" == "0" && "$(detect_os)" == "linux" ]] || return 0
+  local linger="" user_name=""
+  user_name="$(id -un 2>/dev/null || true)"
+  if command -v loginctl >/dev/null 2>&1; then
+    linger="$(loginctl show-user "$(id -u)" -p Linger --value 2>/dev/null || true)"
+  fi
+  if [[ "$linger" != "yes" ]]; then
+    log "WARNING: systemd user lingering is not confirmed."
+    log "The bot may stop after the last logout and may not start at boot."
+    if [[ -n "$user_name" ]]; then
+      printf 'After reviewing the host policy, enable it with: loginctl enable-linger %q\n' \
+        "$user_name"
+    else
+      log "After reviewing the host policy, enable lingering with loginctl."
     fi
   fi
 }
@@ -829,6 +925,8 @@ build_staged_release() {
   chmod 700 "$STAGE_DIR"
   resolve_and_fetch_ref "$STAGE_DIR"
   safe_npm --prefix "$STAGE_DIR" ci
+  [[ ! -e "$STAGE_DIR/.husky/_" && ! -L "$STAGE_DIR/.husky/_" ]] ||
+    die "Managed production build unexpectedly created Husky runtime hooks"
   if [[ -f "$STAGE_DIR/agent/runner/package.json" ]]; then
     safe_npm --prefix "$STAGE_DIR/agent/runner" ci
   fi
@@ -853,13 +951,18 @@ switch_release() {
     OLD_RELEASE_ROOT="$(mktemp -d "$APP_BASE/.skoobi-agent.previous.XXXXXXXX")"
     chmod 700 "$OLD_RELEASE_ROOT"
     OLD_RELEASE="$OLD_RELEASE_ROOT/release"
-    mv "$APP_DIR" "$OLD_RELEASE"
+    if ! mv "$APP_DIR" "$OLD_RELEASE"; then
+      if [[ (-e "$APP_DIR" || -L "$APP_DIR") &&
+          ! -e "$OLD_RELEASE" && ! -L "$OLD_RELEASE" ]]; then
+        OLD_RELEASE=""
+        rmdir "$OLD_RELEASE_ROOT" >/dev/null 2>&1 || true
+        OLD_RELEASE_ROOT=""
+      fi
+      die "Could not preserve the active release before activation"
+    fi
   fi
   STAGE_ACTIVATION_STARTED=1
   if ! mv "$STAGE_DIR" "$APP_DIR"; then
-    [[ -z "$OLD_RELEASE" || ! -e "$OLD_RELEASE" ]] ||
-      mv "$OLD_RELEASE" "$APP_DIR"
-    STAGE_ACTIVATION_STARTED=0
     die "Could not activate the staged release"
   fi
   STAGE_DIR=""
@@ -933,7 +1036,7 @@ assert_instance_path_types() {
   local path
   for path in "$INSTANCE_ROOT" "$INSTANCE_DIR" "$INSTANCE_DIR/store" \
     "$INSTANCE_DIR/groups" "$INSTANCE_DIR/logs" "$INSTANCE_DIR/data" \
-    "$BACKUP_DIR"; do
+    "$BACKUP_DIR" "$BACKUP_INSTANCE_ROOT" "$INSTANCE_BACKUP_DIR"; do
     [[ ! -L "$path" ]] ||
       die "Refusing to configure an instance through a symlinked managed path"
     [[ ! -e "$path" || -d "$path" ]] ||
@@ -948,27 +1051,44 @@ assert_instance_path_types() {
 prepare_instance() {
   assert_instance_path_types
   run mkdir -p "$INSTANCE_DIR/store" "$INSTANCE_DIR/groups" \
-    "$INSTANCE_DIR/logs" "$INSTANCE_DIR/data" "$BACKUP_DIR"
+    "$INSTANCE_DIR/logs" "$INSTANCE_DIR/data" "$INSTANCE_BACKUP_DIR"
   assert_instance_path_types
   run chmod 700 "$PREFIX" "$INSTANCE_ROOT" "$INSTANCE_DIR" \
     "$INSTANCE_DIR/store" "$INSTANCE_DIR/groups" "$INSTANCE_DIR/logs" \
-    "$INSTANCE_DIR/data" "$BACKUP_DIR"
+    "$INSTANCE_DIR/data" "$BACKUP_DIR" "$BACKUP_INSTANCE_ROOT" \
+    "$INSTANCE_BACKUP_DIR"
 
   if [[ -f "$ENV_FILE" ]]; then
     if [[ "$RECONFIGURE" == "0" ]]; then
       log "Existing instance configuration preserved unchanged."
       return 1
     fi
-    local backup
+    local backup pending suffix
     if [[ "$DRY_RUN" == "1" ]]; then
       log "[dry-run] back up existing .env before explicit reconfiguration"
       return 0
     fi
-    backup="$(mktemp "$BACKUP_DIR/${INSTANCE}.env.bak.XXXXXXXX")"
+    pending="$(mktemp "$INSTANCE_BACKUP_DIR/.env-backup-pending.XXXXXXXX")"
+    ENV_BACKUP_PENDING="$pending"
+    suffix="${pending##*.env-backup-pending.}"
+    backup="$INSTANCE_BACKUP_DIR/env.bak.$suffix"
+    if ! cp "$ENV_FILE" "$pending" ||
+        ! chmod 600 "$pending" ||
+        ! cmp -s "$ENV_FILE" "$pending"; then
+      rm -f "$pending" >/dev/null 2>&1 || true
+      ENV_BACKUP_PENDING=""
+      die "Could not create a verified backup of the existing .env"
+    fi
+    [[ ! -e "$backup" && ! -L "$backup" ]] ||
+      die "Generated .env backup path already exists"
+    if ! mv "$pending" "$backup"; then
+      rm -f "$pending" >/dev/null 2>&1 || true
+      ENV_BACKUP_PENDING=""
+      die "Could not publish the verified .env backup"
+    fi
+    ENV_BACKUP_PENDING=""
     ENV_BACKUP="$backup"
-    log "Backing up existing .env before explicit reconfiguration: $backup"
-    cp "$ENV_FILE" "$backup"
-    chmod 600 "$backup"
+    log "Backed up existing .env before explicit reconfiguration: $backup"
     return 0
   fi
 
@@ -1087,14 +1207,20 @@ install_cli_symlink() {
       cli_backup_root="$(mktemp -d "$BACKUP_DIR/cli-backup-XXXXXXXX")"
       chmod 700 "$cli_backup_root"
       CLI_BACKUP="$cli_backup_root/skoobi"
-      mv "$CLI_LINK" "$CLI_BACKUP"
+      CLI_MOVE_ATTEMPTED=1
+      if ! mv "$CLI_LINK" "$CLI_BACKUP"; then
+        die "Could not move the existing CLI path into its backup"
+      fi
       CLI_MOVED_ASIDE=1
     fi
   fi
   if [[ "$DRY_RUN" == "1" ]]; then
     run ln -s "$CLI_TARGET" "$CLI_LINK"
   else
-    ln -s "$CLI_TARGET" "$CLI_LINK"
+    CLI_CHANGE_ATTEMPTED=1
+    if ! ln -s "$CLI_TARGET" "$CLI_LINK"; then
+      die "Could not install the Skoobi CLI symlink"
+    fi
     CLI_CHANGED=1
   fi
   log "CLI symlink: $CLI_LINK -> $CLI_TARGET"
@@ -1119,26 +1245,117 @@ atomic_write_service() {
   tmp="$(mktemp "$dir/.skoobi-service.XXXXXXXX")"
   printf '%s' "$content" >"$tmp"
   chmod 600 "$tmp"
-  mv -f "$tmp" "$file"
   SERVICE_CHANGED=1
+  mv -f "$tmp" "$file"
 }
 
 stop_existing_service() {
-  [[ "$NO_SERVICE" == "0" && "$DRY_RUN" == "0" ]] || return 0
-  if [[ "$(detect_os)" == "macos" ]]; then
-    local target
+  local os_name status target
+  os_name="$(detect_os)"
+  if [[ "$DRY_RUN" != "0" ]]; then
+    SERVICE_STOP_CONFIRMED=1
+    return 0
+  fi
+  if [[ "$NO_SERVICE" != "0" ]]; then
+    if [[ "$os_name" == "macos" ]]; then
+      if [[ -e "$MACOS_PLIST" || -L "$MACOS_PLIST" ]]; then
+        [[ -f "$MACOS_PLIST" && ! -L "$MACOS_PLIST" ]] ||
+          die "Managed launchd service definition is not a safe regular file"
+      fi
+      if ! command -v launchctl >/dev/null 2>&1; then
+        [[ ! -e "$MACOS_PLIST" && ! -L "$MACOS_PLIST" ]] ||
+          die "launchctl is required to verify --no-service safely"
+        SERVICE_STOP_CONFIRMED=1
+        return 0
+      fi
+      target="gui/$(id -u)/$SERVICE_LABEL"
+      if launchd_job_state "$target"; then
+        die "A managed launchd service is running; stop it before using --no-service"
+      else
+        status=$?
+        [[ "$status" == "3" ]] ||
+          die "Could not prove the managed launchd service is inactive for --no-service"
+      fi
+    elif [[ "$os_name" == "linux" ]]; then
+      if [[ -e "$LINUX_UNIT" || -L "$LINUX_UNIT" ]]; then
+        [[ -f "$LINUX_UNIT" && ! -L "$LINUX_UNIT" ]] ||
+          die "Managed systemd service definition is not a safe regular file"
+      fi
+      if ! command -v systemctl >/dev/null 2>&1; then
+        [[ ! -e "$LINUX_UNIT" && ! -L "$LINUX_UNIT" ]] ||
+          die "systemctl is required to verify --no-service safely"
+        SERVICE_STOP_CONFIRMED=1
+        return 0
+      fi
+      if systemctl --user is-active --quiet "skoobi-$INSTANCE"; then
+        status=0
+      else
+        status=$?
+      fi
+      case "$status" in
+        3|4) ;;
+        0) die "A managed systemd service is running; stop it before using --no-service" ;;
+        *) die "Could not prove the managed systemd service is inactive for --no-service" ;;
+      esac
+    fi
+    SERVICE_STOP_CONFIRMED=1
+    return 0
+  fi
+  SERVICE_STOP_ATTEMPTED=1
+  if [[ "$os_name" == "macos" ]]; then
+    local disabled_state="" target
     target="gui/$(id -u)/$SERVICE_LABEL"
-    if launchctl print "$target" >/dev/null 2>&1; then
+    if [[ -f "$MACOS_PLIST" ]]; then
+      SERVICE_WAS_ENABLED=1
+      disabled_state="$(launchctl print-disabled "gui/$(id -u)" 2>/dev/null)" ||
+        die "Could not determine whether the existing launchd service is enabled"
+      if grep -F "\"$SERVICE_LABEL\" => true" <<<"$disabled_state" >/dev/null; then
+        SERVICE_WAS_ENABLED=0
+      fi
+      SERVICE_ENABLEMENT_KNOWN=1
+    fi
+    if launchd_job_state "$target"; then
       SERVICE_WAS_ACTIVE=1
       [[ -f "$MACOS_PLIST" ]] ||
         die "Active launchd service has no regular managed plist"
+      launchctl disable "$target" >/dev/null 2>&1 || true
+      launchctl bootout "$target" >/dev/null 2>&1 || true
+      if launchd_job_state "$target"; then
+        die "Existing launchd service did not stop"
+      else
+        status=$?
+        [[ "$status" == "3" ]] ||
+          die "Could not prove that the existing launchd service stopped"
+      fi
+    else
+      status=$?
+      [[ "$status" == "3" ]] ||
+        die "Could not determine whether the existing launchd service is active"
     fi
-    launchctl disable "$target" >/dev/null 2>&1 || true
-    launchctl bootout "$target" >/dev/null 2>&1 || true
-    ! launchctl print "$target" >/dev/null 2>&1 ||
-      die "Existing launchd service did not stop"
+    SERVICE_STOP_CONFIRMED=1
   else
-    local status
+    local enabled_state="" status
+    if [[ -f "$LINUX_UNIT" ]]; then
+      enabled_state="$(systemctl --user is-enabled "skoobi-$INSTANCE" 2>/dev/null || true)"
+      case "$enabled_state" in
+        enabled)
+          SERVICE_WAS_ENABLED=1
+          SERVICE_ENABLEMENT_KNOWN=1
+          ;;
+        enabled-runtime)
+          SERVICE_WAS_ENABLED=1
+          SERVICE_WAS_ENABLED_RUNTIME=1
+          SERVICE_ENABLEMENT_KNOWN=1
+          ;;
+        disabled)
+          SERVICE_WAS_ENABLED=0
+          SERVICE_ENABLEMENT_KNOWN=1
+          ;;
+        *)
+          die "Existing systemd service has an unsupported enablement state: $enabled_state"
+          ;;
+      esac
+    fi
     if systemctl --user is-active --quiet "skoobi-$INSTANCE"; then
       status=0
     else
@@ -1152,8 +1369,10 @@ stop_existing_service() {
         ;;
       3) ;;
       4)
-        [[ -e "$LINUX_UNIT" ]] ||
+        if [[ ! -e "$LINUX_UNIT" ]]; then
+          SERVICE_STOP_CONFIRMED=1
           return 0
+        fi
         ;;
       *) die "Could not determine whether the existing systemd service is active" ;;
     esac
@@ -1169,7 +1388,65 @@ stop_existing_service() {
       0) die "Existing systemd service did not stop" ;;
       *) die "Could not prove that the existing systemd service stopped" ;;
     esac
+    SERVICE_STOP_CONFIRMED=1
   fi
+}
+
+restore_previous_service_state() {
+  local os_name status target
+  os_name="$(detect_os)"
+  if [[ "$os_name" == "macos" ]]; then
+    target="gui/$(id -u)/$SERVICE_LABEL"
+    if [[ "$SERVICE_WAS_ACTIVE" == "1" ]]; then
+      launchctl enable "$target" >/dev/null 2>&1 || return 1
+      if launchd_job_state "$target"; then
+        :
+      else
+        status=$?
+        [[ "$status" == "3" ]] || return 1
+        launchctl bootstrap "gui/$(id -u)" "$MACOS_PLIST" \
+          >/dev/null 2>&1 || return 1
+      fi
+      launchctl kickstart -k "$target" >/dev/null 2>&1 || return 1
+      if [[ "$SERVICE_ENABLEMENT_KNOWN" == "1" &&
+          "$SERVICE_WAS_ENABLED" == "0" ]]; then
+        launchctl disable "$target" >/dev/null 2>&1 || return 1
+      fi
+      launchd_job_state "$target" || return 1
+    elif [[ "$SERVICE_ENABLEMENT_KNOWN" == "1" ]]; then
+      if [[ "$SERVICE_WAS_ENABLED" == "1" ]]; then
+        launchctl enable "$target" >/dev/null 2>&1 || return 1
+      else
+        launchctl disable "$target" >/dev/null 2>&1 || return 1
+      fi
+    fi
+  elif [[ "$os_name" == "linux" ]]; then
+    systemctl --user daemon-reload >/dev/null 2>&1 || return 1
+    if [[ "$SERVICE_ENABLEMENT_KNOWN" == "1" ]]; then
+      if [[ "$SERVICE_WAS_ENABLED" == "1" ]]; then
+        if [[ "$SERVICE_WAS_ENABLED_RUNTIME" == "1" ]]; then
+          systemctl --user enable --runtime "skoobi-$INSTANCE" >/dev/null 2>&1 ||
+            return 1
+        else
+          systemctl --user enable "skoobi-$INSTANCE" >/dev/null 2>&1 ||
+            return 1
+        fi
+      else
+        systemctl --user disable "skoobi-$INSTANCE" >/dev/null 2>&1 ||
+          return 1
+      fi
+    fi
+    if [[ "$SERVICE_WAS_ACTIVE" == "1" ]]; then
+      systemctl --user start "skoobi-$INSTANCE" >/dev/null 2>&1 || return 1
+      if systemctl --user is-active --quiet "skoobi-$INSTANCE"; then
+        status=0
+      else
+        status=$?
+      fi
+      [[ "$status" == "0" ]] || return 1
+    fi
+  fi
+  return 0
 }
 
 install_service() {
@@ -1180,23 +1457,38 @@ install_service() {
   case "$node_path" in
     *$'\n'*|*$'\r'*) die "Node executable path must not contain newlines" ;;
   esac
-  [[ "$NO_START" == "1" ]] || stop_existing_service
   if [[ "$os_name" == "macos" ]]; then
     atomic_write_service "$MACOS_PLIST" "$(launchd_plist "$node_path")"
     if [[ "$NO_START" == "0" && "$DRY_RUN" == "0" ]]; then
       local target
       target="gui/$(id -u)/$SERVICE_LABEL"
+      SERVICE_ACTIVATION_ATTEMPTED=1
       launchctl enable "$target"
       launchctl bootstrap "gui/$(id -u)" "$MACOS_PLIST"
       launchctl kickstart -k "$target"
       launchctl print "$target" >/dev/null
+    elif [[ "$NO_START" == "1" && "$DRY_RUN" == "0" &&
+        "$SERVICE_ENABLEMENT_KNOWN" == "1" &&
+        "$SERVICE_WAS_ENABLED" == "1" ]]; then
+      launchctl enable "gui/$(id -u)/$SERVICE_LABEL"
     fi
   else
     atomic_write_service "$LINUX_UNIT" "$(systemd_unit "$node_path")"
     if [[ "$NO_START" == "0" && "$DRY_RUN" == "0" ]]; then
+      SERVICE_ACTIVATION_ATTEMPTED=1
       systemctl --user daemon-reload
       systemctl --user enable --now "skoobi-$INSTANCE"
       systemctl --user is-active --quiet "skoobi-$INSTANCE"
+    elif [[ "$NO_START" == "1" && "$DRY_RUN" == "0" ]]; then
+      systemctl --user daemon-reload
+      if [[ "$SERVICE_ENABLEMENT_KNOWN" == "1" &&
+          "$SERVICE_WAS_ENABLED" == "1" ]]; then
+        if [[ "$SERVICE_WAS_ENABLED_RUNTIME" == "1" ]]; then
+          systemctl --user enable --runtime "skoobi-$INSTANCE"
+        else
+          systemctl --user enable "skoobi-$INSTANCE"
+        fi
+      fi
     fi
   fi
 }
@@ -1212,80 +1504,301 @@ write_marker() {
   tmp="$(mktemp "$PREFIX/.skoobi-managed-install.XXXXXXXX")"
   marker_content "$APP_NAME" >"$tmp"
   chmod 600 "$tmp"
+  if [[ ! -e "$MARKER_FILE" && ! -L "$MARKER_FILE" ]]; then
+    MARKER_CREATED_BY_INSTALL=1
+  fi
   mv -f "$tmp" "$MARKER_FILE"
 }
 
+reconcile_cli_mutation_state() {
+  local target=""
+  if [[ "$CLI_CHANGE_ATTEMPTED" == "1" && "$CLI_CHANGED" != "1" ]]; then
+    if [[ -L "$CLI_LINK" ]]; then
+      target="$(readlink "$CLI_LINK" 2>/dev/null || true)"
+      [[ "$target" == "$CLI_TARGET" ]] || return 1
+      CLI_CHANGED=1
+    elif [[ -e "$CLI_LINK" ]]; then
+      return 1
+    fi
+  fi
+
+  if [[ "$CLI_MOVE_ATTEMPTED" == "1" && "$CLI_MOVED_ASIDE" != "1" ]]; then
+    if [[ -n "$CLI_BACKUP" &&
+        (-e "$CLI_BACKUP" || -L "$CLI_BACKUP") ]]; then
+      if [[ "$CLI_CHANGED" == "1" ||
+          (! -e "$CLI_LINK" && ! -L "$CLI_LINK") ]]; then
+        CLI_MOVED_ASIDE=1
+      else
+        return 1
+      fi
+    elif [[ "$CLI_CHANGED" == "1" ||
+        (! -e "$CLI_LINK" && ! -L "$CLI_LINK") ]]; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
 rollback_transaction() {
-  local status="$1"
+  local status="$1" os_name="" service_stopped="$SERVICE_STOP_CONFIRMED"
+  local app_moved_aside=0 cli_state_unknown=0 mutation_started=0
+  local pre_stop_state_restored=0
+  local launchd_status=0 rollback_app="" restore_ok=1 systemd_status=0 target=""
   [[ "$INSTALL_SUCCEEDED" == "0" ]] || return 0
   set +e
-  if [[ "$SERVICE_CHANGED" == "1" ]]; then
-    if [[ "$SERVICE_EXISTED" == "1" && -f "$SERVICE_BACKUP" ]]; then
-      if [[ "$(detect_os)" == "macos" ]]; then
-        mv -f "$SERVICE_BACKUP" "$MACOS_PLIST"
-      else
-        mv -f "$SERVICE_BACKUP" "$LINUX_UNIT"
-      fi
-    else
-      if [[ "$(detect_os)" == "macos" ]]; then
-        rm -f "$MACOS_PLIST"
-      else
-        rm -f "$LINUX_UNIT"
-      fi
-    fi
+  os_name="$(detect_os)"
+  if ! reconcile_cli_mutation_state; then
+    cli_state_unknown=1
+    err "Rollback could not safely determine the CLI path state"
   fi
-  if [[ "$SERVICE_WAS_ACTIVE" == "1" ]]; then
-    if [[ "$(detect_os)" == "macos" ]]; then
-      local target
+  if [[ "$SERVICE_ACTIVATION_ATTEMPTED" == "1" ]]; then
+    if [[ "$os_name" == "macos" ]]; then
       target="gui/$(id -u)/$SERVICE_LABEL"
-      launchctl enable "$target" >/dev/null 2>&1 || true
-      launchctl bootstrap "gui/$(id -u)" "$MACOS_PLIST" >/dev/null 2>&1 || true
-      launchctl kickstart -k "$target" >/dev/null 2>&1 || true
+      launchctl disable "$target" >/dev/null 2>&1 || true
+      launchctl bootout "$target" >/dev/null 2>&1 || true
+      if launchd_job_state "$target"; then
+        service_stopped=0
+      else
+        launchd_status=$?
+        if [[ "$launchd_status" == "3" ]]; then
+          service_stopped=1
+        else
+          service_stopped=0
+        fi
+      fi
     else
+      systemctl --user disable --now "skoobi-$INSTANCE" >/dev/null 2>&1 || true
       systemctl --user daemon-reload >/dev/null 2>&1 || true
-      systemctl --user enable --now "skoobi-$INSTANCE" >/dev/null 2>&1 || true
+      if systemctl --user is-active --quiet "skoobi-$INSTANCE"; then
+        systemd_status=0
+      else
+        systemd_status=$?
+      fi
+      case "$systemd_status" in
+        3|4) ;;
+        *) service_stopped=0 ;;
+      esac
     fi
   fi
-  if [[ "$CLI_CHANGED" == "1" ]]; then
-    rm -f "$CLI_LINK"
-  fi
-  if [[ "$CLI_MOVED_ASIDE" == "1" &&
-      -n "$CLI_BACKUP" && (-e "$CLI_BACKUP" || -L "$CLI_BACKUP") ]]; then
-    if [[ ! -e "$CLI_LINK" && ! -L "$CLI_LINK" ]]; then
-      mv "$CLI_BACKUP" "$CLI_LINK"
-      CLI_MOVED_ASIDE=0
+  if [[ "$STAGE_ACTIVATION_STARTED" != "1" && -n "$OLD_RELEASE" &&
+      ! -e "$OLD_RELEASE" && ! -L "$OLD_RELEASE" &&
+      (-e "$APP_DIR" || -L "$APP_DIR") ]]; then
+    OLD_RELEASE=""
+    if [[ -n "$OLD_RELEASE_ROOT" && -d "$OLD_RELEASE_ROOT" ]]; then
+      rmdir "$OLD_RELEASE_ROOT" >/dev/null 2>&1 || true
+      [[ -e "$OLD_RELEASE_ROOT" ]] || OLD_RELEASE_ROOT=""
     fi
   fi
-  if [[ -n "$ENV_BACKUP" && -f "$ENV_BACKUP" ]]; then
-    rm -f "$ENV_FILE"
-    cp "$ENV_BACKUP" "$ENV_FILE"
-    chmod 600 "$ENV_FILE"
-  elif [[ "$ENV_CREATED_BY_INSTALL" == "1" ]]; then
-    rm -f "$ENV_FILE"
+  if [[ "$STAGE_ACTIVATION_STARTED" == "1" || "$SERVICE_CHANGED" == "1" ||
+      "$CLI_CHANGED" == "1" || "$CLI_MOVED_ASIDE" == "1" ||
+      "$CLI_CHANGE_ATTEMPTED" == "1" || "$CLI_MOVE_ATTEMPTED" == "1" ||
+      "$ENV_CREATED_BY_INSTALL" == "1" || -n "$ENV_BACKUP" ]]; then
+    mutation_started=1
   fi
-  if [[ -n "$OLD_RELEASE" && -e "$OLD_RELEASE" ]]; then
-    rm -rf "$APP_DIR"
-    mv "$OLD_RELEASE" "$APP_DIR"
-  elif [[ "$STAGE_ACTIVATION_STARTED" == "1" && -e "$APP_DIR" ]]; then
-    rm -rf "$APP_DIR"
+  if [[ "$cli_state_unknown" == "1" ]]; then
+    service_stopped=0
+  fi
+  if [[ "$service_stopped" != "1" && "$mutation_started" == "0" &&
+      "$SERVICE_STOP_ATTEMPTED" == "1" ]]; then
+    if restore_previous_service_state; then
+      service_stopped=1
+      pre_stop_state_restored=1
+    else
+      err "Rollback could not restore the service state after a failed stop"
+    fi
+  fi
+  if [[ "$service_stopped" == "1" && "$SERVICE_CHANGED" == "1" &&
+      "$SERVICE_EXISTED" == "1" &&
+      (! -f "$SERVICE_BACKUP" || -L "$SERVICE_BACKUP") ]]; then
+    service_stopped=0
+    err "Rollback cannot safely restore the previous service definition; its backup is missing or unsafe"
+  fi
+  if [[ "$service_stopped" == "1" && -n "$OLD_RELEASE" &&
+      (! -d "$OLD_RELEASE" || -L "$OLD_RELEASE") ]]; then
+    service_stopped=0
+    err "Rollback cannot safely restore the previous app release; its backup is missing or unsafe"
+  fi
+  if [[ "$service_stopped" == "1" && -n "$ENV_BACKUP" &&
+      (! -f "$ENV_BACKUP" || -L "$ENV_BACKUP") ]]; then
+    service_stopped=0
+    err "Rollback cannot safely restore the previous .env; its backup is missing or unsafe"
+  fi
+  if [[ "$service_stopped" == "1" && "$CLI_MOVED_ASIDE" == "1" &&
+      (-z "$CLI_BACKUP" || (! -e "$CLI_BACKUP" && ! -L "$CLI_BACKUP")) ]]; then
+    service_stopped=0
+    err "Rollback cannot safely restore the previous CLI path; its backup is missing"
+  fi
+  if [[ "$service_stopped" != "1" &&
+      ("$mutation_started" == "1" || "$SERVICE_STOP_ATTEMPTED" == "1") ]]; then
+    err "Rollback could not prove a complete safe restore; preserving the current app and service definition"
+    err "Manual recovery is required before another lifecycle operation"
+    err "Preserved app: $APP_DIR"
+    [[ -z "$OLD_RELEASE" ]] || err "Previous release retained: $OLD_RELEASE"
+  fi
+  if [[ "$service_stopped" == "1" && "$SERVICE_CHANGED" == "1" ]]; then
+    if [[ "$SERVICE_EXISTED" == "1" ]]; then
+      if [[ "$os_name" == "macos" ]]; then
+        cp "$SERVICE_BACKUP" "$MACOS_PLIST" &&
+          cmp -s "$SERVICE_BACKUP" "$MACOS_PLIST" ||
+          restore_ok=0
+      else
+        cp "$SERVICE_BACKUP" "$LINUX_UNIT" &&
+          cmp -s "$SERVICE_BACKUP" "$LINUX_UNIT" ||
+          restore_ok=0
+      fi
+    else
+      if [[ "$os_name" == "macos" ]]; then
+        rm -f "$MACOS_PLIST" || restore_ok=0
+      else
+        rm -f "$LINUX_UNIT" || restore_ok=0
+      fi
+    fi
+    if [[ "$restore_ok" == "1" && "$os_name" == "linux" ]]; then
+      systemctl --user daemon-reload >/dev/null 2>&1 || true
+    fi
+  fi
+  if [[ "$service_stopped" == "1" && "$restore_ok" == "1" ]]; then
+    if [[ "$CLI_CHANGED" == "1" ]]; then
+      if [[ -L "$CLI_LINK" &&
+          "$(readlink "$CLI_LINK" 2>/dev/null || true)" == "$CLI_TARGET" ]]; then
+        rm -f "$CLI_LINK" || restore_ok=0
+      else
+        restore_ok=0
+      fi
+    fi
+    if [[ "$restore_ok" == "1" && "$CLI_MOVED_ASIDE" == "1" &&
+        -n "$CLI_BACKUP" && (-e "$CLI_BACKUP" || -L "$CLI_BACKUP") ]]; then
+      if [[ ! -e "$CLI_LINK" && ! -L "$CLI_LINK" ]]; then
+        if mv "$CLI_BACKUP" "$CLI_LINK"; then
+          CLI_MOVED_ASIDE=0
+        else
+          restore_ok=0
+        fi
+      else
+        restore_ok=0
+      fi
+    fi
+    if [[ "$restore_ok" == "1" &&
+        -n "$ENV_BACKUP" && -f "$ENV_BACKUP" ]]; then
+      rm -f "$ENV_FILE" &&
+        cp "$ENV_BACKUP" "$ENV_FILE" &&
+        chmod 600 "$ENV_FILE" &&
+        cmp -s "$ENV_BACKUP" "$ENV_FILE" ||
+        restore_ok=0
+    elif [[ "$restore_ok" == "1" &&
+        "$ENV_CREATED_BY_INSTALL" == "1" ]]; then
+      rm -f "$ENV_FILE" || restore_ok=0
+    fi
+    if [[ "$restore_ok" == "1" &&
+        -n "$OLD_RELEASE" && -e "$OLD_RELEASE" ]]; then
+      rollback_app="$OLD_RELEASE_ROOT/failed-release"
+      if [[ -e "$APP_DIR" || -L "$APP_DIR" ]]; then
+        if mv "$APP_DIR" "$rollback_app"; then
+          app_moved_aside=1
+        else
+          restore_ok=0
+        fi
+      fi
+      if [[ "$restore_ok" == "1" ]]; then
+        if mv "$OLD_RELEASE" "$APP_DIR"; then
+          OLD_RELEASE=""
+          STAGE_ACTIVATION_STARTED=0
+          [[ "$app_moved_aside" == "0" ]] || rm -rf "$rollback_app"
+        else
+          restore_ok=0
+          if [[ "$app_moved_aside" == "1" &&
+              ! -e "$APP_DIR" && ! -L "$APP_DIR" ]]; then
+            mv "$rollback_app" "$APP_DIR" || true
+          fi
+        fi
+      fi
+    elif [[ "$restore_ok" == "1" &&
+        "$STAGE_ACTIVATION_STARTED" == "1" && -e "$APP_DIR" ]]; then
+      if rm -rf "$APP_DIR"; then
+        STAGE_ACTIVATION_STARTED=0
+      else
+        restore_ok=0
+      fi
+    fi
+    if [[ "$restore_ok" == "1" &&
+        "$MARKER_CREATED_BY_INSTALL" == "1" ]]; then
+      if rm -f "$MARKER_FILE"; then
+        MARKER_CREATED_BY_INSTALL=0
+      else
+        err "Rollback could not remove the newly created managed-install marker"
+      fi
+    fi
+  fi
+  if [[ "$service_stopped" == "1" && "$restore_ok" != "1" ]]; then
+    err "Rollback restore failed; the previous service will not be restarted"
+    err "Manual recovery is required before another lifecycle operation"
+  fi
+  if [[ "$service_stopped" == "1" && "$restore_ok" == "1" &&
+      "$pre_stop_state_restored" != "1" ]]; then
+    restore_previous_service_state ||
+      err "Rollback could not confirm the previous service state was restored"
   fi
   [[ -z "$STAGE_DIR" || ! -e "$STAGE_DIR" ]] || rm -rf "$STAGE_DIR"
   [[ -z "$BUILD_HOME" || ! -e "$BUILD_HOME" ]] || rm -rf "$BUILD_HOME"
   [[ -z "$GIT_HOME" || ! -e "$GIT_HOME" ]] || rm -rf "$GIT_HOME"
+  [[ -z "$ENV_BACKUP_PENDING" || ! -e "$ENV_BACKUP_PENDING" ]] ||
+    rm -f "$ENV_BACKUP_PENDING"
   if [[ -n "$OLD_RELEASE_ROOT" && -d "$OLD_RELEASE_ROOT" ]]; then
     rmdir "$OLD_RELEASE_ROOT" >/dev/null 2>&1 || true
   fi
   if [[ "$LOCK_HELD" == "1" ]]; then
-    rmdir "$LOCK_DIR" >/dev/null 2>&1 || true
-    LOCK_HELD=0
+    if rmdir "$LOCK_DIR" >/dev/null 2>&1; then
+      LOCK_HELD=0
+    fi
   fi
   set -e
   return "$status"
 }
 
+cleanup_exit_artifacts() {
+  local cleanup_failed=0
+  set +e
+  [[ -z "$STAGE_DIR" || ! -e "$STAGE_DIR" ]] || rm -rf "$STAGE_DIR"
+  [[ -z "$BUILD_HOME" || ! -e "$BUILD_HOME" ]] || rm -rf "$BUILD_HOME"
+  [[ -z "$GIT_HOME" || ! -e "$GIT_HOME" ]] || rm -rf "$GIT_HOME"
+  [[ -z "$ENV_BACKUP_PENDING" || ! -e "$ENV_BACKUP_PENDING" ]] ||
+    rm -f "$ENV_BACKUP_PENDING"
+  if [[ "$INSTALL_SUCCEEDED" == "1" ]]; then
+    if [[ -n "$OLD_RELEASE" && -e "$OLD_RELEASE" ]]; then
+      rm -rf "$OLD_RELEASE"
+      if [[ ! -e "$OLD_RELEASE" && ! -L "$OLD_RELEASE" ]]; then
+        OLD_RELEASE=""
+      else
+        err "Install succeeded, but the previous release backup could not be removed: $OLD_RELEASE"
+      fi
+    fi
+    if [[ -n "$OLD_RELEASE_ROOT" && -d "$OLD_RELEASE_ROOT" ]]; then
+      rmdir "$OLD_RELEASE_ROOT"
+      if [[ ! -e "$OLD_RELEASE_ROOT" ]]; then
+        OLD_RELEASE_ROOT=""
+      else
+        err "Install succeeded, but the previous release directory could not be removed: $OLD_RELEASE_ROOT"
+      fi
+    fi
+  fi
+  if [[ "$LOCK_HELD" == "1" ]]; then
+    if rmdir "$LOCK_DIR" >/dev/null 2>&1; then
+      LOCK_HELD=0
+    else
+      err "Could not release the installer operation lock: $LOCK_DIR"
+      cleanup_failed=1
+    fi
+  fi
+  set -e
+  return "$cleanup_failed"
+}
+
 on_exit() {
   local status="$1"
+  trap - EXIT
+  trap '' HUP INT TERM
   rollback_transaction "$status" || true
+  cleanup_exit_artifacts || true
   exit "$status"
 }
 trap 'on_exit $?' EXIT
@@ -1303,6 +1816,7 @@ main() {
   [[ "$DRY_RUN" == "0" ]] || log "mode: dry-run"
 
   check_requirements
+  warn_if_linux_linger_disabled
   assert_instance_path_types
   check_provider_requirements
   preflight_service_path
@@ -1311,6 +1825,7 @@ main() {
   run mkdir -p "$APP_BASE" "$BACKUP_DIR"
   run chmod 700 "$PREFIX" "$APP_BASE" "$BACKUP_DIR"
   build_staged_release
+  stop_existing_service
   switch_release
   if prepare_instance; then
     configure_env
@@ -1320,17 +1835,8 @@ main() {
   write_marker
 
   INSTALL_SUCCEEDED=1
-  if [[ -n "$OLD_RELEASE" && -e "$OLD_RELEASE" ]]; then
-    rm -rf "$OLD_RELEASE"
-    OLD_RELEASE=""
-  fi
-  if [[ -n "$OLD_RELEASE_ROOT" && -d "$OLD_RELEASE_ROOT" ]]; then
-    rmdir "$OLD_RELEASE_ROOT"
-    OLD_RELEASE_ROOT=""
-  fi
-  [[ -z "$GIT_HOME" || ! -e "$GIT_HOME" ]] || rm -rf "$GIT_HOME"
-  GIT_HOME=""
-  release_operation_lock
+  cleanup_exit_artifacts ||
+    die "Install committed, but its operation lock could not be released"
   log "Skoobi install complete."
   log "App: $APP_DIR"
   log "Instance data: $INSTANCE_DIR"

@@ -1,6 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'node:url';
 
 import {
   createAssistantTriggerPattern,
@@ -58,8 +59,12 @@ export const SENDER_ALLOWLIST_PATH = path.join(
 // packages/core/{src|dist}/orchestrator/config.{ts|js} → ../../../../
 // In developer mode: same as STATE_ROOT.
 // In plugin mode: the plugin code directory (different from STATE_ROOT).
-const thisDir = path.dirname(new URL(import.meta.url).pathname);
-export const CODE_ROOT = path.resolve(thisDir, '..', '..', '..', '..');
+export function resolveCodeRootFromModuleUrl(moduleUrl: string | URL): string {
+  const thisDir = path.dirname(fileURLToPath(moduleUrl));
+  return path.resolve(thisDir, '..', '..', '..', '..');
+}
+
+export const CODE_ROOT = resolveCodeRootFromModuleUrl(import.meta.url);
 
 // State lives in the current working directory — always.
 // In developer mode: cwd is the claudeclaw repo.

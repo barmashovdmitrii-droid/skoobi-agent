@@ -18,6 +18,7 @@ const INSTALLER_FIXTURE = [
   '#!/usr/bin/env bash',
   'REF_DEFAULT="main"',
   'EXPECTED_COMMIT_DEFAULT=""',
+  '# --ref <branch/tag> Git branch or tag (release assets are tag-pinned)',
   'exit 0',
   '',
 ].join('\n');
@@ -34,6 +35,8 @@ describe('prepareReleaseInstaller', () => {
 
     expect(output).toContain("REF_DEFAULT='refs/tags/v2.0.0-rc.1'");
     expect(output).toContain(`EXPECTED_COMMIT_DEFAULT='${COMMIT}'`);
+    expect(output).toContain('release assets are tag-pinned');
+    expect(output).not.toContain('default: main');
     expect(() =>
       execFileSync('bash', ['-n'], {
         input: output,

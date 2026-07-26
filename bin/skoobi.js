@@ -32,7 +32,7 @@ Commands:
   start       Start the default instance service
   stop        Stop the default instance service
   restart     Restart the default instance service
-  update      Run scripts/update.sh
+  update      Run a commit-pinned update (advanced)
   uninstall   Run scripts/uninstall.sh
   paths       Show app, instance, config, logs, and DB paths
   version     Show CLI version
@@ -40,6 +40,10 @@ Commands:
 Owner setup:
   skoobi owner init <numeric-id-or-tg:chat-id>
   Send /chatid to the bot, copy the private chat ID, then run this command.
+
+Pinned update:
+  skoobi update --ref refs/tags/<version> --expected-commit <40-hex>
+  For normal upgrades, use the next release's checksum-verified install.sh.
 
 Options:
   --prefix <path>      Install prefix (default: ~/.skoobi)
@@ -157,6 +161,16 @@ function isMac() {
   return process.platform === 'darwin';
 }
 
+function launchdJobState(target) {
+  const job = run('launchctl', ['print', target], { capture: true });
+  if (job.status === 0) return 'active';
+  if (job.status !== 113) return 'unknown';
+
+  const domain = target.slice(0, target.lastIndexOf('/'));
+  const reachable = run('launchctl', ['print', domain], { capture: true });
+  return reachable.status === 0 ? 'absent' : 'unknown';
+}
+
 function printPaths(paths) {
   console.log(JSON.stringify(paths, null, 2));
 }
@@ -169,8 +183,11 @@ function serviceAction(action, paths) {
       if (enabled.status !== 0) {
         throw new Error('launchd service could not be enabled');
       }
-      const loaded = run('launchctl', ['print', target], { capture: true });
-      if (loaded.status !== 0) {
+      const state = launchdJobState(target);
+      if (state === 'unknown') {
+        throw new Error('launchd service state could not be determined');
+      }
+      if (state === 'absent') {
         const bootstrapped = run(
           'launchctl',
           ['bootstrap', `gui/${process.getuid()}`, paths.launchdPlist],
@@ -187,11 +204,12 @@ function serviceAction(action, paths) {
         throw new Error('launchd KeepAlive could not be disabled');
       }
       run('launchctl', ['bootout', target], { capture: true });
-      const stillLoaded = run('launchctl', ['print', target], {
-        capture: true,
-      });
-      if (stillLoaded.status === 0) {
+      const state = launchdJobState(target);
+      if (state === 'active') {
         throw new Error('launchd service is still loaded after stop');
+      }
+      if (state === 'unknown') {
+        throw new Error('launchd could not prove the service stopped');
       }
     } else {
       const result = run('launchctl', ['print', target], { capture: true });
@@ -334,7 +352,30 @@ async function doctor(paths) {
   if (failures > 0) process.exitCode = 1;
 }
 
+function printLinuxServiceJournal(paths) {
+  if (process.platform !== 'linux') return false;
+  const result = run(
+    'journalctl',
+    [
+      '--user',
+      '--unit',
+      paths.systemdUnit,
+      '--lines',
+      '80',
+      '--no-pager',
+    ],
+    { capture: true, timeout: 10000 },
+  );
+  if (result.status !== 0) return false;
+  const output = result.stdout || '';
+  const trimmed = output.trim();
+  if (!trimmed || trimmed === '-- No entries --') return false;
+  process.stdout.write(output.endsWith('\n') ? output : `${output}\n`);
+  return true;
+}
+
 function logs(paths) {
+  const journalPrinted = printLinuxServiceJournal(paths);
   const pathChain = [
     paths.prefix,
     path.join(paths.prefix, 'instances'),
@@ -349,7 +390,9 @@ function logs(paths) {
       }
     }
   } catch {
-    console.log('No safe log files found.');
+    if (!journalPrinted) {
+      console.log('No safe log files found.');
+    }
     return;
   }
   const candidates = [
@@ -406,7 +449,9 @@ function logs(paths) {
     }
   }
   if (files.length === 0) {
-    console.log('No safe log files found.');
+    if (!journalPrinted) {
+      console.log('No safe log files found.');
+    }
     return;
   }
   for (const { file, text } of files) {

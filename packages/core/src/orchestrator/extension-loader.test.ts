@@ -1,12 +1,62 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { resolveExtensionEntry } from './extension-loader.js';
+import {
+  resolveExtensionCodeRootFromModuleUrl,
+  resolveExtensionEntry,
+} from './extension-loader.js';
 
 const ROOT = path.resolve('/srv/claudeclaw/extensions/claudeclaw-demo');
+
+describe('extension code-root resolution', () => {
+  it('decodes spaces and Unicode in the module path', () => {
+    const tempRoot = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'skoobi-extension-root-')),
+    );
+    const codeRoot = path.join(tempRoot, 'Skoobi path Юникод');
+    const modulePath = path.join(
+      codeRoot,
+      'packages',
+      'core',
+      'dist',
+      'orchestrator',
+      'extension-loader.js',
+    );
+    fs.mkdirSync(path.dirname(modulePath), { recursive: true });
+    fs.writeFileSync(modulePath, '');
+
+    try {
+      expect(
+        resolveExtensionCodeRootFromModuleUrl(pathToFileURL(modulePath)),
+      ).toBe(codeRoot);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('resolves the repository root from the actual package layout', () => {
+    const moduleUrl = new URL('./extension-loader.js', import.meta.url);
+    const packageOrchestratorDir = path.dirname(fileURLToPath(moduleUrl));
+    const expectedRepositoryRoot = path.resolve(
+      packageOrchestratorDir,
+      '..',
+      '..',
+      '..',
+      '..',
+    );
+
+    expect(resolveExtensionCodeRootFromModuleUrl(moduleUrl)).toBe(
+      expectedRepositoryRoot,
+    );
+    expect(
+      fs.existsSync(path.join(expectedRepositoryRoot, 'package.json')),
+    ).toBe(true);
+  });
+});
 
 describe('resolveExtensionEntry containment', () => {
   it('accepts a plain JS entry inside the extension root', () => {

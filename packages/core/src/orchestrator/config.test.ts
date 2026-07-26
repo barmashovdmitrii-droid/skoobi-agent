@@ -1,3 +1,8 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 describe('config path resolution', () => {
@@ -15,6 +20,32 @@ describe('config path resolution', () => {
   it('uses cwd as STATE_ROOT', async () => {
     const config = await import('./config.js');
     expect(config.STATE_ROOT).toBe(process.cwd());
+  });
+
+  it('decodes spaces and Unicode when resolving CODE_ROOT', async () => {
+    const tempRoot = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'skoobi-code-root-')),
+    );
+    const codeRoot = path.join(tempRoot, 'Skoobi path Юникод');
+    const modulePath = path.join(
+      codeRoot,
+      'packages',
+      'core',
+      'dist',
+      'orchestrator',
+      'config.js',
+    );
+    fs.mkdirSync(path.dirname(modulePath), { recursive: true });
+    fs.writeFileSync(modulePath, '');
+
+    try {
+      const config = await import('./config.js');
+      expect(
+        config.resolveCodeRootFromModuleUrl(pathToFileURL(modulePath)),
+      ).toBe(codeRoot);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 
   it('derives STORE_DIR from STATE_ROOT', async () => {

@@ -15,6 +15,7 @@ import os from 'node:os';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import {
   CodexAppServerClient,
   CodexDesktopBridge,
@@ -56,7 +57,10 @@ function secretMatches(provided, expected) {
 // Config
 // ---------------------------------------------------------------------------
 
-const PROJECT_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const PROJECT_ROOT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+);
 const ENV_FILE = path.join(PROJECT_ROOT, '.env');
 const LOG_FILE = path.join(PROJECT_ROOT, 'logs', 'skoobi-helper.log');
 const SCREENSHOT_DIR = '/tmp/skoobi-screenshots';

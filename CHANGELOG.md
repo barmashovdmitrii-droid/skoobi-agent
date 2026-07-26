@@ -2,6 +2,23 @@
 
 All notable public changes to Skoobi Agent are documented here.
 
+## 2.0.0-rc.3
+
+- Fixed managed Linux service generation and added systemd unit validation.
+- Prevented installer-generated Husky files from blocking reinstall, update,
+  or uninstall while continuing to protect owner-modified files.
+- Fixed application path handling for home directories containing spaces or
+  non-ASCII characters.
+- Made low-level updates fail closed unless both an exact ref and commit ID are
+  supplied; normal upgrades use the checksum-verified release installer.
+- Quiesced managed services before release swaps and improved failed-install
+  and failed-update rollback, including signals and partially completed file
+  operations.
+- Made launchd state checks fail closed on manager/transport errors and added
+  Linux journal output to `skoobi logs`.
+- Corrected extension discovery from the built workspace package layout.
+- Added per-instance backup cleanup and Linux lingering guidance.
+
 ## 2.0.0-rc.2
 
 - Fixed the clean-install Telegram token prompt and CLI link creation.
