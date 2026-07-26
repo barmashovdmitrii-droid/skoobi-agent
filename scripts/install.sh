@@ -368,6 +368,22 @@ systemd_path_escape() {
   printf '%s' "$value"
 }
 
+systemd_executable_path_is_safe() {
+  local value="$1"
+  case "$value" in
+    *$'\n'*|*$'\r'*|*:*)
+      return 1
+      ;;
+  esac
+  [[ "$value" != *'\'* ]] || return 1
+  [[ "$value" != *'"'* ]] || return 1
+  [[ "$value" != *"'"* ]] || return 1
+  [[ "$value" != *'*'* ]] || return 1
+  [[ "$value" != *'?'* ]] || return 1
+  [[ "$value" != *'['* ]] || return 1
+  return 0
+}
+
 launchd_plist() {
   local node_path="$1" node_dir
   case "$node_path" in
@@ -414,9 +430,8 @@ EOF
 
 systemd_unit() {
   local node_path="$1" node_dir
-  case "$node_path" in
-    *$'\n'*|*$'\r'*|*:*) die "Node executable path is unsafe for service PATH" ;;
-  esac
+  systemd_executable_path_is_safe "$node_path" ||
+    die "Node executable path contains characters unsupported by systemd ExecStart"
   node_dir="$(dirname "$node_path")"
   cat <<EOF
 [Unit]

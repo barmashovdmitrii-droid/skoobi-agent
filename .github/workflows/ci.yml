@@ -65,7 +65,7 @@ jobs:
           set -euo pipefail
           prefix="${RUNNER_TEMP}/Skoobi verify % dollar\$ quote\" кириллица"
           service_home="${RUNNER_TEMP}/Home % dollar\$ quote\" slash\\ кириллица"
-          node_dir="${RUNNER_TEMP}/Node % dollar\$ quote\" slash\\ кириллица"
+          node_dir="${RUNNER_TEMP}/Node % dollar\$ кириллица"
           unit="${RUNNER_TEMP}/skoobi-ci.service"
           mkdir -p "$prefix/instances/ci" "$service_home" "$node_dir"
           cp "$(command -v node)" "$node_dir/node"

@@ -2230,6 +2230,46 @@ esac`,
     expect(mac).toContain('/usr/local/opt/node@22/bin');
   });
 
+  it.runIf(process.platform === 'linux')(
+    'rejects Node executable characters unsupported by systemd',
+    () => {
+      for (const nodePath of [
+        '/tmp/node"quoted/node',
+        '/tmp/node\\backslash/node',
+        "/tmp/node'single/node",
+        '/tmp/node*glob/node',
+        '/tmp/node?glob/node',
+        '/tmp/node[glob/node',
+      ]) {
+        const fake = makeFakeCommands({
+          node: `printf '%s\\n' ${JSON.stringify(nodePath)}`,
+        });
+        const result = runResult(
+          'bash',
+          [
+            'scripts/install.sh',
+            '--print-service',
+            'linux',
+            '--prefix',
+            tempDir(),
+            '--instance',
+            'unsupported-node-path',
+          ],
+          {
+            env: {
+              HOME: tempDir(),
+              PATH: `${fake.bin}:${process.env.PATH || ''}`,
+            },
+          },
+        );
+        expect(result.status, nodePath).not.toBe(0);
+        expect(result.stderr).toContain(
+          'Node executable path contains characters unsupported by systemd ExecStart',
+        );
+      }
+    },
+  );
+
   it('warns about missing Linux lingering without changing host policy', () => {
     const prefix = tempDir();
     const home = tempDir();
