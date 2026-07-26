@@ -369,18 +369,23 @@ systemd_path_escape() {
 }
 
 systemd_executable_path_is_safe() {
-  local value="$1"
+  local value="$1" LC_ALL=C
+  [[ -n "$value" ]] || return 1
   case "$value" in
     *$'\n'*|*$'\r'*|*:*)
       return 1
       ;;
   esac
+  [[ "$value" != *[[:cntrl:]]* ]] || return 1
   [[ "$value" != *'\'* ]] || return 1
   [[ "$value" != *'"'* ]] || return 1
   [[ "$value" != *"'"* ]] || return 1
   [[ "$value" != *'*'* ]] || return 1
   [[ "$value" != *'?'* ]] || return 1
   [[ "$value" != *'['* ]] || return 1
+  command -v iconv >/dev/null 2>&1 || return 1
+  printf '%s' "$value" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 ||
+    return 1
   return 0
 }
 
@@ -431,7 +436,7 @@ EOF
 systemd_unit() {
   local node_path="$1" node_dir
   systemd_executable_path_is_safe "$node_path" ||
-    die "Node executable path contains characters unsupported by systemd ExecStart"
+    die "Node executable path cannot be represented safely in systemd ExecStart"
   node_dir="$(dirname "$node_path")"
   cat <<EOF
 [Unit]

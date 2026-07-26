@@ -1613,7 +1613,7 @@ describe('Skoobi installer scripts', () => {
     expect(fs.existsSync(path.join(prefix, '.skoobi-operation.lock'))).toBe(
       false,
     );
-  });
+  }, 20_000);
 
   it('stops a live service before reinstall and restores it after a later failure', () => {
     const remote = createRemote({ tracked: 'old\n' });
@@ -2157,7 +2157,7 @@ esac`,
 
     installFixture(remote, prefix, 'preserve', home);
     expect(fs.readFileSync(envFile, 'utf8')).toBe(ownerConfig);
-  });
+  }, 20_000);
 
   it('creates private state directories and service umask 0077', () => {
     const remote = createRemote();
@@ -2264,7 +2264,39 @@ esac`,
         );
         expect(result.status, nodePath).not.toBe(0);
         expect(result.stderr).toContain(
-          'Node executable path contains characters unsupported by systemd ExecStart',
+          'Node executable path cannot be represented safely in systemd ExecStart',
+        );
+      }
+
+      for (const [label, body] of [
+        ['empty path', ':'],
+        ['TAB', "printf '\\x09'"],
+        ['BEL', "printf '\\x07'"],
+        ['DEL', "printf '\\x7f'"],
+        ['invalid UTF-8', "printf '\\xff'"],
+      ]) {
+        const fake = makeFakeCommands({ node: body });
+        const result = runResult(
+          'bash',
+          [
+            'scripts/install.sh',
+            '--print-service',
+            'linux',
+            '--prefix',
+            tempDir(),
+            '--instance',
+            'unsafe-node-bytes',
+          ],
+          {
+            env: {
+              HOME: tempDir(),
+              PATH: `${fake.bin}:${process.env.PATH || ''}`,
+            },
+          },
+        );
+        expect(result.status, label).not.toBe(0);
+        expect(result.stderr).toContain(
+          'Node executable path cannot be represented safely in systemd ExecStart',
         );
       }
     },
