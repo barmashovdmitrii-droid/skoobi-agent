@@ -38,6 +38,11 @@ const MAX_SCAN_DEPTH = 4;
 const MAX_ROLLOUT_FILES = 6;
 const MAX_ROLLOUT_BYTES_PER_FILE = 64 * 1024 * 1024;
 const MAX_ROLLOUT_INDEX_FILES = 2_000;
+// Some Linux/container filesystems expose coarser mtimes than JavaScript's
+// millisecond clock. Exact rollout ownership still requires the per-job marker
+// and an in-window event timestamp; this narrow skew only prevents a freshly
+// written artifact from being discarded after sub-second mtime truncation.
+const ROLLOUT_ARTIFACT_MTIME_SKEW_MS = 2_000;
 const MAX_TELEGRAM_PHOTO_BYTES = 49 * 1024 * 1024;
 const MIN_IMAGE_BYTES = 128;
 const STALE_GENERATION_MS = 20 * 60 * 1000;
@@ -246,7 +251,12 @@ function exactImageEvidenceFromRollouts(input: {
         if (timestampMs < input.notBeforeMs || timestampMs > input.notAfterMs) {
           continue;
         }
-        if (imageStat.mtimeMs < input.notBeforeMs) continue;
+        if (
+          imageStat.mtimeMs <
+          input.notBeforeMs - ROLLOUT_ARTIFACT_MTIME_SKEW_MS
+        ) {
+          continue;
+        }
       } catch {
         continue;
       }

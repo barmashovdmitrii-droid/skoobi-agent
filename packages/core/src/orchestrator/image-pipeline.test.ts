@@ -800,6 +800,10 @@ describe('official Codex image pipeline', () => {
       'result.png',
     );
     writeTestPng(generated, 28);
+    // Model a coarse filesystem clock that rounds a just-written artifact
+    // slightly before the millisecond-precise job timestamp.
+    const coarseMtime = new Date(now.getTime() - 1_000);
+    fs.utimesSync(generated, coarseMtime, coarseMtime);
     const rollout = path.join(
       codexHome,
       'sessions',
@@ -839,6 +843,67 @@ describe('official Codex image pipeline', () => {
       'call-finalize-rollout',
     );
     expect(getImageJobById(context.job.id)?.generation_attempts).toBe(1);
+  });
+
+  it('rejects an exact-rollout artifact older than the filesystem clock skew', async () => {
+    const now = new Date();
+    const context = beginCodexImageJob({
+      chatJid: 'tg:1',
+      replyJid: 'tg:1',
+      groupFolder: 'telegram_test',
+      requestCursor: new Date(now.getTime() + 2_000).toISOString(),
+      prompt: 'старый маяк',
+      codexHome,
+      workspaceRoot,
+      now: now.toISOString(),
+    });
+    const generated = path.join(
+      codexHome,
+      'generated_images',
+      'stale-finalize-gap',
+      'result.png',
+    );
+    writeTestPng(generated, 29);
+    // One millisecond beyond the production tolerance must still fail closed.
+    const staleMtime = new Date(now.getTime() - 2_001);
+    fs.utimesSync(generated, staleMtime, staleMtime);
+    const rollout = path.join(
+      codexHome,
+      'sessions',
+      '2026',
+      '07',
+      '12',
+      'rollout-stale-finalize-test.jsonl',
+    );
+    fs.mkdirSync(path.dirname(rollout), { recursive: true });
+    fs.writeFileSync(
+      rollout,
+      `${officialImagegenJobMarker(context.job.id, context.generationAttempt)}\n${JSON.stringify(
+        {
+          timestamp: new Date(now.getTime() + 1_000).toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'image_generation_end',
+            call_id: 'call-stale-finalize-rollout',
+            status: 'completed',
+            saved_path: generated,
+          },
+        },
+      )}\n`,
+    );
+    const sentPhotos: string[] = [];
+
+    const result = await finalizeCodexImageJob({
+      context,
+      router: fakeRouter(sentPhotos),
+      generatedArtifacts: [],
+    });
+
+    expect(result.delivered).toBe(false);
+    expect(result.deliveryPending).toBe(true);
+    expect(result.automaticRetrySuppressed).toBe(true);
+    expect(sentPhotos).toEqual([]);
+    expect(getImageJobArtifacts(context.job.id)).toEqual([]);
   });
 
   it('repairs a queued first attempt from rollout before claiming a paid retry', async () => {
