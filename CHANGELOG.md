@@ -2,6 +2,17 @@
 
 All notable public changes to Skoobi Agent are documented here.
 
+## 2.0.0-rc.2
+
+- Fixed the clean-install Telegram token prompt and CLI link creation.
+- Added a fail-closed, idempotent first-owner bootstrap command.
+- Routed default Codex turns only for the registered owner tenant.
+- Verified the pinned sandbox runtime without `npx` or network resolution.
+- Expanded dependency, authentication, owner, and runtime health checks.
+- Added an English five-minute Quick Start and troubleshooting guide.
+- Documented the required explicit rc.1 Codex-profile reconfiguration; a
+  normal update continues to preserve the existing private `.env`.
+
 ## 2.0.0-rc.1
 
 - Reorganized the runtime into workspace packages.

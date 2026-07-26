@@ -446,12 +446,12 @@ describe('task scheduler', () => {
     expect(runnerMocks.writeTasksSnapshot.mock.calls[1][2]).toEqual([]);
   });
 
-  it('runs scheduled tasks through the Codex provider when codex-primary is enabled', async () => {
+  it('routes a durably owner-authorized main sandbox task through Codex primary', async () => {
     process.env.SKOOBI_SCHEDULED_TASKS_CODEX_PRIMARY = 'true';
     createTask({
       id: 'task-codex-primary',
-      group_folder: 'guest_example',
-      chat_jid: 'tg:7000000002',
+      group_folder: 'telegram_main',
+      chat_jid: 'tg:-100123',
       prompt: 'send the morning digest',
       schedule_type: 'once',
       schedule_value: '2026-05-10T10:00:00.000Z',
@@ -459,6 +459,9 @@ describe('task scheduler', () => {
       next_run: new Date(Date.now() - 60_000).toISOString(),
       status: 'active',
       created_at: '2026-05-10T09:00:00.000Z',
+      creator_authorization: 'owner_sender',
+      creator_identity_id: 'telegram:owner',
+      creator_sender_id: '100000001',
     });
 
     runnerMocks.runSandboxAgent.mockImplementation(
@@ -477,18 +480,19 @@ describe('task scheduler', () => {
 
     await runTask(getTaskById('task-codex-primary')!, {
       registeredGroups: () => ({
-        'tg:7000000002': {
-          name: 'User A',
-          folder: 'guest_example',
+        'tg:-100123': {
+          name: 'Main',
+          folder: 'telegram_main',
           trigger: '@Skoobi',
           added_at: '2026-05-10T09:00:00.000Z',
           runtime: 'sandbox',
+          isMain: true,
           agentConfig: { model: 'test-model' },
         },
       }),
       // A live Claude session exists for the group; the codex run must NOT
       // resume (or rotate) it.
-      getSessions: () => ({ guest_example: 'claude-session-123' }),
+      getSessions: () => ({ telegram_main: 'claude-session-123' }),
       queue: { notifyIdle: vi.fn(), closeStdin: vi.fn() } as any,
       onProcess: vi.fn(),
       router: {
@@ -502,6 +506,7 @@ describe('task scheduler', () => {
     expect(runnerMocks.runSandboxAgent).toHaveBeenCalledTimes(1);
     const input = runnerMocks.runSandboxAgent.mock.calls[0][1];
     expect(input.provider).toBe('codex_cli');
+    expect(input.credentialProxyTier).toBe('owner');
     expect(input.codex).toMatchObject({
       command: '/opt/homebrew/bin/codex',
       model: 'gpt-5.6-sol',
@@ -511,7 +516,7 @@ describe('task scheduler', () => {
     expect(input.sessionId).toBeUndefined();
     expect(route).toHaveBeenCalledWith(
       expect.objectContaining({
-        chatJid: 'tg:7000000002',
+        chatJid: 'tg:-100123',
         text: 'codex task result',
         triggerType: 'task-result',
       }),
@@ -519,11 +524,86 @@ describe('task scheduler', () => {
     expect(getTaskById('task-codex-primary')?.status).toBe('completed');
   });
 
+  it('keeps guest and unproven main sandbox tasks off Codex primary', async () => {
+    process.env.SKOOBI_SCHEDULED_TASKS_CODEX_PRIMARY = 'true';
+    const taskBase = {
+      prompt: 'run scheduled task',
+      schedule_type: 'once' as const,
+      schedule_value: '2026-05-10T10:00:00.000Z',
+      context_mode: 'isolated' as const,
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+      status: 'active' as const,
+      created_at: '2026-05-10T09:00:00.000Z',
+    };
+    createTask({
+      ...taskBase,
+      id: 'task-codex-guest-guard',
+      group_folder: 'guest_example',
+      chat_jid: 'tg:7000000002',
+      // Even a row carrying owner-looking provenance cannot authorize a
+      // non-main group.
+      creator_authorization: 'owner_sender',
+      creator_identity_id: 'telegram:owner',
+      creator_sender_id: '100000001',
+    });
+    createTask({
+      ...taskBase,
+      id: 'task-codex-unproven-main-guard',
+      group_folder: 'telegram_main',
+      chat_jid: 'tg:-100123',
+    });
+    runnerMocks.runSandboxAgent.mockResolvedValue({
+      status: 'success',
+      result: 'claude result',
+    });
+    const deps = {
+      registeredGroups: () => ({
+        'tg:7000000002': {
+          name: 'Guest',
+          folder: 'guest_example',
+          trigger: '@Skoobi',
+          added_at: '2026-05-10T09:00:00.000Z',
+          runtime: 'sandbox' as const,
+          agentConfig: { model: 'test-model' },
+        },
+        'tg:-100123': {
+          name: 'Main',
+          folder: 'telegram_main',
+          trigger: '@Skoobi',
+          added_at: '2026-05-10T09:00:00.000Z',
+          runtime: 'sandbox' as const,
+          isMain: true,
+          agentConfig: { model: 'test-model' },
+        },
+      }),
+      getSessions: () => ({}),
+      queue: { notifyIdle: vi.fn(), closeStdin: vi.fn() } as any,
+      onProcess: vi.fn(),
+      router: {
+        route: vi.fn().mockResolvedValue(undefined),
+        send: async () => {},
+        addPreHook: () => {},
+        addPostHook: () => {},
+      } as any,
+    };
+
+    await runTask(getTaskById('task-codex-guest-guard')!, deps);
+    await runTask(getTaskById('task-codex-unproven-main-guard')!, deps);
+
+    expect(runnerMocks.runSandboxAgent).toHaveBeenCalledTimes(2);
+    for (const [, input] of runnerMocks.runSandboxAgent.mock.calls) {
+      expect(input.credentialProxyTier).toBe('guest');
+      expect(input.provider).toBeUndefined();
+      expect(input.codex).toBeUndefined();
+    }
+    expect(runnerMocks.loadModelGatewayConfig).not.toHaveBeenCalled();
+  });
+
   it('keeps the Claude SDK path for scheduled tasks when codex-primary is off', async () => {
     createTask({
       id: 'task-claude-default',
-      group_folder: 'guest_example',
-      chat_jid: 'tg:7000000002',
+      group_folder: 'telegram_main',
+      chat_jid: 'tg:-100123',
       prompt: 'run scheduled task',
       schedule_type: 'once',
       schedule_value: '2026-05-10T10:00:00.000Z',
@@ -531,6 +611,9 @@ describe('task scheduler', () => {
       next_run: new Date(Date.now() - 60_000).toISOString(),
       status: 'active',
       created_at: '2026-05-10T09:00:00.000Z',
+      creator_authorization: 'owner_sender',
+      creator_identity_id: 'telegram:owner',
+      creator_sender_id: '100000001',
     });
 
     runnerMocks.runSandboxAgent.mockResolvedValue({
@@ -540,12 +623,13 @@ describe('task scheduler', () => {
 
     await runTask(getTaskById('task-claude-default')!, {
       registeredGroups: () => ({
-        'tg:7000000002': {
-          name: 'User A',
-          folder: 'guest_example',
+        'tg:-100123': {
+          name: 'Main',
+          folder: 'telegram_main',
           trigger: '@Skoobi',
           added_at: '2026-05-10T09:00:00.000Z',
           runtime: 'sandbox',
+          isMain: true,
           agentConfig: { model: 'test-model' },
         },
       }),
@@ -570,8 +654,8 @@ describe('task scheduler', () => {
     process.env.SKOOBI_SCHEDULED_TASKS_CODEX_PRIMARY = 'true';
     createTask({
       id: 'task-container-guard',
-      group_folder: 'guest_example',
-      chat_jid: 'tg:7000000002',
+      group_folder: 'telegram_main',
+      chat_jid: 'tg:-100123',
       prompt: 'run scheduled task',
       schedule_type: 'once',
       schedule_value: '2026-05-10T10:00:00.000Z',
@@ -579,6 +663,9 @@ describe('task scheduler', () => {
       next_run: new Date(Date.now() - 60_000).toISOString(),
       status: 'active',
       created_at: '2026-05-10T09:00:00.000Z',
+      creator_authorization: 'owner_sender',
+      creator_identity_id: 'telegram:owner',
+      creator_sender_id: '100000001',
     });
 
     runnerMocks.runContainerAgent.mockResolvedValue({
@@ -588,12 +675,13 @@ describe('task scheduler', () => {
 
     await runTask(getTaskById('task-container-guard')!, {
       registeredGroups: () => ({
-        'tg:7000000002': {
-          name: 'User A',
-          folder: 'guest_example',
+        'tg:-100123': {
+          name: 'Main',
+          folder: 'telegram_main',
           trigger: '@Skoobi',
           added_at: '2026-05-10T09:00:00.000Z',
           runtime: 'container',
+          isMain: true,
           agentConfig: { model: 'test-model' },
         },
       }),

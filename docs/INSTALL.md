@@ -1,51 +1,237 @@
 # Installation
 
-## Source installation
+The managed installation is the recommended path for a persistent personal
+instance. It keeps application code and private runtime state in separate
+directories and installs a user service.
 
-Requirements:
+## Requirements
 
-- Node.js 22 or newer
-- npm
-- git
-- the `sqlite3` command-line tool
-- macOS or Linux
+- macOS, or Ubuntu/Debian with a systemd user session
+- Node.js 22 or newer and npm
+- Git, curl, `sqlite3`, and ripgrep (`rg`)
+- native build tools
+- Linux only: Bubblewrap (`bwrap`) and `socat`
+- an authenticated local Codex CLI
+- a Telegram bot token
 
-## Managed installation
+## Five-minute managed setup
 
-Install from a tagged GitHub release, verify the checksum, and run the pinned
-installer:
+The interactive work takes about five minutes. The initial npm installation and
+build may take longer.
+
+### 1. Install prerequisites
+
+#### macOS
+
+Install [Homebrew](https://brew.sh/) first if it is not already available, then
+run:
 
 ```bash
-VERSION=v2.0.0-rc.1
+xcode-select -p >/dev/null 2>&1 || xcode-select --install
+brew install node@22 git sqlite ripgrep
+
+mkdir -p "$HOME/.local/bin"
+export PATH="$(brew --prefix node@22)/bin:$HOME/.local/bin:$PATH"
+```
+
+If macOS opens the Command Line Tools installer, wait for it to finish before
+continuing.
+
+#### Ubuntu or Debian
+
+These commands target an Ubuntu or Debian installation with a working systemd
+user session:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  ca-certificates curl git sqlite3 ripgrep bubblewrap socat \
+  build-essential python3
+
+(
+  set -eu
+  NODE_SOURCE_DIR="$(mktemp -d)"
+  trap 'rm -rf -- "$NODE_SOURCE_DIR"' EXIT
+  chmod 700 "$NODE_SOURCE_DIR"
+  curl -fsSL https://deb.nodesource.com/setup_22.x \
+    -o "$NODE_SOURCE_DIR/setup.sh"
+  sudo -E bash "$NODE_SOURCE_DIR/setup.sh"
+  sudo apt-get install -y nodejs
+)
+
+mkdir -p "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Verify the runtime before continuing:
+
+```bash
+node --version
+npm --version
+rg --version
+sqlite3 --version
+```
+
+`node --version` must report version 22 or newer.
+
+### 2. Install and authenticate Codex CLI
+
+Install Codex under the same user account that will run Skoobi:
+
+```bash
+npm install --global --prefix "$HOME/.local" @openai/codex
+codex login
+codex login status
+```
+
+`codex login` opens an official browser sign-in flow. The managed installer
+requires a successful `codex login status` for its default provider.
+
+### 3. Create the Telegram bot
+
+1. Open [@BotFather](https://t.me/BotFather).
+2. Send `/newbot`.
+3. Choose the display name and unique bot username.
+4. Copy the generated token and store it securely.
+
+The token controls the bot. Never commit it, paste it into an issue, or put it
+directly in a shell command.
+
+### 4. Verify and run the pinned installer
+
+Download both assets from the tagged release:
+
+```bash
+VERSION=v2.0.0-rc.2
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh"
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh.sha256"
+```
+
+Verify the checksum on macOS:
+
+```bash
 shasum -a 256 -c install.sh.sha256
+```
+
+Or verify it on Ubuntu/Debian:
+
+```bash
+sha256sum -c install.sh.sha256
+```
+
+Only after verification succeeds, run:
+
+```bash
 bash install.sh
 ```
 
-On Linux, use `sha256sum -c install.sh.sha256` if `shasum` is unavailable.
 The release workflow embeds the exact tagged commit into `install.sh`. The
 installer aborts if the remote tag no longer resolves to that commit, even when
 the downloaded script's checksum is valid.
-The installer places code under `~/.skoobi/app/` and instance state under
-`~/.skoobi/instances/default/`.
 
-An installation created by an older public release may retain a different local
-app directory name. It is never guessed or selected silently. Preserve a
-verified legacy checkout explicitly by providing its single directory basename:
+The installer asks for:
 
-```bash
-bash install.sh --migrate-legacy <directory-name>
+- the assistant name, with `Skoobi` as the default;
+- the Telegram bot token, using hidden terminal input.
+
+It also checks the required tools and Codex login before activating the new
+release.
+
+### 5. Initialize the first owner
+
+The Telegram token identifies the bot, not its human owner. Skoobi therefore
+does not trust the first account that happens to message a new bot.
+
+Open a private chat with the bot and send:
+
+```text
+/chatid
 ```
 
-The named legacy directory must be a direct child of the managed app directory,
-must be a clean real Git checkout with no ignored files or Git submodules, and
-must use the current canonical public origin. Its code is never executed by the
-installer. If a verified canonical public installation predates the managed
-marker, adopt it once with `bash install.sh --adopt-managed`. Neither option
-accepts an unrelated repository. A normal rerun preserves the existing
-instance `.env`; use `--reconfigure` only when you intentionally want the
-installer to update that configuration.
+The bot returns a value such as:
+
+```text
+Chat ID: tg:123456789
+```
+
+Copy the complete `tg:` value and run:
+
+```bash
+skoobi owner init tg:123456789
+skoobi restart
+```
+
+Use the exact private ID returned by `/chatid`. Do not substitute a Telegram
+username or a group ID. `skoobi owner init` records one owner allowlist entry
+and one main Telegram registration. It refuses to overwrite a different or
+ambiguous existing owner.
+
+### 6. Verify end to end
+
+Send:
+
+```text
+/ping
+```
+
+The bot should report that the assistant is online. This verifies Telegram
+connectivity. Next, send a normal message to verify an actual Codex-backed
+assistant response.
+
+Run the local checks:
+
+```bash
+skoobi doctor
+skoobi status
+```
+
+A ready installation ends the doctor output with:
+
+```text
+overall: ready
+```
+
+If it reports `overall: needs attention`, fix the named problem before enabling
+optional integrations.
+
+## Installed paths and service
+
+With the default prefix and instance name, the installer creates:
+
+| Purpose                | Path or service                     |
+| ---------------------- | ----------------------------------- |
+| Application checkout   | `~/.skoobi/app/skoobi-agent/`       |
+| Private instance state | `~/.skoobi/instances/default/`      |
+| Instance configuration | `~/.skoobi/instances/default/.env`  |
+| Logs                   | `~/.skoobi/instances/default/logs/` |
+| CLI link               | `~/.local/bin/skoobi`               |
+| macOS service          | `com.skoobi.default`                |
+| Linux user service     | `skoobi-default.service`            |
+
+The installer creates `~/.local/bin` when needed, but it does not edit
+`.zshrc`, `.bashrc`, `.profile`, or any other shell startup file. The current
+Quick Start exports the path for the active terminal only. Add it to your
+preferred shell profile yourself if you want it to persist.
+
+A normal installer rerun preserves the existing instance `.env`. Use
+`--reconfigure` only when you intentionally want the installer to update that
+configuration.
+
+## Common operations
+
+Check readiness, service state, and recent logs:
+
+```bash
+skoobi doctor
+skoobi status
+skoobi logs
+```
+
+Restart the default instance:
+
+```bash
+skoobi restart
+```
 
 Update a managed installation:
 
@@ -53,28 +239,96 @@ Update a managed installation:
 skoobi update
 ```
 
-The updater refuses a dirty app checkout. Preserve local source edits first.
-Use `--force --yes` only when you explicitly want an owner-only backup of
-tracked, untracked, ignored, and symlinked app-code changes followed by
-replacement of the active release. The updater builds in a private staging
-directory and does not modify the active release unless the build succeeds.
-Git submodules and FIFO/socket/device files are refused rather than silently
-discarded because they cannot be represented by the normal owner backup.
+The updater refuses a dirty application checkout. It builds in a private
+staging directory and does not replace the active release unless the build
+succeeds.
 
-Uninstall code and service files while preserving instance data:
+### Upgrading from 2.0.0-rc.1
+
+A normal `skoobi update` deliberately preserves the existing instance `.env`.
+The rc.1 Codex profile therefore keeps owner live mode disabled and does not
+gain the new owner-route flags automatically.
+
+For an rc.1 installation that uses the default Codex profile, download and
+verify the rc.2 `install.sh` and `install.sh.sha256` assets exactly as shown in
+step 4 above. Then run the verified installer explicitly:
+
+```bash
+bash install.sh --reconfigure
+```
+
+When prompted, enter the existing assistant name if you customized it. A
+nonempty Telegram token is retained. The installer creates an owner-only
+backup of the old `.env`, reapplies the managed sandbox/Codex profile, keeps
+guest live mode disabled, and writes the rc.2 owner-route flags.
+
+Next, send `/chatid` in the private bot chat and use the exact returned value:
+
+```bash
+skoobi owner init tg:123456789
+skoobi restart
+skoobi doctor
+```
+
+Owner initialization is idempotent for an already compatible registration. If
+it reports that an existing main registration is not owner-ready, Skoobi leaves
+that row and the `.env` unchanged. Do not delete or silently rewrite it; back
+up the instance and review that legacy registration explicitly before retrying.
+
+This migration recipe intentionally selects the managed Codex profile. If the
+rc.1 installation uses Claude, an OpenAI-compatible endpoint, or custom runtime
+settings, do not apply this Codex reconfiguration blindly. Preserve the
+configuration, review the rc.2 keys in `.env.example`, and enable only the
+provider route you intend to use.
+
+Use `--force --yes` only when you explicitly want an owner-only backup of
+tracked, untracked, ignored, and symlinked application changes followed by
+replacement of the active release. Git submodules and FIFO, socket, or device
+files are refused because a normal owner backup cannot safely represent them.
+
+Uninstall service and application files while preserving instance data:
 
 ```bash
 skoobi uninstall
 ```
 
-`skoobi uninstall --purge` additionally removes instance data and requires the
-exact interactive confirmation phrase. Back up anything you need first.
-Default uninstall refuses an app containing owner files it cannot safely
-remove. `skoobi uninstall --force --yes` first backs up changes in a verified
-managed app; an unverified app is moved intact to quarantine instead of being
-deleted.
+To remove instance data as well:
+
+```bash
+skoobi uninstall --purge
+```
+
+The purge path requires an exact interactive confirmation phrase. Back up any
+conversations, memory, or databases you want to keep first.
+
+## Existing and legacy managed installations
+
+An installation created by an older public release may retain a different local
+application directory name. The installer never guesses or silently selects
+one. Preserve a verified legacy checkout explicitly by passing its single
+directory basename:
+
+```bash
+bash install.sh --migrate-legacy <directory-name>
+```
+
+The named directory must be a direct child of the managed app directory, a
+clean real Git checkout without ignored files or Git submodules, and use the
+canonical public HTTPS origin. Its code is not executed by the installer.
+
+If a verified canonical public installation predates the managed marker, adopt
+it once with:
+
+```bash
+bash install.sh --adopt-managed
+```
+
+Neither migration option accepts an unrelated repository.
 
 ## Source installation
+
+Source mode is intended for development. Install and authenticate the same
+prerequisites described above, then build:
 
 ```bash
 git clone https://github.com/barmashovdmitrii-droid/skoobi-agent.git
@@ -84,26 +338,137 @@ npm ci --prefix agent/runner
 npm run build
 ```
 
-Keep runtime state outside the checkout:
+Create private state outside the checkout:
 
 ```bash
 APP_DIR="$PWD"
-STATE_ROOT="$HOME/.skoobi/dev/default"
-mkdir -p "$STATE_ROOT"/{groups,store,logs,data}
-cp .env.example "$STATE_ROOT/.env"
-# Review "$STATE_ROOT/.env", then:
+DEV_PREFIX="$HOME/.skoobi-dev"
+STATE_ROOT="$DEV_PREFIX/instances/default"
+umask 077
+
+install -d -m 700 \
+  "$DEV_PREFIX" \
+  "$DEV_PREFIX/instances" \
+  "$STATE_ROOT" \
+  "$STATE_ROOT/groups" \
+  "$STATE_ROOT/store" \
+  "$STATE_ROOT/logs" \
+  "$STATE_ROOT/data"
+install -m 600 .env.example "$STATE_ROOT/.env"
+```
+
+Edit `$STATE_ROOT/.env` and set `TELEGRAM_BOT_TOKEN`. Keep the Codex defaults
+unless you are deliberately configuring another provider. Start the service in
+the foreground:
+
+```bash
 (cd "$STATE_ROOT" && node "$APP_DIR/dist/service.js")
 ```
 
-Do not install an instance inside a directory containing unrelated credentials
-or private project data. Code and runtime state should use separate paths.
+In a second terminal, send `/chatid` to the bot and initialize the owner with
+the exact returned value:
 
-## Updating
+```bash
+APP_DIR="/absolute/path/to/skoobi-agent"
+node "$APP_DIR/bin/skoobi.js" owner init tg:123456789 \
+  --prefix "$HOME/.skoobi-dev"
+```
 
-Back up runtime state and read the release notes before updating. Never replace
-a live instance with an unreviewed branch or pre-release build.
+Stop and restart the foreground service after owner initialization. Source mode
+does not create a persistent user service; use the managed installer for that.
 
-## Uninstalling
+Never place an instance inside a directory containing unrelated credentials or
+private project data.
 
-Review the uninstall command before running it. Preserve any conversations,
-memory, or databases you intend to keep.
+## Troubleshooting
+
+### `skoobi: command not found`
+
+The installer does not edit shell profiles. Enable the CLI in the current
+terminal:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Then retry `skoobi doctor`. Add the same export to your chosen shell profile if
+you want it in future terminals.
+
+### The installer reports a missing Linux sandbox dependency
+
+Install the required runtime tools:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y bubblewrap socat ripgrep
+```
+
+### Codex is missing or not authenticated
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+codex --version
+codex login
+codex login status
+```
+
+Rerun the installer after authentication.
+
+### The bot does not answer `/chatid` or `/ping`
+
+Check the service and sanitized logs:
+
+```bash
+skoobi status
+skoobi logs
+```
+
+If the token was skipped, rerun the same verified installer explicitly:
+
+```bash
+bash install.sh --reconfigure
+skoobi restart
+```
+
+The token prompt is hidden. If a nonempty but incorrect token is already stored,
+replace `TELEGRAM_BOT_TOKEN` in
+`~/.skoobi/instances/default/.env`, keep the file private, and run
+`skoobi restart`. Do not print the token while troubleshooting.
+
+### Owner initialization says the database is not initialized
+
+The service must start once before the owner can be registered:
+
+```bash
+skoobi restart
+skoobi status
+```
+
+Send `/chatid` again and retry `skoobi owner init` with the exact private
+`tg:` value.
+
+### `/ping` works but normal messages fail
+
+Telegram is connected, but the model path is not healthy. Run:
+
+```bash
+codex login status
+skoobi doctor
+skoobi logs
+```
+
+Do not enable guest access or optional integrations to work around a failed
+owner route.
+
+### Linux user service is unavailable
+
+The managed Linux service requires a functioning systemd user session. On a
+different init system, install with `--no-service` and start the service
+manually from the instance directory:
+
+```bash
+(cd "$HOME/.skoobi/instances/default" && \
+  node "$HOME/.skoobi/app/skoobi-agent/dist/service.js")
+```
+
+This foreground process must remain running.
