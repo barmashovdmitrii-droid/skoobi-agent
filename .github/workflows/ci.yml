@@ -58,5 +58,23 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Validate generated systemd unit
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="${RUNNER_TEMP}/Skoobi verify % dollar\$ quote\" кириллица"
+          service_home="${RUNNER_TEMP}/Home % dollar\$ quote\" slash\\ кириллица"
+          node_dir="${RUNNER_TEMP}/Node % dollar\$ кириллица"
+          unit="${RUNNER_TEMP}/skoobi-ci.service"
+          mkdir -p "$prefix/instances/ci" "$service_home" "$node_dir"
+          cp "$(command -v node)" "$node_dir/node"
+          chmod 700 "$node_dir/node"
+          HOME="$service_home" PATH="$node_dir:$PATH" bash scripts/install.sh \
+            --print-service linux \
+            --prefix "$prefix" \
+            --instance ci >"$unit"
+          systemd-analyze verify --recursive-errors=no "$unit"
+
       - name: Check shell scripts
         run: bash -n scripts/*.sh

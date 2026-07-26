@@ -74,6 +74,24 @@ sqlite3 --version
 
 `node --version` must report version 22 or newer.
 
+A user service normally stops when that user has no login session. For a
+personal bot that must remain online after SSH logout and start after reboot,
+check the current setting:
+
+```bash
+loginctl show-user "$USER" -p Linger
+```
+
+If it reports `Linger=no`, review the host policy and enable lingering
+explicitly:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+The Skoobi installer reports this condition but does not change the host's
+lingering policy automatically.
+
 ### 2. Install and authenticate Codex CLI
 
 Install Codex under the same user account that will run Skoobi:
@@ -102,7 +120,7 @@ directly in a shell command.
 Download both assets from the tagged release:
 
 ```bash
-VERSION=v2.0.0-rc.2
+VERSION=v2.0.0-rc.3
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh"
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh.sha256"
 ```
@@ -227,30 +245,55 @@ skoobi status
 skoobi logs
 ```
 
+On Linux, `skoobi logs` reads the last 80 entries for the managed user service
+from the systemd journal. The equivalent direct command for the default
+instance is:
+
+```bash
+journalctl --user -u skoobi-default -n 80 --no-pager
+```
+
 Restart the default instance:
 
 ```bash
 skoobi restart
 ```
 
-Update a managed installation:
+For a normal upgrade, download and checksum-verify the new release's
+`install.sh` and `install.sh.sha256` assets exactly as described in step 4,
+then run:
 
 ```bash
-skoobi update
+bash install.sh
 ```
 
-The updater refuses a dirty application checkout. It builds in a private
-staging directory and does not replace the active release unless the build
-succeeds.
+The installer preserves the existing instance `.env` unless you explicitly
+pass `--reconfigure`. An upgrade from `2.0.0-rc.2` to `2.0.0-rc.3` uses this
+normal path and does not need `--reconfigure`.
+
+The low-level updater is available for advanced, commit-pinned maintenance:
+
+```bash
+skoobi update \
+  --ref refs/tags/<version> \
+  --expected-commit <40-character-commit-id>
+```
+
+Both values are required. The updater never selects a moving default branch
+implicitly. It refuses a dirty application checkout or a ref that does not
+resolve to the exact supplied commit, builds in a private staging directory,
+and does not replace the active release unless the build succeeds.
+If `--no-start` is supplied, an existing managed service is stopped before
+the release swap and deliberately left stopped.
 
 ### Upgrading from 2.0.0-rc.1
 
-A normal `skoobi update` deliberately preserves the existing instance `.env`.
-The rc.1 Codex profile therefore keeps owner live mode disabled and does not
-gain the new owner-route flags automatically.
+A normal verified installer run preserves the existing instance `.env`. The
+rc.1 Codex profile therefore keeps owner live mode disabled and does not gain
+the new owner-route flags automatically.
 
 For an rc.1 installation that uses the default Codex profile, download and
-verify the rc.2 `install.sh` and `install.sh.sha256` assets exactly as shown in
+verify the rc.3 `install.sh` and `install.sh.sha256` assets exactly as shown in
 step 4 above. Then run the verified installer explicitly:
 
 ```bash
@@ -260,7 +303,7 @@ bash install.sh --reconfigure
 When prompted, enter the existing assistant name if you customized it. A
 nonempty Telegram token is retained. The installer creates an owner-only
 backup of the old `.env`, reapplies the managed sandbox/Codex profile, keeps
-guest live mode disabled, and writes the rc.2 owner-route flags.
+guest live mode disabled, and writes the current owner-route flags.
 
 Next, send `/chatid` in the private bot chat and use the exact returned value:
 
@@ -278,7 +321,7 @@ up the instance and review that legacy registration explicitly before retrying.
 This migration recipe intentionally selects the managed Codex profile. If the
 rc.1 installation uses Claude, an OpenAI-compatible endpoint, or custom runtime
 settings, do not apply this Codex reconfiguration blindly. Preserve the
-configuration, review the rc.2 keys in `.env.example`, and enable only the
+configuration, review the rc.3 keys in `.env.example`, and enable only the
 provider route you intend to use.
 
 Use `--force --yes` only when you explicitly want an owner-only backup of
@@ -298,8 +341,10 @@ To remove instance data as well:
 skoobi uninstall --purge
 ```
 
-The purge path requires an exact interactive confirmation phrase. Back up any
-conversations, memory, or databases you want to keep first.
+The purge path requires an exact interactive confirmation phrase. It removes
+the selected instance and managed `.env` backups belonging to that instance;
+other instances and their backups remain untouched. Back up any conversations,
+memory, or databases you want to keep first.
 
 ## Existing and legacy managed installations
 

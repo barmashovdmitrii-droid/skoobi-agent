@@ -5,7 +5,7 @@ umask 077
 CANONICAL_REPO="https://github.com/barmashovdmitrii-droid/skoobi-agent.git"
 PREFIX="${SKOOBI_PREFIX:-$HOME/.skoobi}"
 INSTANCE="default"
-REF="${SKOOBI_UPDATE_REF:-main}"
+REF="${SKOOBI_UPDATE_REF:-}"
 EXPECTED_COMMIT="${SKOOBI_UPDATE_EXPECTED_COMMIT:-}"
 NO_START=0
 YES=0
@@ -22,6 +22,15 @@ BUILD_HOME=""
 GIT_HOME=""
 LOCK_DIR=""
 LOCK_HELD=0
+MARKER_CREATED_BY_UPDATE=0
+SERVICE_WAS_ACTIVE=0
+SERVICE_WAS_ENABLED=0
+SERVICE_WAS_ENABLED_RUNTIME=0
+SERVICE_ENABLEMENT_KNOWN=0
+SERVICE_STOP_CONFIRMED=0
+SERVICE_STOP_ATTEMPTED=0
+SERVICE_START_ATTEMPTED=0
+STAGE_ACTIVATION_STARTED=0
 
 prefer_node22_path() {
   local candidate
@@ -37,6 +46,7 @@ prefer_node22_path() {
 prefer_node22_path
 
 log() { printf '%s\n' "$*"; }
+err() { printf '%s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
@@ -49,9 +59,9 @@ Usage:
 Options:
   --prefix <path>        Install prefix (default: ~/.skoobi)
   --instance <name>      Instance name (default: default)
-  --ref <branch/tag>     Public branch or tag (default: main)
+  --ref <branch/tag>     Explicit public branch or tag
   --expected-commit <id> Require the resolved ref to match this 40-hex commit
-  --no-start             Do not restart the service after activation
+  --no-start             Stop a running managed service and leave it stopped
   --yes                  Confirm a requested forced replacement
   --force                Back up owner changes, then replace the app release
   --adopt-managed        Adopt a verified old public install missing its marker
@@ -61,6 +71,9 @@ Options:
 The updater never builds inside the active release. It builds a fresh staged
 checkout, verifies its exact commit, and atomically switches releases. Instance
 .env, groups, store, logs, and data are never modified.
+
+Both --ref and --expected-commit are required. For normal upgrades, download
+and verify the next tagged release installer instead of following moving main.
 
 Legacy app directories must first be preserved explicitly with:
   scripts/install.sh --migrate-legacy <directory-name>
@@ -93,6 +106,8 @@ case "$INSTANCE" in
     die "Instance name 'dashboard' is reserved"
     ;;
 esac
+[[ -n "$REF" && -n "$EXPECTED_COMMIT" ]] ||
+  die "Update requires both --ref and --expected-commit; use a checksum-verified tagged release installer for normal upgrades"
 case "$REF" in
   -*|*:*|*' '*|*$'\t'*|*$'\n'*|*$'\r'*|*~*|*^*|*\?*|*\**|*\[*|*\\*)
     die "Git ref contains unsafe characters"
@@ -124,6 +139,8 @@ BACKUP_DIR="$PREFIX/backups"
 MARKER_FILE="$PREFIX/.skoobi-managed-install"
 SERVICE_LABEL="com.skoobi.$INSTANCE"
 LINUX_UNIT="skoobi-$INSTANCE"
+MACOS_PLIST="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
+LINUX_UNIT_FILE="$HOME/.config/systemd/user/$LINUX_UNIT.service"
 
 run() {
   if [[ "$DRY_RUN" == "1" ]]; then
@@ -145,13 +162,6 @@ acquire_operation_lock() {
   mkdir "$LOCK_DIR" 2>/dev/null ||
     die "Another Skoobi install, update, or uninstall operation is in progress"
   LOCK_HELD=1
-}
-
-release_operation_lock() {
-  [[ "$LOCK_HELD" == "1" ]] || return 0
-  rmdir "$LOCK_DIR" ||
-    die "Could not release the installer operation lock"
-  LOCK_HELD=0
 }
 
 ensure_git_home() {
@@ -198,6 +208,7 @@ safe_npm() {
     TMPDIR="${TMPDIR:-/tmp}" \
     LANG="${LANG:-C}" \
     LC_ALL="${LC_ALL:-C}" \
+    HUSKY=0 \
     NPM_CONFIG_CACHE="$BUILD_HOME/npm-cache" \
     NPM_CONFIG_USERCONFIG="$npm_userconfig" \
     NPM_CONFIG_GLOBALCONFIG=/dev/null \
@@ -211,6 +222,21 @@ detect_os() {
     Linux) echo "linux" ;;
     *) echo "unsupported" ;;
   esac
+}
+
+# Return 0 when the job is loaded, 3 only when launchd can prove that the
+# containing user domain is reachable but the label is absent, and 1 when the
+# state is unknown (for example, a transport or permission failure).
+launchd_job_state() {
+  local target="$1" domain="${1%/*}" status
+  if launchctl print "$target" >/dev/null 2>&1; then
+    return 0
+  else
+    status=$?
+  fi
+  [[ "$status" == "113" ]] || return 1
+  launchctl print "$domain" >/dev/null 2>&1 || return 1
+  return 3
 }
 
 marker_content() {
@@ -233,6 +259,9 @@ write_marker() {
   tmp="$(mktemp "$PREFIX/.skoobi-managed-install.XXXXXXXX")"
   marker_content >"$tmp"
   chmod 600 "$tmp"
+  if [[ ! -e "$MARKER_FILE" && ! -L "$MARKER_FILE" ]]; then
+    MARKER_CREATED_BY_UPDATE=1
+  fi
   mv -f "$tmp" "$MARKER_FILE"
 }
 
@@ -243,8 +272,48 @@ validate_origin() {
     die "Managed app origin is not the canonical public HTTPS repository"
 }
 
+sha256_file() {
+  local file="$1" output=""
+  if command -v shasum >/dev/null 2>&1; then
+    output="$(shasum -a 256 <"$file")" || return 1
+  elif command -v sha256sum >/dev/null 2>&1; then
+    output="$(sha256sum <"$file")" || return 1
+  else
+    return 1
+  fi
+  printf '%s' "${output%% *}"
+}
+
+is_husky_generated_file() {
+  local app_root="$1" rel="$2" file="$1/$2" expected_hash="" actual_hash=""
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  case "$rel" in
+    .husky/_/.gitignore)
+      expected_hash="684888c0ebb17f374298b65ee2807526c066094c701bcc7ebbe1c1095f494fc1"
+      ;;
+    .husky/_/h)
+      expected_hash="70200b200ca709b0622784f93839a5b2872333a917a09afddefd7dc2d8cdc680"
+      ;;
+    .husky/_/husky.sh)
+      expected_hash="21122903fca7209a13c991e5be68780636e28f1b8f0ae7ea07ed0065dfe37268"
+      ;;
+    .husky/_/applypatch-msg|.husky/_/commit-msg|.husky/_/post-applypatch|\
+      .husky/_/post-checkout|.husky/_/post-commit|.husky/_/post-merge|\
+      .husky/_/post-rewrite|.husky/_/pre-applypatch|.husky/_/pre-auto-gc|\
+      .husky/_/pre-commit|.husky/_/pre-merge-commit|.husky/_/pre-push|\
+      .husky/_/pre-rebase|.husky/_/prepare-commit-msg)
+      expected_hash="34fe496008be71d8fdd446b2cce81e4bb0406109c130eafc583fbd9fe33244e2"
+      ;;
+    *) return 1 ;;
+  esac
+  actual_hash="$(sha256_file "$file")" || return 1
+  [[ "$actual_hash" == "$expected_hash" ]]
+}
+
 is_ephemeral_ignored_path() {
-  case "$1" in
+  local app_root="$1" rel="$2"
+  is_husky_generated_file "$app_root" "$rel" && return 0
+  case "$rel" in
     node_modules/*|*/node_modules/*|dist/*|*/dist/*|coverage/*|*/coverage/*|\
       .vite/*|*/.vite/*|*.tsbuildinfo|*/.DS_Store|.DS_Store)
       return 0
@@ -260,7 +329,7 @@ has_owner_ignored_files() {
   git_safe -C "$APP_DIR" ls-files --others --ignored --exclude-standard -z >"$listing" ||
     die "Could not inspect ignored files in the managed app"
   while IFS= read -r -d '' rel; do
-    if ! is_ephemeral_ignored_path "$rel"; then
+    if ! is_ephemeral_ignored_path "$APP_DIR" "$rel"; then
       found=0
       break
     fi
@@ -291,15 +360,19 @@ git_status_output() {
 }
 
 has_special_files() {
-  local found listing result=1
+  local found rel listing result=1
   ensure_git_home
   listing="$(mktemp "$GIT_HOME/special.XXXXXXXX")"
   find "$APP_DIR" -xdev -path "$APP_DIR/.git" -prune -o \
     \( -type p -o -type s -o -type b -o -type c \) -print0 >"$listing" ||
     die "Could not inspect special files in the managed app"
   while IFS= read -r -d '' found; do
-    result=0
-    break
+    rel="${found#"$APP_DIR"/}"
+    if [[ "$rel" == "$found" ]] ||
+        ! is_ephemeral_ignored_path "$APP_DIR" "$rel"; then
+      result=0
+      break
+    fi
   done <"$listing"
   rm -f "$listing"
   return "$result"
@@ -383,7 +456,7 @@ backup_owner_changes() {
     copy_owner_file "$backup_dir" "$rel"
   done <"$untracked_listing"
   while IFS= read -r -d '' rel; do
-    is_ephemeral_ignored_path "$rel" ||
+    is_ephemeral_ignored_path "$APP_DIR" "$rel" ||
       copy_owner_file "$backup_dir" "$rel"
   done <"$ignored_listing"
   rm -f "$untracked_listing" "$ignored_listing"
@@ -500,6 +573,8 @@ build_staged_release() {
   chmod 700 "$STAGE_DIR"
   resolve_and_fetch_ref "$STAGE_DIR"
   safe_npm --prefix "$STAGE_DIR" ci
+  [[ ! -e "$STAGE_DIR/.husky/_" && ! -L "$STAGE_DIR/.husky/_" ]] ||
+    die "Managed production build unexpectedly created Husky runtime hooks"
   if [[ -f "$STAGE_DIR/agent/runner/package.json" ]]; then
     safe_npm --prefix "$STAGE_DIR/agent/runner" ci
   fi
@@ -517,6 +592,135 @@ build_staged_release() {
   BUILD_HOME=""
 }
 
+stop_managed_service() {
+  local disabled_state="" enabled_state="" os_name status target
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "[dry-run] stop and prove any running managed service before activation"
+    SERVICE_STOP_CONFIRMED=1
+    return 0
+  fi
+  os_name="$(detect_os)"
+  case "$os_name" in
+    macos)
+      target="gui/$(id -u)/$SERVICE_LABEL"
+      if [[ ! -e "$MACOS_PLIST" && ! -L "$MACOS_PLIST" ]]; then
+        if ! command -v launchctl >/dev/null 2>&1; then
+          SERVICE_STOP_CONFIRMED=1
+          return 0
+        fi
+        if launchd_job_state "$target"; then
+          die "A managed launchd service is loaded without its definition; restore or stop it before updating"
+        else
+          status=$?
+          [[ "$status" == "3" ]] ||
+            die "Could not prove the definition-less managed launchd service is inactive"
+        fi
+        SERVICE_STOP_CONFIRMED=1
+        return 0
+      fi
+      command -v launchctl >/dev/null 2>&1 ||
+        die "launchctl is required to safely update the managed service"
+      SERVICE_STOP_ATTEMPTED=1
+      [[ -f "$MACOS_PLIST" && ! -L "$MACOS_PLIST" ]] ||
+        die "Managed launchd service definition is not a safe regular file"
+      SERVICE_WAS_ENABLED=1
+      disabled_state="$(launchctl print-disabled "gui/$(id -u)" 2>/dev/null)" ||
+        die "Could not determine whether the managed launchd service is enabled"
+      if grep -F "\"$SERVICE_LABEL\" => true" <<<"$disabled_state" >/dev/null; then
+        SERVICE_WAS_ENABLED=0
+      fi
+      SERVICE_ENABLEMENT_KNOWN=1
+      if launchd_job_state "$target"; then
+        SERVICE_WAS_ACTIVE=1
+        launchctl disable "$target" >/dev/null 2>&1 || true
+        launchctl bootout "$target" >/dev/null 2>&1 || true
+        if launchd_job_state "$target"; then
+          die "Managed launchd service did not stop"
+        else
+          status=$?
+          [[ "$status" == "3" ]] ||
+            die "Could not prove that the managed launchd service stopped"
+        fi
+      else
+        status=$?
+        [[ "$status" == "3" ]] ||
+          die "Could not determine whether the managed launchd service is active"
+      fi
+      SERVICE_STOP_CONFIRMED=1
+      ;;
+    linux)
+      if [[ ! -e "$LINUX_UNIT_FILE" && ! -L "$LINUX_UNIT_FILE" ]]; then
+        if ! command -v systemctl >/dev/null 2>&1; then
+          SERVICE_STOP_CONFIRMED=1
+          return 0
+        fi
+        if systemctl --user is-active --quiet "$LINUX_UNIT"; then
+          status=0
+        else
+          status=$?
+        fi
+        case "$status" in
+          3|4)
+            SERVICE_STOP_CONFIRMED=1
+            return 0
+            ;;
+          0) die "A managed systemd service is loaded without its definition; restore or stop it before updating" ;;
+          *) die "Could not prove the definition-less managed systemd service is inactive" ;;
+        esac
+      fi
+      command -v systemctl >/dev/null 2>&1 ||
+        die "systemctl is required to safely update the managed service"
+      SERVICE_STOP_ATTEMPTED=1
+      [[ -f "$LINUX_UNIT_FILE" && ! -L "$LINUX_UNIT_FILE" ]] ||
+        die "Managed systemd service definition is not a safe regular file"
+      enabled_state="$(systemctl --user is-enabled "$LINUX_UNIT" 2>/dev/null || true)"
+      case "$enabled_state" in
+        enabled)
+          SERVICE_WAS_ENABLED=1
+          SERVICE_ENABLEMENT_KNOWN=1
+          ;;
+        enabled-runtime)
+          SERVICE_WAS_ENABLED=1
+          SERVICE_WAS_ENABLED_RUNTIME=1
+          SERVICE_ENABLEMENT_KNOWN=1
+          ;;
+        disabled)
+          SERVICE_ENABLEMENT_KNOWN=1
+          ;;
+        *) die "Managed systemd service has an unsupported enablement state: $enabled_state" ;;
+      esac
+      if systemctl --user is-active --quiet "$LINUX_UNIT"; then
+        status=0
+      else
+        status=$?
+      fi
+      case "$status" in
+        0)
+          SERVICE_WAS_ACTIVE=1
+          systemctl --user stop "$LINUX_UNIT" ||
+            die "Could not stop the managed systemd service"
+          ;;
+        3|4) ;;
+        *) die "Could not determine whether the managed systemd service is active" ;;
+      esac
+      if systemctl --user is-active --quiet "$LINUX_UNIT"; then
+        status=0
+      else
+        status=$?
+      fi
+      case "$status" in
+        3|4) ;;
+        0) die "Managed systemd service did not stop" ;;
+        *) die "Could not prove that the managed systemd service stopped" ;;
+      esac
+      SERVICE_STOP_CONFIRMED=1
+      ;;
+    *)
+      SERVICE_STOP_CONFIRMED=1
+      ;;
+  esac
+}
+
 switch_release() {
   [[ "$DRY_RUN" == "0" ]] || {
     log "[dry-run] atomically switch staged release into $APP_DIR"
@@ -525,53 +729,213 @@ switch_release() {
   OLD_RELEASE_ROOT="$(mktemp -d "$APP_BASE/.skoobi-agent.previous.XXXXXXXX")"
   chmod 700 "$OLD_RELEASE_ROOT"
   OLD_RELEASE="$OLD_RELEASE_ROOT/release"
-  mv "$APP_DIR" "$OLD_RELEASE"
+  if ! mv "$APP_DIR" "$OLD_RELEASE"; then
+    if [[ (-e "$APP_DIR" || -L "$APP_DIR") &&
+        ! -e "$OLD_RELEASE" && ! -L "$OLD_RELEASE" ]]; then
+      OLD_RELEASE=""
+      rmdir "$OLD_RELEASE_ROOT" >/dev/null 2>&1 || true
+      OLD_RELEASE_ROOT=""
+    fi
+    die "Could not preserve the active release before activation"
+  fi
+  STAGE_ACTIVATION_STARTED=1
   if ! mv "$STAGE_DIR" "$APP_DIR"; then
-    mv "$OLD_RELEASE" "$APP_DIR"
     die "Could not activate staged release"
   fi
   STAGE_DIR=""
 }
 
-restart_service() {
-  [[ "$NO_START" == "0" ]] || return 0
+resume_managed_service() {
+  [[ "$SERVICE_WAS_ACTIVE" == "1" ]] || {
+    log "Managed service was not running; release activated without starting it."
+    return 0
+  }
   case "$(detect_os)" in
     macos)
       local target
       target="gui/$(id -u)/$SERVICE_LABEL"
-      if [[ "$DRY_RUN" == "1" ]]; then
-        log "[dry-run] restart loaded launchd service"
-      elif launchctl print "$target" >/dev/null 2>&1; then
-        launchctl kickstart -k "$target"
-        launchctl print "$target" >/dev/null
+      if [[ "$NO_START" == "1" ]]; then
+        if [[ "$SERVICE_WAS_ENABLED" == "1" ]]; then
+          launchctl enable "$target"
+        fi
+        log "Managed service left stopped because --no-start was requested."
       else
-        log "Service is not loaded; release activated without restart."
+        SERVICE_START_ATTEMPTED=1
+        launchctl enable "$target"
+        launchctl bootstrap "gui/$(id -u)" "$MACOS_PLIST"
+        launchctl kickstart -k "$target"
+        if [[ "$SERVICE_WAS_ENABLED" == "0" ]]; then
+          launchctl disable "$target"
+        fi
+        launchctl print "$target" >/dev/null
       fi
       ;;
     linux)
-      if [[ "$DRY_RUN" == "1" ]]; then
-        log "[dry-run] restart installed systemd user service"
-      elif systemctl --user list-unit-files "$LINUX_UNIT.service" >/dev/null 2>&1; then
-        systemctl --user restart "$LINUX_UNIT"
-        systemctl --user is-active --quiet "$LINUX_UNIT"
+      if [[ "$NO_START" == "1" ]]; then
+        log "Managed service left stopped because --no-start was requested."
       else
-        log "Service is not installed; release activated without restart."
+        SERVICE_START_ATTEMPTED=1
+        systemctl --user start "$LINUX_UNIT"
+        systemctl --user is-active --quiet "$LINUX_UNIT"
       fi
       ;;
-    *) log "Unsupported OS; release activated without restart." ;;
+    *) log "Unsupported OS; release activated without starting a service." ;;
   esac
 }
 
+restore_previous_update_service_state() {
+  local status target
+  case "$(detect_os)" in
+    macos)
+      target="gui/$(id -u)/$SERVICE_LABEL"
+      if [[ "$SERVICE_WAS_ACTIVE" == "1" ]]; then
+        launchctl enable "$target" >/dev/null 2>&1 || return 1
+        if launchd_job_state "$target"; then
+          :
+        else
+          status=$?
+          [[ "$status" == "3" ]] || return 1
+          launchctl bootstrap "gui/$(id -u)" "$MACOS_PLIST" \
+            >/dev/null 2>&1 || return 1
+        fi
+        launchctl kickstart -k "$target" >/dev/null 2>&1 || return 1
+        if [[ "$SERVICE_ENABLEMENT_KNOWN" == "1" &&
+            "$SERVICE_WAS_ENABLED" == "0" ]]; then
+          launchctl disable "$target" >/dev/null 2>&1 || return 1
+        fi
+        launchd_job_state "$target" || return 1
+      elif [[ "$SERVICE_ENABLEMENT_KNOWN" == "1" ]]; then
+        if [[ "$SERVICE_WAS_ENABLED" == "1" ]]; then
+          launchctl enable "$target" >/dev/null 2>&1 || return 1
+        else
+          launchctl disable "$target" >/dev/null 2>&1 || return 1
+        fi
+      fi
+      ;;
+    linux)
+      if [[ "$SERVICE_WAS_ACTIVE" == "1" ]]; then
+        systemctl --user start "$LINUX_UNIT" >/dev/null 2>&1 || return 1
+        if systemctl --user is-active --quiet "$LINUX_UNIT"; then
+          status=0
+        else
+          status=$?
+        fi
+        [[ "$status" == "0" ]] || return 1
+      fi
+      ;;
+  esac
+  return 0
+}
+
 rollback_release() {
-  local status="$1"
+  local status="$1" app_moved_aside=0 restore_ok=1
+  local rollback_app="" service_stopped="$SERVICE_STOP_CONFIRMED"
+  local launchd_status=0 service_status=0 target=""
   [[ "$UPDATE_SUCCEEDED" == "0" ]] || return 0
   set +e
-  if [[ -n "$OLD_RELEASE" && -e "$OLD_RELEASE" ]]; then
-    rm -rf "$APP_DIR"
-    mv "$OLD_RELEASE" "$APP_DIR"
+  if [[ "$SERVICE_START_ATTEMPTED" == "1" ]]; then
+    case "$(detect_os)" in
+      macos)
+        target="gui/$(id -u)/$SERVICE_LABEL"
+        launchctl disable "$target" >/dev/null 2>&1 || true
+        launchctl bootout "$target" >/dev/null 2>&1 || true
+        if launchd_job_state "$target"; then
+          service_stopped=0
+        else
+          launchd_status=$?
+          if [[ "$launchd_status" == "3" ]]; then
+            service_stopped=1
+          else
+            service_stopped=0
+          fi
+        fi
+        ;;
+      linux)
+        systemctl --user stop "$LINUX_UNIT" >/dev/null 2>&1 || true
+        if systemctl --user is-active --quiet "$LINUX_UNIT"; then
+          service_status=0
+        else
+          service_status=$?
+        fi
+        case "$service_status" in
+          3|4) service_stopped=1 ;;
+          *) service_stopped=0 ;;
+        esac
+        ;;
+    esac
+  fi
+  if [[ "$STAGE_ACTIVATION_STARTED" != "1" && -n "$OLD_RELEASE" &&
+      ! -e "$OLD_RELEASE" && ! -L "$OLD_RELEASE" &&
+      (-e "$APP_DIR" || -L "$APP_DIR") ]]; then
     OLD_RELEASE=""
-    restart_service >/dev/null 2>&1 || true
-    log "Previous active release restored."
+    if [[ -n "$OLD_RELEASE_ROOT" && -d "$OLD_RELEASE_ROOT" ]]; then
+      rmdir "$OLD_RELEASE_ROOT" >/dev/null 2>&1 || true
+      [[ -e "$OLD_RELEASE_ROOT" ]] || OLD_RELEASE_ROOT=""
+    fi
+  fi
+  if [[ -z "$OLD_RELEASE" && "$SERVICE_STOP_ATTEMPTED" == "1" &&
+      "$SERVICE_WAS_ACTIVE" == "1" ]]; then
+    if restore_previous_update_service_state; then
+      :
+    else
+      err "Rollback could not restore the service after a failed pre-activation stop"
+    fi
+  fi
+  if [[ -n "$OLD_RELEASE" &&
+      (! -d "$OLD_RELEASE" || -L "$OLD_RELEASE") ]]; then
+    service_stopped=0
+    err "Rollback cannot safely restore the previous app release; its backup is missing or unsafe"
+  fi
+  if [[ -n "$OLD_RELEASE" && "$service_stopped" != "1" ]]; then
+    err "Rollback could not prove the managed service stopped; both app releases were preserved"
+    err "Current release: $APP_DIR"
+    err "Previous release: $OLD_RELEASE"
+    err "Manual recovery is required before another lifecycle operation"
+  elif [[ -n "$OLD_RELEASE" ]]; then
+    rollback_app="$OLD_RELEASE_ROOT/failed-release"
+    if [[ -e "$APP_DIR" || -L "$APP_DIR" ]]; then
+      if mv "$APP_DIR" "$rollback_app"; then
+        app_moved_aside=1
+      else
+        restore_ok=0
+      fi
+    fi
+    if [[ "$restore_ok" == "1" ]]; then
+      if mv "$OLD_RELEASE" "$APP_DIR"; then
+        OLD_RELEASE=""
+        STAGE_ACTIVATION_STARTED=0
+        if [[ "$app_moved_aside" == "1" ]]; then
+          rm -rf "$rollback_app" ||
+            err "Rollback restored the previous app but could not remove the failed release backup: $rollback_app"
+        fi
+      else
+        restore_ok=0
+        if [[ "$app_moved_aside" == "1" &&
+            ! -e "$APP_DIR" && ! -L "$APP_DIR" ]]; then
+          mv "$rollback_app" "$APP_DIR" || true
+        fi
+      fi
+    fi
+    if [[ "$restore_ok" == "1" ]]; then
+      if restore_previous_update_service_state; then
+        log "Previous active release restored."
+      else
+        restore_ok=0
+        err "Rollback restored the app but could not restore the previous service state"
+      fi
+    fi
+  fi
+  if [[ "$service_stopped" == "1" && "$restore_ok" == "1" &&
+      "$MARKER_CREATED_BY_UPDATE" == "1" ]]; then
+    if rm -f "$MARKER_FILE"; then
+      MARKER_CREATED_BY_UPDATE=0
+    else
+      err "Rollback could not remove the newly created managed-install marker"
+    fi
+  fi
+  if [[ "$restore_ok" != "1" ]]; then
+    err "Rollback restore failed; the service was not restarted"
+    err "Manual recovery is required before another lifecycle operation"
   fi
   [[ -z "$STAGE_DIR" || ! -e "$STAGE_DIR" ]] || rm -rf "$STAGE_DIR"
   [[ -z "$BUILD_HOME" || ! -e "$BUILD_HOME" ]] || rm -rf "$BUILD_HOME"
@@ -580,16 +944,56 @@ rollback_release() {
     rmdir "$OLD_RELEASE_ROOT" >/dev/null 2>&1 || true
   fi
   if [[ "$LOCK_HELD" == "1" ]]; then
-    rmdir "$LOCK_DIR" >/dev/null 2>&1 || true
-    LOCK_HELD=0
+    if rmdir "$LOCK_DIR" >/dev/null 2>&1; then
+      LOCK_HELD=0
+    fi
   fi
   set -e
   return "$status"
 }
 
+cleanup_exit_artifacts() {
+  local cleanup_failed=0
+  set +e
+  [[ -z "$STAGE_DIR" || ! -e "$STAGE_DIR" ]] || rm -rf "$STAGE_DIR"
+  [[ -z "$BUILD_HOME" || ! -e "$BUILD_HOME" ]] || rm -rf "$BUILD_HOME"
+  [[ -z "$GIT_HOME" || ! -e "$GIT_HOME" ]] || rm -rf "$GIT_HOME"
+  if [[ "$UPDATE_SUCCEEDED" == "1" ]]; then
+    if [[ -n "$OLD_RELEASE" && -e "$OLD_RELEASE" ]]; then
+      rm -rf "$OLD_RELEASE"
+      if [[ ! -e "$OLD_RELEASE" && ! -L "$OLD_RELEASE" ]]; then
+        OLD_RELEASE=""
+      else
+        err "Update succeeded, but the previous release backup could not be removed: $OLD_RELEASE"
+      fi
+    fi
+    if [[ -n "$OLD_RELEASE_ROOT" && -d "$OLD_RELEASE_ROOT" ]]; then
+      rmdir "$OLD_RELEASE_ROOT"
+      if [[ ! -e "$OLD_RELEASE_ROOT" ]]; then
+        OLD_RELEASE_ROOT=""
+      else
+        err "Update succeeded, but the previous release directory could not be removed: $OLD_RELEASE_ROOT"
+      fi
+    fi
+  fi
+  if [[ "$LOCK_HELD" == "1" ]]; then
+    if rmdir "$LOCK_DIR" >/dev/null 2>&1; then
+      LOCK_HELD=0
+    else
+      err "Could not release the updater operation lock: $LOCK_DIR"
+      cleanup_failed=1
+    fi
+  fi
+  set -e
+  return "$cleanup_failed"
+}
+
 on_exit() {
   local status="$1"
+  trap - EXIT
+  trap '' HUP INT TERM
   rollback_release "$status" || true
+  cleanup_exit_artifacts || true
   exit "$status"
 }
 trap 'on_exit $?' EXIT
@@ -650,22 +1054,14 @@ main() {
   fi
 
   build_staged_release
+  stop_managed_service
   switch_release
   write_marker
-  restart_service
+  resume_managed_service
 
   UPDATE_SUCCEEDED=1
-  if [[ -n "$OLD_RELEASE" && -e "$OLD_RELEASE" ]]; then
-    rm -rf "$OLD_RELEASE"
-    OLD_RELEASE=""
-  fi
-  if [[ -n "$OLD_RELEASE_ROOT" && -d "$OLD_RELEASE_ROOT" ]]; then
-    rmdir "$OLD_RELEASE_ROOT"
-    OLD_RELEASE_ROOT=""
-  fi
-  [[ -z "$GIT_HOME" || ! -e "$GIT_HOME" ]] || rm -rf "$GIT_HOME"
-  GIT_HOME=""
-  release_operation_lock
+  cleanup_exit_artifacts ||
+    die "Update committed, but its operation lock could not be released"
   log "Skoobi update complete."
 }
 

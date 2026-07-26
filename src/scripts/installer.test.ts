@@ -18,6 +18,23 @@ const canonicalRepo =
 const realGit = execFileSync('which', ['git'], {
   encoding: 'utf8',
 }).trim();
+if (process.platform === 'linux') {
+  const serviceFallbackBin = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'skoobi-test-service-bin-'),
+  );
+  fs.writeFileSync(
+    path.join(serviceFallbackBin, 'systemctl'),
+    `#!/usr/bin/env bash
+case "\${2:-}" in
+  is-active) exit 4 ;;
+  is-enabled) printf 'disabled\\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+  process.env.PATH = `${serviceFallbackBin}:${process.env.PATH || ''}`;
+}
 
 function run(
   command: string,
@@ -175,9 +192,68 @@ exec ${JSON.stringify(realGit)} "\${args[@]}"
   return {
     HOME: home,
     SKOOBI_INSTALLER_SKIP_REQUIREMENTS: '1',
+    SKOOBI_UPDATE_REF: 'refs/heads/main',
+    SKOOBI_UPDATE_EXPECTED_COMMIT: git(remote, ['rev-parse', 'HEAD']),
     ...extra,
     PATH: `${transportBin}:${requestedPath}`,
   };
+}
+
+const huskyGeneratedHooks = [
+  'applypatch-msg',
+  'commit-msg',
+  'post-applypatch',
+  'post-checkout',
+  'post-commit',
+  'post-merge',
+  'post-rewrite',
+  'pre-applypatch',
+  'pre-auto-gc',
+  'pre-commit',
+  'pre-merge-commit',
+  'pre-push',
+  'pre-rebase',
+  'prepare-commit-msg',
+];
+
+function createLegacyHuskyScaffold(appDir: string): void {
+  const huskyPackageDir = path.join(appDir, 'node_modules', 'husky');
+  const generatedDir = path.join(appDir, '.husky', '_');
+  fs.mkdirSync(huskyPackageDir, { recursive: true });
+  fs.mkdirSync(generatedDir, { recursive: true });
+  fs.copyFileSync(
+    path.join(repoRoot, 'node_modules', 'husky', 'husky'),
+    path.join(huskyPackageDir, 'husky'),
+  );
+  fs.copyFileSync(
+    path.join(huskyPackageDir, 'husky'),
+    path.join(generatedDir, 'h'),
+  );
+  fs.writeFileSync(path.join(generatedDir, '.gitignore'), '*');
+  for (const hook of huskyGeneratedHooks) {
+    fs.writeFileSync(
+      path.join(generatedDir, hook),
+      '#!/usr/bin/env sh\n. "$(dirname "$0")/h"',
+      { mode: 0o755 },
+    );
+  }
+  const deprecatedShim = `echo "husky - DEPRECATED
+
+Please remove the following two lines from $0:
+
+#!/usr/bin/env sh
+. \\"\\$(dirname -- \\"\\$0\\")/_/husky.sh\\"
+
+They WILL FAIL in v10.0.0
+"
+`;
+  fs.writeFileSync(
+    path.join(generatedDir, 'husky.sh'),
+    deprecatedShim.trimEnd(),
+  );
+  const binDir = path.join(appDir, 'node_modules', '.bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.symlinkSync('../husky/bin.js', path.join(binDir, 'husky'));
 }
 
 function installFixture(
@@ -388,6 +464,83 @@ describe('Skoobi installer scripts', () => {
     );
     expect(run('node', ['bin/skoobi.js', '--version']).trim()).toBe(
       `skoobi ${packageVersion}`,
+    );
+    expect(run('node', ['bin/skoobi.js', '--help'])).toContain(
+      'skoobi update --ref refs/tags/<version> --expected-commit <40-hex>',
+    );
+  });
+
+  it('refuses every unpinned update form before filesystem or network access', () => {
+    const home = tempDir();
+    const prefix = path.join(tempDir(), 'must-not-exist');
+    const fake = makeFakeCommands({
+      git: 'touch "$UNEXPECTED_NETWORK"; exit 97',
+    });
+    const networkMarker = path.join(tempDir(), 'git-called');
+    const cases = [
+      [],
+      ['--ref', 'refs/heads/main'],
+      [
+        '--expected-commit',
+        '1111111111111111111111111111111111111111',
+      ],
+    ];
+
+    for (const args of cases) {
+      const result = runResult(
+        'bash',
+        ['scripts/update.sh', '--prefix', prefix, ...args],
+        {
+          env: {
+            HOME: home,
+            PATH: `${fake.bin}:${process.env.PATH || ''}`,
+            SKOOBI_UPDATE_REF: '',
+            SKOOBI_UPDATE_EXPECTED_COMMIT: '',
+            UNEXPECTED_NETWORK: networkMarker,
+          },
+        },
+      );
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(
+        'requires both --ref and --expected-commit',
+      );
+      expect(fs.existsSync(prefix)).toBe(false);
+      expect(fs.existsSync(networkMarker)).toBe(false);
+    }
+  });
+
+  it('keeps the active release when a pinned update commit does not match', () => {
+    const remote = createRemote({ tracked: 'installed\n' });
+    const prefix = tempDir();
+    const home = tempDir();
+    installFixture(remote, prefix, 'pin-mismatch', home);
+    const appDir = path.join(prefix, 'app', 'skoobi-agent');
+    const installedHead = git(appDir, ['rev-parse', 'HEAD']);
+
+    fs.writeFileSync(path.join(remote, 'tracked.txt'), 'new remote\n');
+    git(remote, ['add', 'tracked.txt']);
+    git(remote, ['commit', '-m', 'move fixture branch']);
+    const result = runResult(
+      'bash',
+      [
+        'scripts/update.sh',
+        '--prefix',
+        prefix,
+        '--instance',
+        'pin-mismatch',
+        '--ref',
+        'refs/heads/main',
+        '--expected-commit',
+        installedHead,
+        '--no-start',
+      ],
+      { env: transportEnv(remote, home) },
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('does not match the expected commit');
+    expect(git(appDir, ['rev-parse', 'HEAD'])).toBe(installedHead);
+    expect(fs.readFileSync(path.join(appDir, 'tracked.txt'), 'utf8')).toBe(
+      'installed\n',
     );
   });
 
@@ -1410,12 +1563,14 @@ describe('Skoobi installer scripts', () => {
     const home = tempDir();
     installFixture(remote, prefix, 'env-rollback', home);
     const envFile = path.join(prefix, 'instances', 'env-rollback', '.env');
+    const appDir = path.join(prefix, 'app', 'skoobi-agent');
+    const originalHead = git(appDir, ['rev-parse', 'HEAD']);
     const ownerEnv = 'ASSISTANT_NAME=OwnerOriginal\nRUNTIME=owner-runtime\n';
     fs.writeFileSync(envFile, ownerEnv, { mode: 0o600 });
     const fake = makeFakeCommands({
       uname: 'printf "Linux\\n"',
       systemctl:
-        '[[ "$*" == *"is-active"* ]] && exit 4; [[ "$*" == *"enable --now"* ]] && exit 9; exit 0',
+        'printf "%s\\n" "$*" >>"$FAKE_CALL_LOG"; [[ "${2:-}" == "is-active" ]] && exit 4; [[ "${2:-}" == "enable" && "${3:-}" == "--now" ]] && exit 9; exit 0',
     });
     const result = runResult(
       'bash',
@@ -1431,16 +1586,137 @@ describe('Skoobi installer scripts', () => {
       {
         env: transportEnv(remote, home, {
           PATH: `${fake.bin}:${process.env.PATH || ''}`,
+          FAKE_CALL_LOG: fake.log,
           SKOOBI_ASSISTANT_NAME: 'Replacement',
         }),
       },
     );
     expect(result.status).not.toBe(0);
     expect(fs.readFileSync(envFile, 'utf8')).toBe(ownerEnv);
+    expect(git(appDir, ['rev-parse', 'HEAD'])).toBe(originalHead);
+    const calls = fs.readFileSync(fake.log, 'utf8');
+    expect(calls.indexOf('enable --now')).toBeGreaterThanOrEqual(0);
+    expect(calls.lastIndexOf('disable --now')).toBeGreaterThan(
+      calls.indexOf('enable --now'),
+    );
+    expect(
+      fs.existsSync(
+        path.join(
+          home,
+          '.config',
+          'systemd',
+          'user',
+          'skoobi-env-rollback.service',
+        ),
+      ),
+    ).toBe(false);
     expect(fs.existsSync(path.join(prefix, '.skoobi-operation.lock'))).toBe(
       false,
     );
-  });
+  }, 20_000);
+
+  it('stops a live service before reinstall and restores it after a later failure', () => {
+    const remote = createRemote({ tracked: 'old\n' });
+    const prefix = tempDir();
+    const home = tempDir();
+    installFixture(remote, prefix, 'install-live', home);
+    const appDir = path.join(prefix, 'app', 'skoobi-agent');
+    const oldHead = git(appDir, ['rev-parse', 'HEAD']);
+    fs.writeFileSync(path.join(remote, 'tracked.txt'), 'new\n');
+    git(remote, ['add', 'tracked.txt']);
+    git(remote, ['commit', '-m', 'new installer release']);
+
+    const unit = path.join(
+      home,
+      '.config',
+      'systemd',
+      'user',
+      'skoobi-install-live.service',
+    );
+    fs.mkdirSync(path.dirname(unit), { recursive: true });
+    fs.writeFileSync(unit, 'old service\n', { mode: 0o600 });
+    const serviceState = path.join(tempDir(), 'service-state');
+    fs.writeFileSync(serviceState, 'active\n');
+    fs.rmSync(path.join(home, '.local'), { recursive: true, force: true });
+    fs.symlinkSync(tempDir(), path.join(home, '.local'));
+
+    const fake = makeFakeCommands({
+      uname: 'printf "Linux\\n"',
+      systemctl: `printf 'cmd:%s\\n' "$*" >>"$FAKE_CALL_LOG"
+case "\${2:-}" in
+  is-enabled) printf 'enabled\\n'; exit 0 ;;
+  is-active)
+    [[ "$(cat "$SERVICE_STATE")" == "active" ]] && exit 0
+    exit 3
+    ;;
+  disable)
+    printf 'stop:%s\\n' "$(tr -d '\\n' <"$APP_SENTINEL")" >>"$FAKE_CALL_LOG"
+    printf 'stopped\\n' >"$SERVICE_STATE"
+    exit 0
+    ;;
+  start)
+    printf 'start:%s\\n' "$(tr -d '\\n' <"$APP_SENTINEL")" >>"$FAKE_CALL_LOG"
+    printf 'active\\n' >"$SERVICE_STATE"
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac`,
+    });
+    const result = runResult(
+      'bash',
+      [
+        'scripts/install.sh',
+        '--prefix',
+        prefix,
+        '--instance',
+        'install-live',
+        '--yes',
+      ],
+      {
+        env: transportEnv(remote, home, {
+          PATH: `${fake.bin}:${process.env.PATH || ''}`,
+          APP_SENTINEL: path.join(appDir, 'tracked.txt'),
+          FAKE_CALL_LOG: fake.log,
+          SERVICE_STATE: serviceState,
+        }),
+      },
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('symlinked directory ancestor');
+    expect(git(appDir, ['rev-parse', 'HEAD'])).toBe(oldHead);
+    expect(fs.readFileSync(serviceState, 'utf8').trim()).toBe('active');
+    const calls = fs.readFileSync(fake.log, 'utf8');
+    expect(calls.indexOf('stop:old')).toBeGreaterThanOrEqual(0);
+    expect(calls.indexOf('start:old')).toBeGreaterThan(
+      calls.indexOf('stop:old'),
+    );
+
+    fs.unlinkSync(unit);
+    const noService = runResult(
+      'bash',
+      [
+        'scripts/install.sh',
+        '--prefix',
+        prefix,
+        '--instance',
+        'install-live',
+        '--no-service',
+        '--no-start',
+        '--yes',
+      ],
+      {
+        env: transportEnv(remote, home, {
+          PATH: `${fake.bin}:${process.env.PATH || ''}`,
+          APP_SENTINEL: path.join(appDir, 'tracked.txt'),
+          FAKE_CALL_LOG: fake.log,
+          SERVICE_STATE: serviceState,
+        }),
+      },
+    );
+    expect(noService.status).not.toBe(0);
+    expect(noService.stderr).toContain('managed systemd service is running');
+    expect(git(appDir, ['rev-parse', 'HEAD'])).toBe(oldHead);
+  }, 20_000);
 
   it('refuses symlinked store and .env paths without touching their targets', () => {
     const remote = createRemote();
@@ -1881,7 +2157,7 @@ describe('Skoobi installer scripts', () => {
 
     installFixture(remote, prefix, 'preserve', home);
     expect(fs.readFileSync(envFile, 'utf8')).toBe(ownerConfig);
-  });
+  }, 20_000);
 
   it('creates private state directories and service umask 0077', () => {
     const remote = createRemote();
@@ -1897,6 +2173,8 @@ describe('Skoobi installer scripts', () => {
       path.join(prefix, 'instances', 'private', 'logs'),
       path.join(prefix, 'instances', 'private', 'data'),
       path.join(prefix, 'backups'),
+      path.join(prefix, 'backups', 'instances'),
+      path.join(prefix, 'backups', 'instances', 'private'),
     ]) {
       expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
     }
@@ -1908,12 +2186,24 @@ describe('Skoobi installer scripts', () => {
       '--print-service',
       'linux',
       '--prefix',
-      `${prefix}/quoted"%dir`,
+      `${prefix}/quoted"%$cash`,
       '--instance',
       'svc',
-    ]);
+    ], {
+      env: { HOME: `${home}/literal$home` },
+    });
     expect(linux).toContain('UMask=0077');
-    expect(linux).toContain('quoted\\"%%dir');
+    expect(linux).toContain('quoted\\"%%$cash');
+    expect(linux).toContain('ExecStart=":');
+    const workingDirectory = linux
+      .split(/\r?\n/u)
+      .find((line) => line.startsWith('WorkingDirectory='));
+    expect(workingDirectory).toBe(
+      `WorkingDirectory=${prefix}/quoted"%%$cash/instances/svc`,
+    );
+    expect(workingDirectory).not.toContain('WorkingDirectory="');
+    expect(linux).toContain(`Environment="HOME=${home}/literal$home"`);
+    expect(linux).not.toContain(`Environment="HOME=${home}/literal$$home"`);
     expect(linux).toContain(
       'Environment="SKOOBI_SERVICE_LABEL=com.skoobi.svc"',
     );
@@ -1938,6 +2228,227 @@ describe('Skoobi installer scripts', () => {
       `<string>${path.dirname(process.execPath)}:/opt/homebrew/opt/node@22/bin`,
     );
     expect(mac).toContain('/usr/local/opt/node@22/bin');
+  });
+
+  it.runIf(process.platform === 'linux')(
+    'rejects Node executable characters unsupported by systemd',
+    () => {
+      for (const nodePath of [
+        '/tmp/node"quoted/node',
+        '/tmp/node\\backslash/node',
+        "/tmp/node'single/node",
+        '/tmp/node*glob/node',
+        '/tmp/node?glob/node',
+        '/tmp/node[glob/node',
+      ]) {
+        const fake = makeFakeCommands({
+          node: `printf '%s\\n' ${JSON.stringify(nodePath)}`,
+        });
+        const result = runResult(
+          'bash',
+          [
+            'scripts/install.sh',
+            '--print-service',
+            'linux',
+            '--prefix',
+            tempDir(),
+            '--instance',
+            'unsupported-node-path',
+          ],
+          {
+            env: {
+              HOME: tempDir(),
+              PATH: `${fake.bin}:${process.env.PATH || ''}`,
+            },
+          },
+        );
+        expect(result.status, nodePath).not.toBe(0);
+        expect(result.stderr).toContain(
+          'Node executable path cannot be represented safely in systemd ExecStart',
+        );
+      }
+
+      for (const [label, body] of [
+        ['empty path', ':'],
+        ['TAB', "printf '\\x09'"],
+        ['BEL', "printf '\\x07'"],
+        ['DEL', "printf '\\x7f'"],
+        ['invalid UTF-8', "printf '\\xff'"],
+      ]) {
+        const fake = makeFakeCommands({ node: body });
+        const result = runResult(
+          'bash',
+          [
+            'scripts/install.sh',
+            '--print-service',
+            'linux',
+            '--prefix',
+            tempDir(),
+            '--instance',
+            'unsafe-node-bytes',
+          ],
+          {
+            env: {
+              HOME: tempDir(),
+              PATH: `${fake.bin}:${process.env.PATH || ''}`,
+            },
+          },
+        );
+        expect(result.status, label).not.toBe(0);
+        expect(result.stderr).toContain(
+          'Node executable path cannot be represented safely in systemd ExecStart',
+        );
+      }
+    },
+  );
+
+  it('warns about missing Linux lingering without changing host policy', () => {
+    const prefix = tempDir();
+    const home = tempDir();
+    const fake = makeFakeCommands({
+      uname: 'printf "Linux\\n"',
+      loginctl:
+        'printf "%s\\n" "$*" >>"$FAKE_CALL_LOG"; [[ "${1:-}" == "show-user" ]] && { printf "no\\n"; exit 0; }; exit 91',
+    });
+    const result = runResult(
+      'bash',
+      [
+        'scripts/install.sh',
+        '--dry-run',
+        '--yes',
+        '--prefix',
+        prefix,
+        '--instance',
+        'linger-warning',
+      ],
+      {
+        env: {
+          HOME: home,
+          PATH: `${fake.bin}:${process.env.PATH || ''}`,
+          FAKE_CALL_LOG: fake.log,
+          SKOOBI_INSTALLER_SKIP_REQUIREMENTS: '1',
+        },
+      },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(
+      'WARNING: systemd user lingering is not confirmed.',
+    );
+    const calls = fs.readFileSync(fake.log, 'utf8');
+    expect(calls).toContain('show-user');
+    expect(calls).not.toContain('enable-linger');
+  });
+
+  it('disables Husky installation in managed production builds', () => {
+    const remote = createRemote();
+    const packageFile = path.join(remote, 'package.json');
+    const packageJson = JSON.parse(fs.readFileSync(packageFile, 'utf8')) as {
+      scripts: Record<string, string>;
+    };
+    packageJson.scripts.prepare =
+      'node -e "if(process.env.HUSKY!==\'0\')process.exit(87)"';
+    fs.writeFileSync(packageFile, `${JSON.stringify(packageJson, null, 2)}\n`);
+    git(remote, ['add', 'package.json']);
+    git(remote, ['commit', '-m', 'require production Husky disable']);
+
+    const prefix = tempDir();
+    const home = tempDir();
+    installFixture(remote, prefix, 'husky-disabled', home);
+    expect(
+      fs.existsSync(
+        path.join(prefix, 'app', 'skoobi-agent', 'dist', 'service.js'),
+      ),
+    ).toBe(true);
+  });
+
+  it('accepts only an unmodified legacy Husky scaffold across the normal lifecycle', () => {
+    const remote = createRemote();
+    const prefix = path.join(tempDir(), 'managed\\release');
+    const home = tempDir();
+    installFixture(remote, prefix, 'husky-lifecycle', home);
+    let appDir = path.join(prefix, 'app', 'skoobi-agent');
+
+    createLegacyHuskyScaffold(appDir);
+    installFixture(remote, prefix, 'husky-lifecycle', home);
+
+    fs.writeFileSync(path.join(remote, 'tracked.txt'), 'next release\n');
+    git(remote, ['add', 'tracked.txt']);
+    git(remote, ['commit', '-m', 'next fixture release']);
+    appDir = path.join(prefix, 'app', 'skoobi-agent');
+    createLegacyHuskyScaffold(appDir);
+    run(
+      'bash',
+      [
+        'scripts/update.sh',
+        '--prefix',
+        prefix,
+        '--instance',
+        'husky-lifecycle',
+        '--no-start',
+      ],
+      { env: transportEnv(remote, home) },
+    );
+    expect(fs.readFileSync(path.join(appDir, 'tracked.txt'), 'utf8')).toBe(
+      'next release\n',
+    );
+
+    createLegacyHuskyScaffold(appDir);
+    run(
+      'bash',
+      [
+        'scripts/uninstall.sh',
+        '--prefix',
+        prefix,
+        '--instance',
+        'husky-lifecycle',
+        '--yes',
+      ],
+      { env: { HOME: home } },
+    );
+    expect(fs.existsSync(appDir)).toBe(false);
+    expect(
+      fs.existsSync(path.join(prefix, 'instances', 'husky-lifecycle')),
+    ).toBe(true);
+  }, 20_000);
+
+  it('preserves a modified legacy Husky scaffold as owner data', () => {
+    const remote = createRemote();
+    const prefix = tempDir();
+    const home = tempDir();
+    installFixture(remote, prefix, 'husky-owner-data', home);
+    const appDir = path.join(prefix, 'app', 'skoobi-agent');
+    createLegacyHuskyScaffold(appDir);
+    fs.writeFileSync(
+      path.join(appDir, '.husky', '_', 'pre-commit'),
+      'owner data\n',
+    );
+
+    const result = runResult(
+      'bash',
+      [
+        'scripts/install.sh',
+        '--repo',
+        canonicalRepo,
+        '--ref',
+        'main',
+        '--prefix',
+        prefix,
+        '--instance',
+        'husky-owner-data',
+        '--no-service',
+        '--no-start',
+        '--yes',
+      ],
+      { env: transportEnv(remote, home) },
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('ignored owner files');
+    expect(
+      fs.readFileSync(
+        path.join(appDir, '.husky', '_', 'pre-commit'),
+        'utf8',
+      ),
+    ).toBe('owner data\n');
   });
 
   it('rolls a reinstall back when the staged build fails', () => {
@@ -2025,7 +2536,7 @@ describe('Skoobi installer scripts', () => {
     const fake = makeFakeCommands({
       uname: 'printf "Linux\\n"',
       systemctl:
-        'printf "%s\\n" "$*" >>"$FAKE_CALL_LOG"; [[ "$*" == *"is-active"* ]] && exit 1; exit 0',
+        'printf "%s\\n" "$*" >>"$FAKE_CALL_LOG"; [[ "$*" == *"is-active"* ]] && exit 4; exit 0',
     });
     const env = transportEnv(remote, home, {
       PATH: `${fake.bin}:${process.env.PATH || ''}`,
@@ -2146,6 +2657,182 @@ describe('Skoobi installer scripts', () => {
       fs.readFileSync(path.join(appDir, 'dist', 'service.js'), 'utf8'),
     ).toBe(oldBuild);
   });
+
+  it('quiesces a live service before update, restores it on failure, and honors --no-start', () => {
+    const remote = createRemote({ tracked: 'old\n' });
+    const prefix = tempDir();
+    const home = tempDir();
+    installFixture(remote, prefix, 'update-live', home);
+    const appDir = path.join(prefix, 'app', 'skoobi-agent');
+    const oldHead = git(appDir, ['rev-parse', 'HEAD']);
+    const unit = path.join(
+      home,
+      '.config',
+      'systemd',
+      'user',
+      'skoobi-update-live.service',
+    );
+    fs.mkdirSync(path.dirname(unit), { recursive: true });
+    fs.writeFileSync(unit, 'managed\n', { mode: 0o600 });
+    const serviceState = path.join(tempDir(), 'service-state');
+    const startCount = path.join(tempDir(), 'start-count');
+    fs.writeFileSync(serviceState, 'active\n');
+    fs.writeFileSync(startCount, '0\n');
+
+    fs.writeFileSync(path.join(remote, 'tracked.txt'), 'new\n');
+    git(remote, ['add', 'tracked.txt']);
+    git(remote, ['commit', '-m', 'new live release']);
+
+    const fake = makeFakeCommands({
+      uname: 'printf "Linux\\n"',
+      systemctl: `printf 'cmd:%s\\n' "$*" >>"$FAKE_CALL_LOG"
+case "\${2:-}" in
+  is-enabled) printf 'enabled\\n'; exit 0 ;;
+  is-active)
+    [[ "$(cat "$SERVICE_STATE")" == "active" ]] && exit 0
+    exit 3
+    ;;
+  stop)
+    printf 'stop:%s\\n' "$(tr -d '\\n' <"$APP_SENTINEL")" >>"$FAKE_CALL_LOG"
+    printf 'stopped\\n' >"$SERVICE_STATE"
+    exit 0
+    ;;
+  start)
+    printf 'start:%s\\n' "$(tr -d '\\n' <"$APP_SENTINEL")" >>"$FAKE_CALL_LOG"
+    count="$(cat "$START_COUNT")"
+    count=$((count + 1))
+    printf '%s\\n' "$count" >"$START_COUNT"
+    printf 'active\\n' >"$SERVICE_STATE"
+    [[ "$count" != "1" ]] || exit 9
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac`,
+    });
+    const extraEnv = {
+      PATH: `${fake.bin}:${process.env.PATH || ''}`,
+      APP_SENTINEL: path.join(appDir, 'tracked.txt'),
+      FAKE_CALL_LOG: fake.log,
+      SERVICE_STATE: serviceState,
+      START_COUNT: startCount,
+    };
+    const failed = runResult(
+      'bash',
+      [
+        'scripts/update.sh',
+        '--prefix',
+        prefix,
+        '--instance',
+        'update-live',
+      ],
+      { env: transportEnv(remote, home, extraEnv) },
+    );
+    expect(failed.status).not.toBe(0);
+    expect(git(appDir, ['rev-parse', 'HEAD'])).toBe(oldHead);
+    expect(fs.readFileSync(serviceState, 'utf8').trim()).toBe('active');
+    const failedCalls = fs.readFileSync(fake.log, 'utf8');
+    const firstStop = failedCalls.indexOf('stop:old');
+    const failedStart = failedCalls.indexOf('start:new');
+    const rollbackStop = failedCalls.indexOf('stop:new', firstStop + 1);
+    const rollbackStart = failedCalls.indexOf('start:old', failedStart + 1);
+    expect(firstStop).toBeGreaterThanOrEqual(0);
+    expect(failedStart).toBeGreaterThan(firstStop);
+    expect(rollbackStop).toBeGreaterThan(failedStart);
+    expect(rollbackStart).toBeGreaterThan(rollbackStop);
+
+    const noStart = runResult(
+      'bash',
+      [
+        'scripts/update.sh',
+        '--prefix',
+        prefix,
+        '--instance',
+        'update-live',
+        '--no-start',
+      ],
+      { env: transportEnv(remote, home, extraEnv) },
+    );
+    expect(noStart.status).toBe(0);
+    expect(fs.readFileSync(path.join(appDir, 'tracked.txt'), 'utf8')).toBe(
+      'new\n',
+    );
+    expect(fs.readFileSync(serviceState, 'utf8').trim()).toBe('stopped');
+    expect(fs.readFileSync(startCount, 'utf8').trim()).toBe('2');
+
+    fs.unlinkSync(unit);
+    fs.writeFileSync(serviceState, 'active\n');
+    fs.writeFileSync(path.join(remote, 'tracked.txt'), 'newer\n');
+    git(remote, ['add', 'tracked.txt']);
+    git(remote, ['commit', '-m', 'orphan service target']);
+    const orphan = runResult(
+      'bash',
+      [
+        'scripts/update.sh',
+        '--prefix',
+        prefix,
+        '--instance',
+        'update-live',
+        '--no-start',
+      ],
+      { env: transportEnv(remote, home, extraEnv) },
+    );
+    expect(orphan.status).not.toBe(0);
+    expect(orphan.stderr).toContain('loaded without its definition');
+    expect(fs.readFileSync(path.join(appDir, 'tracked.txt'), 'utf8')).toBe(
+      'new\n',
+    );
+  }, 20_000);
+
+  it('handles interruption immediately before or after the first release rename', () => {
+    const realMv = execFileSync('which', ['mv'], {
+      encoding: 'utf8',
+    }).trim();
+    for (const mode of ['before', 'after'] as const) {
+      const remote = createRemote({ tracked: 'old\n' });
+      const prefix = tempDir();
+      const home = tempDir();
+      installFixture(remote, prefix, `first-rename-${mode}`, home);
+      const appDir = path.join(prefix, 'app', 'skoobi-agent');
+      const oldHead = git(appDir, ['rev-parse', 'HEAD']);
+      fs.writeFileSync(path.join(remote, 'tracked.txt'), 'new\n');
+      git(remote, ['add', 'tracked.txt']);
+      git(remote, ['commit', '-m', `first rename ${mode}`]);
+
+      const failure =
+        mode === 'before'
+          ? 'kill -TERM "$PPID"; sleep 0.2; exit 143'
+          : `${JSON.stringify(realMv)} "$@"; exit 19`;
+      const fake = makeFakeCommands({
+        mv: `target="\${!#}"
+if [[ "\${1:-}" == */app/skoobi-agent && "$target" == *".skoobi-agent.previous."*/release ]]; then
+  ${failure}
+fi
+exec ${JSON.stringify(realMv)} "$@"`,
+      });
+      const result = runResult(
+        'bash',
+        [
+          'scripts/update.sh',
+          '--prefix',
+          prefix,
+          '--instance',
+          `first-rename-${mode}`,
+          '--no-start',
+        ],
+        {
+          env: transportEnv(remote, home, {
+            PATH: `${fake.bin}:${process.env.PATH || ''}`,
+          }),
+        },
+      );
+      expect(result.status).not.toBe(0);
+      expect(fs.existsSync(appDir)).toBe(true);
+      expect(git(appDir, ['rev-parse', 'HEAD'])).toBe(oldHead);
+      expect(fs.existsSync(path.join(prefix, '.skoobi-operation.lock'))).toBe(
+        false,
+      );
+    }
+  }, 20_000);
 
   it('restores the previous release when SIGTERM arrives between release renames', () => {
     const remote = createRemote({ tracked: 'before\n' });
@@ -2312,6 +2999,10 @@ exec ${JSON.stringify(realMv)} "$@"`,
       prefix,
       '--instance',
       'origin',
+      '--ref',
+      'refs/heads/main',
+      '--expected-commit',
+      '1111111111111111111111111111111111111111',
       '--no-start',
     ]);
     expect(result.status).not.toBe(0);
@@ -2555,6 +3246,57 @@ exec ${JSON.stringify(realMv)} "$@"`,
     expect(fs.existsSync(unit)).toBe(true);
   });
 
+  it('stops a loaded systemd job even when its unit file is already missing', () => {
+    const remote = createRemote();
+    const prefix = tempDir();
+    const home = tempDir();
+    installFixture(remote, prefix, 'orphan-job', home);
+    const appDir = path.join(prefix, 'app', 'skoobi-agent');
+    const serviceState = path.join(tempDir(), 'service-state');
+    fs.writeFileSync(serviceState, 'active\n');
+    const fake = makeFakeCommands({
+      uname: 'printf "Linux\\n"',
+      systemctl: `printf '%s\\n' "$*" >>"$FAKE_CALL_LOG"
+case "\${2:-}" in
+  is-active)
+    [[ "$(cat "$SERVICE_STATE")" == "active" ]] && exit 0
+    exit 3
+    ;;
+  stop)
+    printf 'stopped\\n' >"$SERVICE_STATE"
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac`,
+    });
+
+    const result = runResult(
+      'bash',
+      [
+        'scripts/uninstall.sh',
+        '--prefix',
+        prefix,
+        '--instance',
+        'orphan-job',
+        '--yes',
+      ],
+      {
+        env: {
+          HOME: home,
+          PATH: `${fake.bin}:${process.env.PATH || ''}`,
+          FAKE_CALL_LOG: fake.log,
+          SERVICE_STATE: serviceState,
+        },
+      },
+    );
+    expect(result.status).toBe(0);
+    expect(fs.existsSync(appDir)).toBe(false);
+    expect(fs.readFileSync(serviceState, 'utf8').trim()).toBe('stopped');
+    expect(fs.readFileSync(fake.log, 'utf8')).toContain(
+      '--user stop skoobi-orphan-job',
+    );
+  });
+
   it('treats a systemctl transport failure as unknown, not as stopped', () => {
     const remote = createRemote();
     const prefix = tempDir();
@@ -2607,7 +3349,7 @@ exec ${JSON.stringify(realMv)} "$@"`,
     const fake = makeFakeCommands({
       uname: 'printf "Darwin\\n"',
       launchctl:
-        'printf "%s\\n" "$*" >>"$FAKE_CALL_LOG"; [[ "${1:-}" == "print" ]] && exit 1; exit 0',
+        'printf "%s\\n" "$*" >>"$FAKE_CALL_LOG"; [[ "${1:-}" == "print" && "${2:-}" == */*/* ]] && exit 113; exit 0',
     });
     run(
       'bash',
@@ -2628,6 +3370,46 @@ exec ${JSON.stringify(realMv)} "$@"`,
     expect(fs.existsSync(plist)).toBe(false);
   });
 
+  it('preserves files when launchd cannot prove uninstall stopped the service', () => {
+    const remote = createRemote();
+    const prefix = tempDir();
+    const home = tempDir();
+    installFixture(remote, prefix, 'mac-unknown', home);
+    const appDir = path.join(prefix, 'app', 'skoobi-agent');
+    const plist = path.join(
+      home,
+      'Library',
+      'LaunchAgents',
+      'com.skoobi.mac-unknown.plist',
+    );
+    fs.mkdirSync(path.dirname(plist), { recursive: true });
+    fs.writeFileSync(plist, 'managed\n');
+    const fake = makeFakeCommands({
+      uname: 'printf "Darwin\\n"',
+      launchctl: '[[ "${1:-}" == "print" ]] && exit 1; exit 0',
+    });
+    const result = runResult(
+      'bash',
+      [
+        'scripts/uninstall.sh',
+        '--prefix',
+        prefix,
+        '--instance',
+        'mac-unknown',
+      ],
+      {
+        env: {
+          HOME: home,
+          PATH: `${fake.bin}:${process.env.PATH || ''}`,
+        },
+      },
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('could not prove');
+    expect(fs.existsSync(appDir)).toBe(true);
+    expect(fs.existsSync(plist)).toBe(true);
+  });
+
   it('CLI stop disables launchd KeepAlive and proves bootout completed', () => {
     const home = tempDir();
     const prefix = tempDir();
@@ -2638,7 +3420,7 @@ exec ${JSON.stringify(realMv)} "$@"`,
     );
     const fake = makeFakeCommands({
       launchctl:
-        'printf "%s\\n" "$*" >>"$FAKE_CALL_LOG"; [[ "${1:-}" == "print" ]] && exit 1; exit 0',
+        'printf "%s\\n" "$*" >>"$FAKE_CALL_LOG"; [[ "${1:-}" == "print" && "${2:-}" == */*/* ]] && exit 113; exit 0',
     });
     const result = runResult(
       'node',
@@ -2669,6 +3451,40 @@ exec ${JSON.stringify(realMv)} "$@"`,
     expect(calls.indexOf('print gui/')).toBeGreaterThan(
       calls.indexOf('bootout gui/'),
     );
+  });
+
+  it('CLI stop rejects a launchd transport failure instead of calling it stopped', () => {
+    const home = tempDir();
+    const prefix = tempDir();
+    const preload = path.join(tempDir(), 'darwin-platform.cjs');
+    fs.writeFileSync(
+      preload,
+      "Object.defineProperty(process, 'platform', { value: 'darwin' });\n",
+    );
+    const fake = makeFakeCommands({
+      launchctl: '[[ "${1:-}" == "print" ]] && exit 1; exit 0',
+    });
+    const result = runResult(
+      'node',
+      [
+        '--require',
+        preload,
+        'bin/skoobi.js',
+        'stop',
+        '--prefix',
+        prefix,
+        '--instance',
+        'cli-mac-transport',
+      ],
+      {
+        env: {
+          HOME: home,
+          PATH: `${fake.bin}:${process.env.PATH || ''}`,
+        },
+      },
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('could not prove');
   });
 
   it('CLI stop rejects a systemd transport failure instead of calling it stopped', () => {
@@ -2755,6 +3571,10 @@ exec ${JSON.stringify(realMv)} "$@"`,
       prefix,
       '--instance',
       'forged',
+      '--ref',
+      'refs/heads/main',
+      '--expected-commit',
+      '1111111111111111111111111111111111111111',
       '--dry-run',
       '--no-start',
     ]);
@@ -2797,6 +3617,304 @@ exec ${JSON.stringify(realMv)} "$@"`,
     expect(dirResult).toContain('No safe log files');
     expect(dirResult).not.toContain(secret);
   });
+
+  it('reads recent Linux service logs from the user journal', () => {
+    const prefix = tempDir();
+    const home = tempDir();
+    const preload = path.join(tempDir(), 'linux-platform.cjs');
+    fs.writeFileSync(
+      preload,
+      "Object.defineProperty(process, 'platform', { value: 'linux' });\n",
+    );
+    const fake = makeFakeCommands({
+      journalctl:
+        'printf "%s\\n" "$*" >>"$FAKE_CALL_LOG"; printf "journal smoke line\\n"',
+    });
+    const result = runResult(
+      'node',
+      [
+        '--require',
+        preload,
+        'bin/skoobi.js',
+        'logs',
+        '--prefix',
+        prefix,
+        '--instance',
+        'journal',
+      ],
+      {
+        env: {
+          HOME: home,
+          PATH: `${fake.bin}:${process.env.PATH || ''}`,
+          FAKE_CALL_LOG: fake.log,
+        },
+      },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('journal smoke line');
+    expect(fs.readFileSync(fake.log, 'utf8')).toContain(
+      '--user --unit skoobi-journal --lines 80 --no-pager',
+    );
+  });
+
+  it('never restores an instance .env from an incomplete backup copy', () => {
+    const remote = createRemote();
+    const prefix = tempDir();
+    const home = tempDir();
+    installFixture(remote, prefix, 'env-copy', home);
+    const appDir = path.join(prefix, 'app', 'skoobi-agent');
+    const envFile = path.join(prefix, 'instances', 'env-copy', '.env');
+    const originalEnv = fs.readFileSync(envFile);
+    const originalHead = git(appDir, ['rev-parse', 'HEAD']);
+    fs.writeFileSync(path.join(remote, 'tracked.txt'), 'new release\n');
+    git(remote, ['add', 'tracked.txt']);
+    git(remote, ['commit', '-m', 'new release']);
+
+    const realCp = execFileSync('which', ['cp'], { encoding: 'utf8' }).trim();
+    const fake = makeFakeCommands({
+      cp: `if [[ "\${1:-}" == "$TARGET_ENV" && "\${2:-}" == *"/.env-backup-pending."* ]]; then
+  printf 'partial backup\\n' >"\${2}"
+  exit 19
+fi
+exec ${JSON.stringify(realCp)} "$@"`,
+    });
+    const result = runResult(
+      'bash',
+      [
+        'scripts/install.sh',
+        '--repo',
+        canonicalRepo,
+        '--ref',
+        'main',
+        '--prefix',
+        prefix,
+        '--instance',
+        'env-copy',
+        '--no-service',
+        '--no-start',
+        '--yes',
+        '--reconfigure',
+      ],
+      {
+        env: transportEnv(remote, home, {
+          PATH: `${fake.bin}:${process.env.PATH || ''}`,
+          TARGET_ENV: envFile,
+          SKOOBI_TELEGRAM_BOT_TOKEN: 'replacement-secret-must-not-print',
+        }),
+      },
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).not.toContain('replacement-secret-must-not-print');
+    expect(fs.readFileSync(envFile)).toEqual(originalEnv);
+    expect(git(appDir, ['rev-parse', 'HEAD'])).toBe(originalHead);
+    const backupDir = path.join(
+      prefix,
+      'backups',
+      'instances',
+      'env-copy',
+    );
+    expect(
+      fs
+        .readdirSync(backupDir)
+        .some((entry) => entry.startsWith('.env-backup-pending.')),
+    ).toBe(false);
+  });
+
+  it('restores an owner CLI path when mv or ln fails before or after effect', () => {
+    const realMv = execFileSync('which', ['mv'], { encoding: 'utf8' }).trim();
+    const realLn = execFileSync('which', ['ln'], { encoding: 'utf8' }).trim();
+    for (const operation of ['mv', 'ln'] as const) {
+      for (const mode of ['before', 'after'] as const) {
+        const remote = createRemote();
+        const prefix = tempDir();
+        const home = tempDir();
+        const ownerCli = path.join(home, '.local', 'bin', 'skoobi');
+        fs.mkdirSync(path.dirname(ownerCli), { recursive: true });
+        fs.writeFileSync(ownerCli, `owner cli ${operation}-${mode}\n`);
+
+        const commands: Record<string, string> =
+          operation === 'mv'
+            ? {
+                mv: `if [[ "\${1:-}" == "$OWNER_CLI" ]]; then
+  [[ "$FAIL_MODE" != "before" ]] || exit 19
+  ${JSON.stringify(realMv)} "$@"
+  exit 19
+fi
+exec ${JSON.stringify(realMv)} "$@"`,
+              }
+            : {
+                ln: `target="\${!#}"
+if [[ "\${1:-}" == "-s" && "$target" == "$OWNER_CLI" ]]; then
+  [[ "$FAIL_MODE" != "before" ]] || exit 19
+  ${JSON.stringify(realLn)} "$@"
+  exit 19
+fi
+exec ${JSON.stringify(realLn)} "$@"`,
+              };
+        const fake = makeFakeCommands(commands);
+        const result = runResult(
+          'bash',
+          [
+            'scripts/install.sh',
+            '--repo',
+            canonicalRepo,
+            '--ref',
+            'main',
+            '--prefix',
+            prefix,
+            '--instance',
+            `cli-${operation}-${mode}`,
+            '--no-service',
+            '--no-start',
+            '--yes',
+          ],
+          {
+            env: transportEnv(remote, home, {
+              PATH: `${fake.bin}:${process.env.PATH || ''}`,
+              OWNER_CLI: ownerCli,
+              FAIL_MODE: mode,
+            }),
+          },
+        );
+        expect(result.status).not.toBe(0);
+        expect(fs.lstatSync(ownerCli).isSymbolicLink()).toBe(false);
+        expect(fs.readFileSync(ownerCli, 'utf8')).toBe(
+          `owner cli ${operation}-${mode}\n`,
+        );
+        expect(fs.existsSync(path.join(prefix, 'app', 'skoobi-agent'))).toBe(
+          false,
+        );
+        expect(fs.existsSync(path.join(prefix, '.skoobi-operation.lock'))).toBe(
+          false,
+        );
+      }
+    }
+  }, 20_000);
+
+  it('keeps a committed release and clears its lock after a cleanup signal', () => {
+    const realRm = execFileSync('which', ['rm'], { encoding: 'utf8' }).trim();
+    for (const operation of ['install', 'update'] as const) {
+      const remote = createRemote();
+      const prefix = tempDir();
+      const home = tempDir();
+      installFixture(remote, prefix, `committed-${operation}`, home);
+      const appDir = path.join(prefix, 'app', 'skoobi-agent');
+      fs.writeFileSync(path.join(remote, 'tracked.txt'), `${operation} new\n`);
+      git(remote, ['add', 'tracked.txt']);
+      git(remote, ['commit', '-m', `${operation} new release`]);
+      const newHead = git(remote, ['rev-parse', 'HEAD']);
+      const fake = makeFakeCommands({
+        rm: `if [[ "\${1:-}" == "-rf" && "\${2:-}" == *".skoobi-agent.previous."*/release ]]; then
+  ${JSON.stringify(realRm)} "$@"
+  kill -TERM "$PPID"
+  sleep 0.2
+  exit 143
+fi
+exec ${JSON.stringify(realRm)} "$@"`,
+      });
+      const args =
+        operation === 'install'
+          ? [
+              'scripts/install.sh',
+              '--repo',
+              canonicalRepo,
+              '--ref',
+              'main',
+              '--prefix',
+              prefix,
+              '--instance',
+              `committed-${operation}`,
+              '--no-service',
+              '--no-start',
+              '--yes',
+            ]
+          : [
+              'scripts/update.sh',
+              '--prefix',
+              prefix,
+              '--instance',
+              `committed-${operation}`,
+              '--no-start',
+            ];
+      const result = runResult('bash', args, {
+        env: transportEnv(remote, home, {
+          PATH: `${fake.bin}:${process.env.PATH || ''}`,
+        }),
+      });
+      expect(result.status).not.toBe(0);
+      expect(git(appDir, ['rev-parse', 'HEAD'])).toBe(newHead);
+      expect(fs.readFileSync(path.join(appDir, 'tracked.txt'), 'utf8')).toBe(
+        `${operation} new\n`,
+      );
+      expect(fs.existsSync(path.join(prefix, '.skoobi-operation.lock'))).toBe(
+        false,
+      );
+    }
+  }, 20_000);
+
+  it('fails closed on unknown launchd state before install or update activation', () => {
+    for (const operation of ['install', 'update'] as const) {
+      const remote = createRemote();
+      const prefix = tempDir();
+      const home = tempDir();
+      const instance = `launchd-unknown-${operation}`;
+      let previousHead = '';
+      if (operation === 'update') {
+        installFixture(remote, prefix, instance, home);
+        previousHead = git(
+          path.join(prefix, 'app', 'skoobi-agent'),
+          ['rev-parse', 'HEAD'],
+        );
+        fs.writeFileSync(path.join(remote, 'tracked.txt'), 'new release\n');
+        git(remote, ['add', 'tracked.txt']);
+        git(remote, ['commit', '-m', 'new release']);
+      }
+      const fake = makeFakeCommands({
+        uname: 'printf "Darwin\\n"',
+        launchctl: '[[ "${1:-}" == "print" ]] && exit 1; exit 0',
+      });
+      const args =
+        operation === 'install'
+          ? [
+              'scripts/install.sh',
+              '--repo',
+              canonicalRepo,
+              '--ref',
+              'main',
+              '--prefix',
+              prefix,
+              '--instance',
+              instance,
+              '--no-service',
+              '--no-start',
+              '--yes',
+            ]
+          : [
+              'scripts/update.sh',
+              '--prefix',
+              prefix,
+              '--instance',
+              instance,
+              '--no-start',
+            ];
+      const result = runResult('bash', args, {
+        env: transportEnv(remote, home, {
+          PATH: `${fake.bin}:${process.env.PATH || ''}`,
+        }),
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr.toLowerCase()).toContain('could not prove');
+      const appDir = path.join(prefix, 'app', 'skoobi-agent');
+      if (operation === 'install') {
+        expect(fs.existsSync(appDir)).toBe(false);
+      } else {
+        expect(git(appDir, ['rev-parse', 'HEAD'])).toBe(previousHead);
+      }
+      expect(fs.existsSync(path.join(prefix, '.skoobi-operation.lock'))).toBe(
+        false,
+      );
+    }
+  }, 20_000);
 
   it('refuses concurrent lifecycle operations while the prefix lock exists', () => {
     const remote = createRemote();
@@ -2850,6 +3968,131 @@ exec ${JSON.stringify(realMv)} "$@"`,
     expect(result.status).not.toBe(0);
     expect(fs.existsSync(appDir)).toBe(true);
     expect(fs.existsSync(instanceDir)).toBe(true);
+  });
+
+  it('purges only validated backups for the selected instance', () => {
+    const remote = createRemote();
+    const prefix = tempDir();
+    const home = tempDir();
+    installFixture(remote, prefix, 'purge-safe', home);
+    const instanceDir = path.join(prefix, 'instances', 'purge-safe');
+    const backups = path.join(prefix, 'backups');
+    const instanceBackups = path.join(backups, 'instances', 'purge-safe');
+    const otherBackups = path.join(backups, 'instances', 'other');
+    fs.mkdirSync(instanceBackups, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(otherBackups, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      path.join(instanceBackups, 'env.bak.A1b2C3d4'),
+      'selected token backup\n',
+      { mode: 0o600 },
+    );
+    fs.writeFileSync(
+      path.join(backups, 'purge-safe.env.bak.Z9y8X7w6'),
+      'legacy selected token backup\n',
+      { mode: 0o600 },
+    );
+    const otherSentinel = path.join(otherBackups, 'env.bak.Q1w2E3r4');
+    fs.writeFileSync(otherSentinel, 'other instance\n', { mode: 0o600 });
+    const globalSentinel = path.join(backups, 'app-owner-changes-keep');
+    fs.mkdirSync(globalSentinel, { mode: 0o700 });
+
+    run(
+      'bash',
+      [
+        'scripts/uninstall.sh',
+        '--prefix',
+        prefix,
+        '--instance',
+        'purge-safe',
+        '--purge',
+        '--yes',
+      ],
+      {
+        env: {
+          HOME: home,
+          SKOOBI_PURGE_CONFIRMATION: 'DELETE Skoobi data',
+        },
+      },
+    );
+    expect(fs.existsSync(instanceDir)).toBe(false);
+    expect(fs.existsSync(instanceBackups)).toBe(false);
+    expect(
+      fs.existsSync(path.join(backups, 'purge-safe.env.bak.Z9y8X7w6')),
+    ).toBe(false);
+    expect(fs.readFileSync(otherSentinel, 'utf8')).toBe('other instance\n');
+    expect(fs.existsSync(globalSentinel)).toBe(true);
+  });
+
+  it('purges successfully with no instance env backups on macOS Bash 3.2', () => {
+    const remote = createRemote();
+    const prefix = tempDir();
+    const home = tempDir();
+    installFixture(remote, prefix, 'purge-empty', home);
+
+    const result = runResult(
+      '/bin/bash',
+      [
+        'scripts/uninstall.sh',
+        '--prefix',
+        prefix,
+        '--instance',
+        'purge-empty',
+        '--purge',
+        '--yes',
+      ],
+      {
+        env: {
+          HOME: home,
+          SKOOBI_PURGE_CONFIRMATION: 'DELETE Skoobi data',
+        },
+      },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe('');
+    expect(
+      fs.existsSync(path.join(prefix, 'instances', 'purge-empty')),
+    ).toBe(false);
+  });
+
+  it('stops purge before removal when an instance backup path is unexpected', () => {
+    const remote = createRemote();
+    const prefix = tempDir();
+    const home = tempDir();
+    installFixture(remote, prefix, 'purge-owner', home);
+    const appDir = path.join(prefix, 'app', 'skoobi-agent');
+    const instanceDir = path.join(prefix, 'instances', 'purge-owner');
+    const ownerBackup = path.join(
+      prefix,
+      'backups',
+      'purge-owner.env.bak.owner-data',
+    );
+    fs.writeFileSync(ownerBackup, 'preserve\n', { mode: 0o600 });
+
+    const result = runResult(
+      'bash',
+      [
+        'scripts/uninstall.sh',
+        '--prefix',
+        prefix,
+        '--instance',
+        'purge-owner',
+        '--purge',
+        '--yes',
+      ],
+      {
+        env: {
+          HOME: home,
+          SKOOBI_PURGE_CONFIRMATION: 'DELETE Skoobi data',
+        },
+      },
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      'purge stopped before removal',
+    );
+    expect(fs.existsSync(appDir)).toBe(true);
+    expect(fs.existsSync(instanceDir)).toBe(true);
+    expect(fs.readFileSync(ownerBackup, 'utf8')).toBe('preserve\n');
   });
 
   it('CLI ignores an arbitrary app-dir override and selects only a marked install', () => {

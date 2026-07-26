@@ -6,7 +6,7 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { pathToFileURL } from 'url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { logger } from './logger.js';
 import { validateManifest, type ExtensionManifest, type LoadResult } from './extension-manifest.js';
 
@@ -86,18 +86,18 @@ function symlinkSafeWithinRoot(root: string, entryPath: string): boolean {
   return true;
 }
 
-// CODE_ROOT is where the ClaudeClaw code lives (for finding extensions/)
-// In dev mode: process.cwd()
-// In plugin mode: resolved from import.meta.url (the dist/ directory's parent)
-function getCodeRoot(): string {
-  // import.meta.url points to dist/orchestrator/extension-loader.js
-  // Code root is two levels up from dist/orchestrator/
-  const distDir = path.dirname(new URL(import.meta.url).pathname);
-  return path.resolve(distDir, '..', '..');
+// CODE_ROOT is the repository/plugin root used for finding extensions/.
+// This module executes from packages/core/{src|dist}/orchestrator/, so the
+// repository root is four levels above it.
+export function resolveExtensionCodeRootFromModuleUrl(
+  moduleUrl: string | URL,
+): string {
+  const moduleDir = path.dirname(fileURLToPath(moduleUrl));
+  return path.resolve(moduleDir, '..', '..', '..', '..');
 }
 
 export async function loadExtensions(): Promise<LoadResult[]> {
-  const codeRoot = getCodeRoot();
+  const codeRoot = resolveExtensionCodeRootFromModuleUrl(import.meta.url);
   const extensionsDir = path.join(codeRoot, 'extensions');
   const results: LoadResult[] = [];
 
@@ -167,7 +167,7 @@ export async function loadExtensions(): Promise<LoadResult[]> {
  * Returns deduplicated list of domains that extensions need for network access.
  */
 export function getExtensionAllowedDomains(): string[] {
-  const codeRoot = getCodeRoot();
+  const codeRoot = resolveExtensionCodeRootFromModuleUrl(import.meta.url);
   const extensionsDir = path.join(codeRoot, 'extensions');
   const domains: string[] = [];
 

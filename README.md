@@ -51,6 +51,16 @@ mkdir -p "$HOME/.local/bin"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+For a Linux bot that must remain online after SSH logout and start after
+reboot, review the host policy and enable user lingering explicitly:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+The installer warns when lingering is not confirmed; it never changes this
+host setting automatically.
+
 Confirm that Node.js 22 or newer is active:
 
 ```bash
@@ -77,7 +87,7 @@ uses the absolute Codex path found during installation.
 ### 4. Download and verify the release installer
 
 ```bash
-VERSION=v2.0.0-rc.2
+VERSION=v2.0.0-rc.3
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh"
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh.sha256"
 ```
@@ -162,12 +172,22 @@ skoobi status
 skoobi doctor
 skoobi logs
 skoobi restart
-skoobi update
 ```
 
-An upgrade from `2.0.0-rc.1` needs one explicit, checksum-verified
-`install.sh --reconfigure` run because the updater intentionally preserves
-`.env`. Follow the rc.1 migration steps in
+On Linux, `skoobi logs` reads the last 80 entries for the managed user service
+from the systemd journal. The equivalent direct command for the default
+instance is `journalctl --user -u skoobi-default -n 80 --no-pager`.
+
+For a normal upgrade, download and checksum-verify the installer assets for the
+new release exactly as shown above, then run `bash install.sh`. This preserves
+the existing instance `.env`. The low-level `skoobi update` command is intended
+for advanced, commit-pinned maintenance and requires both an explicit Git ref
+and its exact 40-character commit ID.
+
+An upgrade from `2.0.0-rc.2` to `2.0.0-rc.3` uses the normal verified
+`bash install.sh` path; `--reconfigure` is not needed. An upgrade from
+`2.0.0-rc.1` needs one explicit, checksum-verified
+`bash install.sh --reconfigure` run. Follow the rc.1 migration steps in
 [docs/INSTALL.md](docs/INSTALL.md#upgrading-from-200-rc1); do not enable the
 Codex profile blindly on an installation that uses another provider.
 
