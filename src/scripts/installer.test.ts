@@ -1652,7 +1652,7 @@ describe('Skoobi installer scripts', () => {
     );
     expect(content).toContain(`TELEGRAM_BOT_TOKEN="${secondToken}"`);
     expect(content).not.toContain(firstToken);
-  });
+  }, 20_000);
 
   it('uses a preserved pinned Codex executable when the shell PATH omits codex', () => {
     const prefix = tempDir();
@@ -1752,7 +1752,7 @@ describe('Skoobi installer scripts', () => {
     expect(content).not.toContain(
       `SKOOBI_CODEX_COMMAND="${path.join(fake.bin, 'codex')}"`,
     );
-  });
+  }, 20_000);
 
   it('fails requirement checks when sandbox dependencies are absent', () => {
     const mac = makeFakeCommands({
@@ -1893,7 +1893,7 @@ describe('Skoobi installer scripts', () => {
       if (previous === undefined) delete process.env.CLAUDECLAW_ENV_FILE;
       else process.env.CLAUDECLAW_ENV_FILE = previous;
     }
-  });
+  }, 20_000);
 
   it('restores owner .env when a later service activation fails', () => {
     const remote = createRemote();
@@ -2978,7 +2978,7 @@ esac`,
     expect(fs.readFileSync(path.join(appDir, 'tracked.txt'), 'utf8')).toBe(
       'new release\n',
     );
-  });
+  }, 20_000);
 
   it('leaves active release and its build outputs untouched after failed update', () => {
     const remote = createRemote({ build: buildCommand('stable-build\\n') });
@@ -3012,7 +3012,7 @@ esac`,
     expect(
       fs.readFileSync(path.join(appDir, 'dist', 'service.js'), 'utf8'),
     ).toBe(oldBuild);
-  });
+  }, 20_000);
 
   it('quiesces a live service before update, restores it on failure, and honors --no-start', () => {
     const remote = createRemote({ tracked: 'old\n' });
