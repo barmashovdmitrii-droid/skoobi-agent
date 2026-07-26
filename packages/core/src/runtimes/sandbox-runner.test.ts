@@ -185,8 +185,13 @@ describe('ensureSandboxRuntimeAvailable', () => {
     mockExecFileSync.mockReturnValueOnce('1.0.0');
     ensureSandboxRuntimeAvailable();
     expect(mockExecFileSync).toHaveBeenCalledWith(
-      'npx',
-      ['@anthropic-ai/sandbox-runtime', '--version'],
+      process.execPath,
+      [
+        expect.stringMatching(
+          /node_modules[/\\]@anthropic-ai[/\\]sandbox-runtime[/\\]dist[/\\]cli\.js$/,
+        ),
+        '--version',
+      ],
       expect.any(Object),
     );
   });

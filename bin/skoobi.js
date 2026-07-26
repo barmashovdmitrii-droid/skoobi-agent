@@ -26,7 +26,8 @@ Usage:
 
 Commands:
   status      Show service and path status
-  doctor      Check local requirements
+  doctor      Check runtime, Telegram, owner, and provider readiness
+  owner       Initialize the first Telegram owner
   logs        Print recent service logs
   start       Start the default instance service
   stop        Stop the default instance service
@@ -35,6 +36,10 @@ Commands:
   uninstall   Run scripts/uninstall.sh
   paths       Show app, instance, config, logs, and DB paths
   version     Show CLI version
+
+Owner setup:
+  skoobi owner init <numeric-id-or-tg:chat-id>
+  Send /chatid to the bot, copy the private chat ID, then run this command.
 
 Options:
   --prefix <path>      Install prefix (default: ~/.skoobi)
@@ -74,7 +79,8 @@ function parseArgs(argv) {
 }
 
 function pathsFor(opts) {
-  const prefix = opts.prefix.replace(/^~(?=$|\/)/, os.homedir());
+  const expandedPrefix = opts.prefix.replace(/^~(?=$|\/)/, os.homedir());
+  const prefix = path.resolve(expandedPrefix);
   const installedAppDir = path.join(prefix, 'app', 'skoobi-agent');
   const markerFile = path.join(prefix, '.skoobi-managed-install');
   const canonicalRepo =
@@ -140,6 +146,7 @@ function run(command, args, options = {}) {
     stdio: options.capture ? ['ignore', 'pipe', 'pipe'] : 'inherit',
     encoding: 'utf8',
     env: process.env,
+    timeout: options.timeout,
   });
   if (options.capture) return result;
   if (result.status !== 0) process.exit(result.status ?? 1);
@@ -213,31 +220,118 @@ function serviceAction(action, paths) {
   else run('systemctl', ['--user', 'status', unit, '--no-pager']);
 }
 
-function doctor(paths) {
+async function doctor(paths) {
+  let failures = 0;
   const checks = [
     ['node', ['--version']],
     ['npm', ['--version']],
     ['git', ['--version']],
     ['sqlite3', ['--version']],
     ['curl', ['--version']],
+    ['rg', ['--version']],
   ];
+  if (process.platform === 'linux') {
+    checks.push(['bwrap', ['--version']], ['socat', ['-V']]);
+  }
   for (const [cmd, args] of checks) {
-    const result = run(cmd, args, { capture: true });
+    const result = run(cmd, args, { capture: true, timeout: 5000 });
     const firstLine = (result.stdout || result.stderr || '').split(/\r?\n/)[0];
+    let ok = result.status === 0;
+    if (cmd === 'node' && ok) {
+      const major = Number(/^v?(\d+)/.exec(firstLine)?.[1] || 0);
+      ok = major >= 22;
+    }
+    if (!ok) failures += 1;
+    console.log(`${cmd}: ${ok ? 'ok' : 'problem'} ${firstLine}`.trimEnd());
+  }
+
+  let inspection;
+  try {
+    const { inspectTelegramOwner } = await import('./owner-bootstrap.js');
+    inspection = inspectTelegramOwner(paths);
     console.log(
-      `${cmd}: ${result.status === 0 ? 'ok' : 'missing'} ${firstLine}`,
+      `telegram token: ${inspection.tokenConfigured ? 'ok' : 'problem'}`,
+    );
+    console.log(
+      `telegram owner: ${inspection.ownerConfigured ? 'ok' : 'problem'}`,
+    );
+    if (!inspection.tokenConfigured || !inspection.ownerConfigured) {
+      failures += 1;
+    }
+  } catch (err) {
+    failures += 1;
+    console.log(
+      `telegram owner: problem (${err instanceof Error ? err.message : 'state unavailable'})`,
     );
   }
-  const codex = run('codex', ['--version'], { capture: true });
-  console.log(
-    `codex: ${codex.status === 0 ? 'ok' : 'optional-missing'} ${(codex.stdout || '').trim()}`,
-  );
-  const claude = run('claude', ['--version'], { capture: true });
-  console.log(
-    `claude: ${claude.status === 0 ? 'ok' : 'optional-missing'} ${(claude.stdout || claude.stderr || '').trim()}`,
-  );
+
+  const codexRequired =
+    inspection?.gatewayType === 'codex_subscription_cli' ||
+    inspection?.ownerCodexConfigured === true;
+  if (codexRequired) {
+    const codexCommand = inspection?.codexCommand || 'codex';
+    const codex = run(codexCommand, ['--version'], {
+      capture: true,
+      timeout: 5000,
+    });
+    const codexVersion = (codex.stdout || codex.stderr || '')
+      .split(/\r?\n/)[0]
+      .trim();
+    if (codex.status !== 0) {
+      failures += 1;
+      console.log('codex: problem');
+    } else {
+      console.log(`codex: ok ${codexVersion}`.trimEnd());
+      const login = run(codexCommand, ['login', 'status'], {
+        capture: true,
+        timeout: 10000,
+      });
+      const authenticated = login.status === 0;
+      if (!authenticated) failures += 1;
+      console.log(`codex login: ${authenticated ? 'ok' : 'problem'}`);
+    }
+    const routeReady = inspection?.ownerCodexConfigured === true;
+    if (!routeReady) failures += 1;
+    console.log(`owner Codex route: ${routeReady ? 'ok' : 'problem'}`);
+  } else if (inspection?.gatewayType === 'openai_compatible') {
+    const configured = inspection.gatewayKeyConfigured === true;
+    if (!configured) failures += 1;
+    console.log(
+      `openai-compatible provider key: ${configured ? 'ok' : 'problem'}`,
+    );
+  } else if (inspection?.gatewayType === 'disabled') {
+    if (inspection.anthropicAuthConfigured === true) {
+      console.log('claude credentials: ok');
+    } else {
+      const claude = run('claude', ['--version'], {
+        capture: true,
+        timeout: 5000,
+      });
+      const claudeVersion = (claude.stdout || claude.stderr || '')
+        .split(/\r?\n/)[0]
+        .trim();
+      if (claude.status !== 0) {
+        failures += 1;
+        console.log('claude: problem');
+      } else {
+        console.log(`claude: ok ${claudeVersion}`.trimEnd());
+        const auth = run('claude', ['auth', 'status'], {
+          capture: true,
+          timeout: 10000,
+        });
+        const authenticated = auth.status === 0;
+        if (!authenticated) failures += 1;
+        console.log(`claude auth: ${authenticated ? 'ok' : 'problem'}`);
+      }
+    }
+  } else if (inspection) {
+    failures += 1;
+    console.log('provider: problem (unsupported gateway type)');
+  }
   console.log(`appDir: ${paths.appDir}`);
   console.log(`instanceDir: ${paths.instanceDir}`);
+  console.log(`overall: ${failures === 0 ? 'ready' : 'needs attention'}`);
+  if (failures > 0) process.exitCode = 1;
 }
 
 function logs(paths) {
@@ -375,8 +469,23 @@ try {
       serviceAction('status', paths);
       break;
     case 'doctor':
-      doctor(paths);
+      await doctor(paths);
       break;
+    case 'owner': {
+      if (opts.passthrough.length !== 2 || opts.passthrough[0] !== 'init') {
+        throw new Error('Usage: skoobi owner init <numeric-id-or-tg:chat-id>');
+      }
+      const { initializeTelegramOwner } = await import('./owner-bootstrap.js');
+      const result = initializeTelegramOwner(paths, opts.passthrough[1]);
+      console.log(
+        result.created
+          ? 'Telegram owner initialized.'
+          : 'Telegram owner was already initialized.',
+      );
+      console.log(`Registration: ${result.jid}`);
+      console.log('Run: skoobi restart');
+      break;
+    }
     case 'logs':
       logs(paths);
       break;

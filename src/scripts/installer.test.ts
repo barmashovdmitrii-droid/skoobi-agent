@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readEnvFile } from '@skoobi/shared/env';
+import Database from 'better-sqlite3';
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -37,11 +38,12 @@ function run(
 function runResult(
   command: string,
   args: string[],
-  options: { env?: NodeJS.ProcessEnv; cwd?: string } = {},
+  options: { env?: NodeJS.ProcessEnv; cwd?: string; input?: string } = {},
 ) {
   return spawnSync(command, args, {
     cwd: options.cwd ?? repoRoot,
     encoding: 'utf8',
+    input: options.input,
     env: {
       ...process.env,
       PATH: `/opt/homebrew/opt/node@22/bin:${process.env.PATH || ''}`,
@@ -240,11 +242,130 @@ function makeFakeCommands(commands: Record<string, string>): {
   fs.mkdirSync(bin);
   for (const [name, body] of Object.entries(commands)) {
     const file = path.join(bin, name);
-    fs.writeFileSync(file, `#!/usr/bin/env bash\nset -eu\n${body}\n`, {
+    fs.writeFileSync(file, `#!/bin/bash\nset -eu\n${body}\n`, {
       mode: 0o755,
     });
   }
   return { bin, log };
+}
+
+function createOwnerCliState(
+  options: {
+    token?: string;
+    ownerIds?: string;
+    chatIds?: string;
+    mainJid?: string;
+  } = {},
+) {
+  const prefix = tempDir('skoobi-owner-cli-');
+  const instance = 'default';
+  const instanceDir = path.join(prefix, 'instances', instance);
+  const storeDir = path.join(instanceDir, 'store');
+  const groupsDir = path.join(instanceDir, 'groups');
+  for (const dir of [
+    prefix,
+    path.join(prefix, 'instances'),
+    instanceDir,
+    storeDir,
+    groupsDir,
+  ]) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dir, 0o700);
+  }
+  const envFile = path.join(instanceDir, '.env');
+  fs.writeFileSync(
+    envFile,
+    [
+      `TELEGRAM_BOT_TOKEN="${options.token ?? 'test-only-token'}"`,
+      'SKOOBI_TELEGRAM_BOT_ID="telegram_default"',
+      `OWNER_TELEGRAM_USER_IDS="${options.ownerIds ?? ''}"`,
+      ...(options.chatIds === undefined
+        ? []
+        : [`OWNER_TELEGRAM_CHAT_IDS="${options.chatIds}"`]),
+      'SKOOBI_MODEL_GATEWAY_TYPE="codex_subscription_cli"',
+      'SKOOBI_CODEX_SUBSCRIPTION_ENABLED="true"',
+      'SKOOBI_TELEGRAM_OWNER_LIVE_ENABLED="true"',
+      'SKOOBI_CODEX_OWNER_FULL_AGENT_ENABLED="true"',
+      'SKOOBI_CODEX_OWNER_FULL_AGENT_MODE="always"',
+      'SKOOBI_SCHEDULED_TASKS_CODEX_PRIMARY="true"',
+      '',
+    ].join('\n'),
+    { mode: 0o600 },
+  );
+  fs.chmodSync(envFile, 0o600);
+  const dbFile = path.join(storeDir, 'messages.db');
+  const db = new Database(dbFile);
+  db.exec(`
+    CREATE TABLE registered_groups (
+      jid TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      folder TEXT NOT NULL UNIQUE,
+      trigger_pattern TEXT NOT NULL,
+      added_at TEXT NOT NULL,
+      container_config TEXT,
+      requires_trigger INTEGER DEFAULT 1,
+      is_main INTEGER DEFAULT 0,
+      agent_config TEXT,
+      runtime TEXT
+    )
+  `);
+  if (options.mainJid) {
+    db.prepare(
+      `INSERT INTO registered_groups
+         (jid, name, folder, trigger_pattern, added_at, requires_trigger, is_main, runtime)
+       VALUES (?, 'Existing', 'telegram_main', '@Skoobi', ?, 0, 1, 'sandbox')`,
+    ).run(options.mainJid, '2026-01-01T00:00:00.000Z');
+  }
+  db.close();
+  fs.chmodSync(dbFile, 0o600);
+  return { prefix, instance, instanceDir, envFile, dbFile, groupsDir };
+}
+
+function runOwnerCli(
+  state: ReturnType<typeof createOwnerCliState>,
+  ownerArgument: string,
+  extraArgs: string[] = [],
+) {
+  return runResult(
+    process.execPath,
+    [
+      'bin/skoobi.js',
+      'owner',
+      'init',
+      ownerArgument,
+      '--prefix',
+      state.prefix,
+      '--instance',
+      state.instance,
+      ...extraArgs,
+    ],
+    { env: { ...process.env, HOME: tempDir('skoobi-owner-home-') } },
+  );
+}
+
+function ownerRows(dbFile: string): Array<{
+  jid: string;
+  name: string;
+  folder: string;
+  trigger_pattern: string;
+  added_at: string;
+  requires_trigger: number;
+  is_main: number;
+  runtime: string;
+}> {
+  const db = new Database(dbFile, { readonly: true });
+  try {
+    return db
+      .prepare(
+        `SELECT jid, name, folder, trigger_pattern, added_at,
+                requires_trigger, is_main, runtime
+         FROM registered_groups
+         ORDER BY jid`,
+      )
+      .all() as ReturnType<typeof ownerRows>;
+  } finally {
+    db.close();
+  }
 }
 
 describe('Skoobi installer scripts', () => {
@@ -267,6 +388,496 @@ describe('Skoobi installer scripts', () => {
     );
     expect(run('node', ['bin/skoobi.js', '--version']).trim()).toBe(
       `skoobi ${packageVersion}`,
+    );
+  });
+
+  it('keeps every active public environment key unique', () => {
+    const overlayTemplate = path.join(
+      repoRoot,
+      'public-release',
+      'overlay',
+      '.env.example',
+    );
+    const template = fs.readFileSync(
+      fs.existsSync(overlayTemplate)
+        ? overlayTemplate
+        : path.join(repoRoot, '.env.example'),
+      'utf8',
+    );
+    const counts = new Map<string, number>();
+    for (const line of template.split(/\r?\n/)) {
+      const match = line.match(/^[ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*=/);
+      if (!match) continue;
+      counts.set(match[1], (counts.get(match[1]) ?? 0) + 1);
+    }
+    expect([...counts.entries()].filter(([, count]) => count !== 1)).toEqual(
+      [],
+    );
+  });
+
+  it('initializes one fail-closed Telegram owner and retries idempotently', () => {
+    const state = createOwnerCliState();
+    const first = runOwnerCli(state, 'tg:123456789');
+    expect(first.status).toBe(0);
+    expect(first.stdout).toContain('Telegram owner initialized.');
+    expect(first.stdout).toContain('Run: skoobi restart');
+    expect(`${first.stdout}${first.stderr}`).not.toContain('test-only-token');
+
+    const rowsAfterFirst = ownerRows(state.dbFile);
+    expect(rowsAfterFirst).toHaveLength(1);
+    expect(rowsAfterFirst[0]).toMatchObject({
+      jid: 'tg:123456789',
+      name: 'Owner',
+      folder: 'telegram_main',
+      trigger_pattern: '@Skoobi',
+      requires_trigger: 0,
+      is_main: 1,
+      runtime: 'sandbox',
+    });
+    const envAfterFirst = fs.readFileSync(state.envFile, 'utf8');
+    expect(envAfterFirst).toContain('OWNER_TELEGRAM_USER_IDS="123456789"');
+    expect(fs.statSync(state.envFile).mode & 0o777).toBe(0o600);
+    for (const dir of [
+      path.join(state.groupsDir, 'telegram_main'),
+      path.join(state.groupsDir, 'telegram_main', 'logs'),
+    ]) {
+      expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
+    }
+
+    const second = runOwnerCli(state, '123456789');
+    expect(second.status).toBe(0);
+    expect(second.stdout).toContain('was already initialized');
+    expect(ownerRows(state.dbFile)).toEqual(rowsAfterFirst);
+    expect(fs.readFileSync(state.envFile, 'utf8')).toBe(envAfterFirst);
+  });
+
+  it('refuses conflicting owner, JID, folder, and allowlist state without replacement', () => {
+    const differentMain = createOwnerCliState({
+      mainJid: 'tg:987654321',
+    });
+    const mainEnv = fs.readFileSync(differentMain.envFile, 'utf8');
+    const mainRows = ownerRows(differentMain.dbFile);
+    const mainResult = runOwnerCli(differentMain, '123456789');
+    expect(mainResult.status).not.toBe(0);
+    expect(mainResult.stderr).toContain('refusing to replace');
+    expect(ownerRows(differentMain.dbFile)).toEqual(mainRows);
+    expect(fs.readFileSync(differentMain.envFile, 'utf8')).toBe(mainEnv);
+    expect(
+      fs.existsSync(path.join(differentMain.groupsDir, 'telegram_main')),
+    ).toBe(false);
+
+    const existingGuest = createOwnerCliState();
+    const guestDb = new Database(existingGuest.dbFile);
+    guestDb
+      .prepare(
+        `INSERT INTO registered_groups
+           (jid, name, folder, trigger_pattern, added_at, requires_trigger, is_main, runtime)
+         VALUES ('tg:123456789', 'Guest', 'guest_one', '@Skoobi', ?, 0, 0, 'sandbox')`,
+      )
+      .run('2026-01-01T00:00:00.000Z');
+    guestDb.close();
+    const guestResult = runOwnerCli(existingGuest, '123456789');
+    expect(guestResult.status).not.toBe(0);
+    expect(guestResult.stderr).toContain('different registration');
+    expect(ownerRows(existingGuest.dbFile)).toHaveLength(1);
+
+    const otherAllowlist = createOwnerCliState({ ownerIds: '987654321' });
+    const allowlistEnv = fs.readFileSync(otherAllowlist.envFile, 'utf8');
+    const allowlistResult = runOwnerCli(otherAllowlist, '123456789');
+    expect(allowlistResult.status).not.toBe(0);
+    expect(allowlistResult.stderr).toContain(
+      'different owner allowlist already exists',
+    );
+    expect(ownerRows(otherAllowlist.dbFile)).toEqual([]);
+    expect(fs.readFileSync(otherAllowlist.envFile, 'utf8')).toBe(allowlistEnv);
+
+    const restrictedChat = createOwnerCliState({
+      chatIds: '-1001234567890',
+    });
+    const restrictedResult = runOwnerCli(restrictedChat, '123456789');
+    expect(restrictedResult.status).not.toBe(0);
+    expect(restrictedResult.stderr).toContain('chat allowlist excludes');
+    expect(restrictedResult.stderr).not.toContain('invalid');
+  });
+
+  it('refuses unsafe owner paths and a concurrent Skoobi operation', () => {
+    const locked = createOwnerCliState();
+    fs.mkdirSync(path.join(locked.prefix, '.skoobi-operation.lock'), {
+      mode: 0o700,
+    });
+    const lockedEnv = fs.readFileSync(locked.envFile, 'utf8');
+    const lockedResult = runOwnerCli(locked, '123456789');
+    expect(lockedResult.status).not.toBe(0);
+    expect(lockedResult.stderr).toContain('is in progress');
+    expect(ownerRows(locked.dbFile)).toEqual([]);
+    expect(fs.readFileSync(locked.envFile, 'utf8')).toBe(lockedEnv);
+
+    const symlinked = createOwnerCliState();
+    const outside = path.join(tempDir('skoobi-owner-outside-'), 'outside.env');
+    fs.writeFileSync(outside, 'KEEP=unchanged\n', { mode: 0o600 });
+    fs.unlinkSync(symlinked.envFile);
+    fs.symlinkSync(outside, symlinked.envFile);
+    const symlinkResult = runOwnerCli(symlinked, '123456789');
+    expect(symlinkResult.status).not.toBe(0);
+    expect(symlinkResult.stderr).toContain('single-link regular file');
+    expect(fs.readFileSync(outside, 'utf8')).toBe('KEEP=unchanged\n');
+    expect(ownerRows(symlinked.dbFile)).toEqual([]);
+    expect(
+      fs.existsSync(path.join(symlinked.prefix, '.skoobi-operation.lock')),
+    ).toBe(false);
+  });
+
+  it('rolls owner env changes back when the database insert aborts', () => {
+    const state = createOwnerCliState();
+    const before = fs.readFileSync(state.envFile, 'utf8');
+    const db = new Database(state.dbFile);
+    db.exec(`
+      CREATE TRIGGER reject_owner_insert
+      BEFORE INSERT ON registered_groups
+      BEGIN
+        SELECT RAISE(ABORT, 'test insert rejected');
+      END
+    `);
+    db.close();
+
+    const result = runOwnerCli(state, '123456789');
+    expect(result.status).not.toBe(0);
+    expect(ownerRows(state.dbFile)).toEqual([]);
+    expect(fs.readFileSync(state.envFile, 'utf8')).toBe(before);
+    expect(
+      fs.existsSync(path.join(state.prefix, '.skoobi-operation.lock')),
+    ).toBe(false);
+    expect(fs.existsSync(path.join(state.groupsDir, 'telegram_main'))).toBe(
+      false,
+    );
+
+    const existing = createOwnerCliState();
+    const ownerDir = path.join(existing.groupsDir, 'telegram_main');
+    const logsDir = path.join(ownerDir, 'logs');
+    fs.mkdirSync(logsDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(ownerDir, 0o750);
+    fs.chmodSync(logsDir, 0o710);
+    const existingDb = new Database(existing.dbFile);
+    existingDb.exec(`
+      CREATE TRIGGER reject_existing_owner_insert
+      BEFORE INSERT ON registered_groups
+      BEGIN
+        SELECT RAISE(ABORT, 'test existing insert rejected');
+      END
+    `);
+    existingDb.close();
+
+    const existingResult = runOwnerCli(existing, '123456789');
+    expect(existingResult.status).not.toBe(0);
+    expect(ownerRows(existing.dbFile)).toEqual([]);
+    expect(fs.statSync(ownerDir).mode & 0o777).toBe(0o750);
+    expect(fs.statSync(logsDir).mode & 0o777).toBe(0o710);
+  });
+
+  it('handles actual SQLite commit and rollback exceptions atomically', async () => {
+    const actual = (await vi.importActual('better-sqlite3')) as {
+      default: typeof Database;
+    };
+    const ActualDatabase = actual.default;
+    let fault: 'before-commit' | 'after-commit' = 'before-commit';
+    class FaultyDatabase extends ActualDatabase {
+      exec(source: string): this {
+        const statement = source.trim().toUpperCase();
+        if (fault === 'before-commit' && statement === 'COMMIT') {
+          throw new Error('simulated commit exception');
+        }
+        if (fault === 'before-commit' && statement === 'ROLLBACK') {
+          throw new Error('simulated rollback exception');
+        }
+        const result = super.exec(source);
+        if (fault === 'after-commit' && statement === 'COMMIT') {
+          throw new Error('simulated ambiguous post-commit exception');
+        }
+        return result;
+      }
+    }
+    vi.doMock('better-sqlite3', () => ({
+      ...actual,
+      default: FaultyDatabase,
+    }));
+    try {
+      const { initializeTelegramOwner } =
+        // @ts-expect-error JavaScript CLI modules intentionally have no TS declarations.
+        await import('../../bin/owner-bootstrap.js');
+
+      const failed = createOwnerCliState();
+      fs.chmodSync(failed.envFile, 0o400);
+      const before = fs.readFileSync(failed.envFile, 'utf8');
+      const beforeMode = fs.statSync(failed.envFile).mode & 0o777;
+      expect(() =>
+        initializeTelegramOwner(
+          {
+            prefix: failed.prefix,
+            instanceDir: failed.instanceDir,
+            envFile: failed.envFile,
+            dbFile: failed.dbFile,
+          },
+          '123456789',
+        ),
+      ).toThrow('simulated commit exception');
+      expect(ownerRows(failed.dbFile)).toEqual([]);
+      expect(fs.readFileSync(failed.envFile, 'utf8')).toBe(before);
+      expect(fs.statSync(failed.envFile).mode & 0o777).toBe(beforeMode);
+      expect(
+        fs.existsSync(path.join(failed.prefix, '.skoobi-operation.lock')),
+      ).toBe(false);
+      expect(fs.existsSync(path.join(failed.groupsDir, 'telegram_main'))).toBe(
+        false,
+      );
+
+      fault = 'after-commit';
+      const committed = createOwnerCliState();
+      const result = initializeTelegramOwner(
+        {
+          prefix: committed.prefix,
+          instanceDir: committed.instanceDir,
+          envFile: committed.envFile,
+          dbFile: committed.dbFile,
+        },
+        '123456789',
+      );
+      expect(result).toEqual({ created: true, jid: 'tg:123456789' });
+      expect(ownerRows(committed.dbFile)).toHaveLength(1);
+      expect(fs.readFileSync(committed.envFile, 'utf8')).toContain(
+        'OWNER_TELEGRAM_USER_IDS="123456789"',
+      );
+      expect(
+        fs.existsSync(path.join(committed.prefix, '.skoobi-operation.lock')),
+      ).toBe(false);
+    } finally {
+      vi.doUnmock('better-sqlite3');
+      vi.resetModules();
+    }
+  });
+
+  it('preserves an exact existing owner workspace while repairing its missing allowlist', () => {
+    const state = createOwnerCliState({ mainJid: 'tg:123456789' });
+    const ownerDir = path.join(state.groupsDir, 'telegram_main');
+    fs.mkdirSync(ownerDir, { mode: 0o700 });
+    const note = path.join(ownerDir, 'owner-note.txt');
+    fs.writeFileSync(note, 'preserve\n', { mode: 0o600 });
+    const rowsBefore = ownerRows(state.dbFile);
+
+    const result = runOwnerCli(state, 'tg:123456789');
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('was already initialized');
+    expect(ownerRows(state.dbFile)).toEqual(rowsBefore);
+    expect(fs.readFileSync(note, 'utf8')).toBe('preserve\n');
+    expect(fs.readFileSync(state.envFile, 'utf8')).toContain(
+      'OWNER_TELEGRAM_USER_IDS="123456789"',
+    );
+  });
+
+  it('doctor returns success only when runtime, owner, and Codex are ready', () => {
+    const state = createOwnerCliState({
+      ownerIds: '123456789',
+      mainJid: 'tg:123456789',
+    });
+    const fake = makeFakeCommands({
+      node: 'printf "v22.14.0\\n"',
+      npm: 'printf "10.0.0\\n"',
+      git: 'printf "git version 2.0.0\\n"',
+      sqlite3: 'printf "3.0.0\\n"',
+      curl: 'printf "curl 8.0.0\\n"',
+      rg: 'printf "ripgrep 14.0.0\\n"',
+      bwrap: 'printf "bubblewrap 0.10.0\\n"',
+      socat: 'printf "socat version 1.8.0\\n"',
+      codex:
+        '[[ "$*" == "login status" ]] && exit 0; printf "codex-cli test\\n"',
+    });
+    const result = runResult(
+      process.execPath,
+      [
+        'bin/skoobi.js',
+        'doctor',
+        '--prefix',
+        state.prefix,
+        '--instance',
+        state.instance,
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: tempDir('skoobi-doctor-home-'),
+          PATH: fake.bin,
+        },
+      },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('telegram token: ok');
+    expect(result.stdout).toContain('telegram owner: ok');
+    expect(result.stdout).toContain('codex login: ok');
+    expect(result.stdout).toContain('owner Codex route: ok');
+    expect(result.stdout).toContain('overall: ready');
+    expect(`${result.stdout}${result.stderr}`).not.toContain('test-only-token');
+  });
+
+  it('doctor fails on old Node, missing Telegram setup, or failed Codex login', () => {
+    const notReady = createOwnerCliState({ token: '' });
+    const fake = makeFakeCommands({
+      node: 'printf "v20.19.0\\n"',
+      npm: 'printf "10.0.0\\n"',
+      git: 'printf "git version 2.0.0\\n"',
+      sqlite3: 'printf "3.0.0\\n"',
+      curl: 'printf "curl 8.0.0\\n"',
+      rg: 'printf "ripgrep 14.0.0\\n"',
+      bwrap: 'printf "bubblewrap 0.10.0\\n"',
+      socat: 'printf "socat version 1.8.0\\n"',
+      codex:
+        '[[ "$*" == "login status" ]] && { printf "PRIVATE_ACCOUNT_DETAIL\\n" >&2; exit 1; }; printf "codex-cli test\\n"',
+    });
+    const result = runResult(
+      process.execPath,
+      [
+        'bin/skoobi.js',
+        'doctor',
+        '--prefix',
+        notReady.prefix,
+        '--instance',
+        notReady.instance,
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: tempDir('skoobi-doctor-home-'),
+          PATH: fake.bin,
+        },
+      },
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).toContain('node: problem');
+    expect(result.stdout).toContain('telegram token: problem');
+    expect(result.stdout).toContain('telegram owner: problem');
+    expect(result.stdout).toContain('codex login: problem');
+    expect(result.stdout).toContain('overall: needs attention');
+    expect(`${result.stdout}${result.stderr}`).not.toContain(
+      'PRIVATE_ACCOUNT_DETAIL',
+    );
+  });
+
+  it('doctor fails closed for incomplete non-Codex providers', () => {
+    const baseCommands = {
+      node: 'printf "v22.14.0\\n"',
+      npm: 'printf "10.0.0\\n"',
+      git: 'printf "git version 2.0.0\\n"',
+      sqlite3: 'printf "3.0.0\\n"',
+      curl: 'printf "curl 8.0.0\\n"',
+      rg: 'printf "ripgrep 14.0.0\\n"',
+      bwrap: 'printf "bubblewrap 0.10.0\\n"',
+      socat: 'printf "socat version 1.8.0\\n"',
+    };
+    const openai = createOwnerCliState({
+      ownerIds: '123456789',
+      mainJid: 'tg:123456789',
+    });
+    fs.writeFileSync(
+      openai.envFile,
+      fs
+        .readFileSync(openai.envFile, 'utf8')
+        .replace(
+          'SKOOBI_MODEL_GATEWAY_TYPE="codex_subscription_cli"',
+          'SKOOBI_MODEL_GATEWAY_TYPE="openai_compatible"',
+        ),
+      { mode: 0o600 },
+    );
+    const openaiFake = makeFakeCommands(baseCommands);
+    const openaiResult = runResult(
+      process.execPath,
+      [
+        'bin/skoobi.js',
+        'doctor',
+        '--prefix',
+        openai.prefix,
+        '--instance',
+        openai.instance,
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: tempDir('skoobi-doctor-home-'),
+          PATH: openaiFake.bin,
+        },
+      },
+    );
+    expect(openaiResult.status).not.toBe(0);
+    expect(openaiResult.stdout).toContain(
+      'openai-compatible provider key: problem',
+    );
+    expect(openaiResult.stdout).toContain('overall: needs attention');
+    fs.appendFileSync(
+      openai.envFile,
+      'SKOOBI_MODEL_GATEWAY_KEY="test-only-openai-key"\n',
+    );
+    const openaiReady = runResult(
+      process.execPath,
+      [
+        'bin/skoobi.js',
+        'doctor',
+        '--prefix',
+        openai.prefix,
+        '--instance',
+        openai.instance,
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: tempDir('skoobi-doctor-home-'),
+          PATH: openaiFake.bin,
+        },
+      },
+    );
+    expect(openaiReady.status).toBe(0);
+    expect(openaiReady.stdout).toContain('openai-compatible provider key: ok');
+    expect(`${openaiReady.stdout}${openaiReady.stderr}`).not.toContain(
+      'test-only-openai-key',
+    );
+
+    const claude = createOwnerCliState({
+      ownerIds: '123456789',
+      mainJid: 'tg:123456789',
+    });
+    fs.writeFileSync(
+      claude.envFile,
+      fs
+        .readFileSync(claude.envFile, 'utf8')
+        .replace(
+          'SKOOBI_MODEL_GATEWAY_TYPE="codex_subscription_cli"',
+          'SKOOBI_MODEL_GATEWAY_TYPE="disabled"',
+        ),
+      { mode: 0o600 },
+    );
+    const claudeFake = makeFakeCommands({
+      ...baseCommands,
+      claude:
+        '[[ "$*" == "--version" ]] && { printf "claude test\\n"; exit 0; }; [[ "$*" == "auth status" ]] && { printf "PRIVATE_CLAUDE_AUTH\\n" >&2; exit 1; }; exit 2',
+    });
+    const claudeResult = runResult(
+      process.execPath,
+      [
+        'bin/skoobi.js',
+        'doctor',
+        '--prefix',
+        claude.prefix,
+        '--instance',
+        claude.instance,
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: tempDir('skoobi-doctor-home-'),
+          PATH: claudeFake.bin,
+        },
+      },
+    );
+    expect(claudeResult.status).not.toBe(0);
+    expect(claudeResult.stdout).toContain('claude auth: problem');
+    expect(`${claudeResult.stdout}${claudeResult.stderr}`).not.toContain(
+      'PRIVATE_CLAUDE_AUTH',
     );
   });
 
@@ -381,6 +992,235 @@ describe('Skoobi installer scripts', () => {
     expect(out).not.toContain(gateway);
     expect(out).not.toContain(gatewayUrlSecret);
     expect(fs.existsSync(path.join(prefix, 'app'))).toBe(false);
+  });
+
+  it('prompts for a token when copied configuration contains an empty key', () => {
+    const prefix = tempDir();
+    const home = tempDir();
+    const instanceDir = path.join(prefix, 'instances', 'prompt-token');
+    fs.mkdirSync(instanceDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      path.join(instanceDir, '.env'),
+      'TELEGRAM_BOT_TOKEN=\nOWNER_TELEGRAM_USER_IDS=\n',
+      { mode: 0o600 },
+    );
+    const result = runResult(
+      'bash',
+      [
+        'scripts/install.sh',
+        '--dry-run',
+        '--reconfigure',
+        '--prefix',
+        prefix,
+        '--instance',
+        'prompt-token',
+        '--no-service',
+        '--no-start',
+      ],
+      {
+        env: {
+          HOME: home,
+          SKOOBI_INSTALLER_SKIP_REQUIREMENTS: '1',
+          SKOOBI_ASSISTANT_NAME: 'Skoobi',
+        },
+        input: 'test-only-prompt-token\n',
+      },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('TELEGRAM_BOT_TOKEN=<redacted>');
+    expect(`${result.stdout}${result.stderr}`).not.toContain(
+      'test-only-prompt-token',
+    );
+    expect(fs.readFileSync(path.join(instanceDir, '.env'), 'utf8')).toBe(
+      'TELEGRAM_BOT_TOKEN=\nOWNER_TELEGRAM_USER_IDS=\n',
+    );
+  });
+
+  it('configures Codex for owner-only full-agent turns and clears it for other providers', () => {
+    const remote = createRemote();
+    const prefix = tempDir();
+    const home = tempDir();
+    installFixture(remote, prefix, 'provider-route', home, [], {
+      SKOOBI_TELEGRAM_BOT_TOKEN: 'test-only-provider-token',
+    });
+    const envFile = path.join(prefix, 'instances', 'provider-route', '.env');
+    let content = fs.readFileSync(envFile, 'utf8');
+    expect(content).toContain('SKOOBI_TELEGRAM_OWNER_LIVE_ENABLED="true"');
+    expect(content).toContain('SKOOBI_CODEX_OWNER_FULL_AGENT_ENABLED="true"');
+    expect(content).toContain('SKOOBI_CODEX_OWNER_FULL_AGENT_MODE="always"');
+    expect(content).toContain('SKOOBI_SANDBOX_CODEX_PRIMARY="false"');
+    expect(content).toContain('SKOOBI_SCHEDULED_TASKS_CODEX_PRIMARY="true"');
+    expect(content).toContain('SKOOBI_TELEGRAM_GUEST_LIVE_ENABLED="false"');
+
+    installFixture(remote, prefix, 'provider-route', home, ['--reconfigure'], {
+      SKOOBI_INSTALL_PROVIDER: 'openai',
+      SKOOBI_MODEL_GATEWAY_KEY: 'test-only-gateway-key',
+    });
+    content = fs.readFileSync(envFile, 'utf8');
+    expect(content).toContain('SKOOBI_TELEGRAM_OWNER_LIVE_ENABLED="true"');
+    expect(content).toContain('SKOOBI_CODEX_OWNER_FULL_AGENT_ENABLED="false"');
+    expect(content).toContain('SKOOBI_CODEX_OWNER_FULL_AGENT_MODE="auto"');
+    expect(content).toContain('SKOOBI_SANDBOX_CODEX_PRIMARY="false"');
+    expect(content).toContain('SKOOBI_SCHEDULED_TASKS_CODEX_PRIMARY="false"');
+
+    installFixture(remote, prefix, 'provider-route', home, ['--reconfigure'], {
+      SKOOBI_INSTALL_PROVIDER: 'claude',
+    });
+    content = fs.readFileSync(envFile, 'utf8');
+    expect(content).toContain('SKOOBI_TELEGRAM_OWNER_LIVE_ENABLED="false"');
+    expect(content).toContain('SKOOBI_CODEX_OWNER_FULL_AGENT_ENABLED="false"');
+    expect(content).toContain('SKOOBI_CODEX_OWNER_FULL_AGENT_MODE="auto"');
+    expect(content).toContain('SKOOBI_SCHEDULED_TASKS_CODEX_PRIMARY="false"');
+  });
+
+  it('does not require Codex when a normal rerun preserves another provider', () => {
+    const prefix = tempDir();
+    const home = tempDir();
+    const instanceDir = path.join(prefix, 'instances', 'preserved-openai');
+    fs.mkdirSync(instanceDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      path.join(instanceDir, '.env'),
+      'SKOOBI_MODEL_GATEWAY_TYPE="openai_compatible"\n',
+      { mode: 0o600 },
+    );
+    const fake = makeFakeCommands({
+      uname: 'printf "Darwin\\n"',
+      curl: 'exit 0',
+      git: 'exit 0',
+      npm: 'exit 0',
+      node: 'printf "22\\n"',
+      sqlite3: 'exit 0',
+      rg: 'exit 0',
+    });
+    const result = runResult(
+      '/bin/bash',
+      [
+        'scripts/install.sh',
+        '--dry-run',
+        '--yes',
+        '--prefix',
+        prefix,
+        '--instance',
+        'preserved-openai',
+        '--no-service',
+        '--no-start',
+      ],
+      {
+        env: {
+          HOME: home,
+          PATH: `${fake.bin}:/usr/bin:/bin`,
+        },
+      },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(
+      'Existing non-Codex provider configuration will be preserved.',
+    );
+    expect(`${result.stdout}${result.stderr}`).not.toContain(
+      'codex is required',
+    );
+  });
+
+  it('uses a preserved pinned Codex executable when the shell PATH omits codex', () => {
+    const prefix = tempDir();
+    const home = tempDir();
+    const calls = path.join(home, 'pinned-codex-calls.log');
+    const fake = makeFakeCommands({
+      uname: 'printf "Darwin\\n"',
+      curl: 'exit 0',
+      git: 'exit 0',
+      npm: 'exit 0',
+      node: 'printf "22\\n"',
+      sqlite3: 'exit 0',
+      rg: 'exit 0',
+      'pinned-codex': `printf '%s\\n' "$*" >> ${JSON.stringify(calls)}`,
+    });
+    const instanceDir = path.join(prefix, 'instances', 'preserved-codex');
+    fs.mkdirSync(instanceDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      path.join(instanceDir, '.env'),
+      [
+        'SKOOBI_MODEL_GATEWAY_TYPE=codex_subscription_cli # preserved',
+        `SKOOBI_CODEX_COMMAND="${path.join(fake.bin, 'pinned-codex')}"`,
+        '',
+      ].join('\n'),
+      { mode: 0o600 },
+    );
+
+    const result = runResult(
+      '/bin/bash',
+      [
+        'scripts/install.sh',
+        '--dry-run',
+        '--yes',
+        '--prefix',
+        prefix,
+        '--instance',
+        'preserved-codex',
+        '--no-service',
+        '--no-start',
+      ],
+      {
+        env: {
+          HOME: home,
+          PATH: `${fake.bin}:/usr/bin:/bin`,
+        },
+      },
+    );
+    expect(result.status).toBe(0);
+    expect(fs.readFileSync(calls, 'utf8')).toBe('login status\n');
+    expect(`${result.stdout}${result.stderr}`).not.toContain(
+      'codex is required',
+    );
+  });
+
+  it('fails requirement checks when sandbox dependencies are absent', () => {
+    const mac = makeFakeCommands({
+      uname: 'printf "Darwin\\n"',
+      curl: 'exit 0',
+      git: 'exit 0',
+      npm: 'exit 0',
+      node: 'printf "22\\n"',
+      sqlite3: 'exit 0',
+      codex: 'exit 0',
+    });
+    const missingRg = runResult(
+      '/bin/bash',
+      [
+        'scripts/install.sh',
+        '--dry-run',
+        '--yes',
+        '--no-service',
+        '--no-start',
+      ],
+      { env: { HOME: tempDir(), PATH: mac.bin } },
+    );
+    expect(missingRg.status).not.toBe(0);
+    expect(missingRg.stderr).toContain('rg is required');
+
+    const linux = makeFakeCommands({
+      uname: 'printf "Linux\\n"',
+      curl: 'exit 0',
+      git: 'exit 0',
+      npm: 'exit 0',
+      node: 'printf "22\\n"',
+      sqlite3: 'exit 0',
+      rg: 'exit 0',
+      codex: 'exit 0',
+    });
+    const missingBwrap = runResult(
+      '/bin/bash',
+      [
+        'scripts/install.sh',
+        '--dry-run',
+        '--yes',
+        '--no-service',
+        '--no-start',
+      ],
+      { env: { HOME: tempDir(), PATH: linux.bin } },
+    );
+    expect(missingBwrap.status).not.toBe(0);
+    expect(missingBwrap.stderr).toContain('bwrap is required');
   });
 
   it('does not pass bot or gateway secrets into install build subprocesses', () => {
@@ -971,6 +1811,9 @@ describe('Skoobi installer scripts', () => {
     ]) {
       expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
     }
+    expect(
+      fs.lstatSync(path.join(home, '.local', 'bin', 'skoobi')).isSymbolicLink(),
+    ).toBe(true);
     const linux = run('bash', [
       'scripts/install.sh',
       '--print-service',
@@ -985,6 +1828,10 @@ describe('Skoobi installer scripts', () => {
     expect(linux).toContain(
       'Environment="SKOOBI_SERVICE_LABEL=com.skoobi.svc"',
     );
+    expect(linux).toContain(
+      `Environment="PATH=${path.dirname(process.execPath)}:`,
+    );
+    expect(linux).toContain('/usr/local/opt/node@22/bin');
     const mac = run('bash', [
       'scripts/install.sh',
       '--print-service',
@@ -998,6 +1845,10 @@ describe('Skoobi installer scripts', () => {
     expect(mac).toContain('<integer>63</integer>');
     expect(mac).toContain('<key>SKOOBI_SERVICE_LABEL</key>');
     expect(mac).toContain('<string>com.skoobi.svc</string>');
+    expect(mac).toContain(
+      `<string>${path.dirname(process.execPath)}:/opt/homebrew/opt/node@22/bin`,
+    );
+    expect(mac).toContain('/usr/local/opt/node@22/bin');
   });
 
   it('rolls a reinstall back when the staged build fails', () => {

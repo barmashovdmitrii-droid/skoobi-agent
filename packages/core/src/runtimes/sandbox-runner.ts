@@ -894,9 +894,25 @@ export function isClaudeclawSandboxProcess(
 /**
  * Verify that sandbox-runtime is available.
  */
+function sandboxRuntimeCliPath(): string {
+  return path.join(
+    CODE_ROOT,
+    'node_modules',
+    '@anthropic-ai',
+    'sandbox-runtime',
+    'dist',
+    'cli.js',
+  );
+}
+
 export function ensureSandboxRuntimeAvailable(): void {
   try {
-    execFileSync('npx', ['@anthropic-ai/sandbox-runtime', '--version'], {
+    const cliPath = sandboxRuntimeCliPath();
+    const stat = fs.lstatSync(cliPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error('sandbox-runtime CLI is not a regular installed file');
+    }
+    execFileSync(process.execPath, [cliPath, '--version'], {
       stdio: 'pipe',
       timeout: 30000,
     });
@@ -913,7 +929,7 @@ export function ensureSandboxRuntimeAvailable(): void {
       '║                                                                ║',
     );
     console.error(
-      '║  Install: npm install @anthropic-ai/sandbox-runtime            ║',
+      '║  Repair: run npm ci in the installed Skoobi app                ║',
     );
     console.error(
       '╚════════════════════════════════════════════════════════════════╝\n',
@@ -1714,14 +1730,7 @@ export function buildSandboxArgs(settingsPath: string): string[] {
   // owner-controlled guest sandbox-exec shim from PATH[0], so the shim
   // correctly fails closed. Direct Node execution preserves the exact PATH
   // assembled by runSandboxAgent and cannot resolve/download another package.
-  const sandboxRuntimeCliPath = path.join(
-    CODE_ROOT,
-    'node_modules',
-    '@anthropic-ai',
-    'sandbox-runtime',
-    'dist',
-    'cli.js',
-  );
+  const cliPath = sandboxRuntimeCliPath();
   // Sandbox runs the pre-compiled agent-runner directly on the host. The agent
   // runner lives in the CODE root, not the data/state root.
   const agentRunnerPath = path.join(
@@ -1734,7 +1743,7 @@ export function buildSandboxArgs(settingsPath: string): string[] {
 
   return [
     process.execPath,
-    sandboxRuntimeCliPath,
+    cliPath,
     '--settings',
     settingsPath,
     '--',

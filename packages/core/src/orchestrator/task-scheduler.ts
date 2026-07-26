@@ -538,10 +538,13 @@ export async function runTask(
   let codexReserveFallbackDelivered = false;
 
   // Codex-primary scheduled tasks: same full sandbox agent, Codex CLI backend.
-  // Sandbox runtime only — the container runtime has no codex provider support
-  // (mirrors the guard in message-loop's runAgent).
+  // This route is restricted to host-proven owner-created tasks in main:
+  // unproven/guest rows must not gain a more capable provider merely because
+  // the process-wide switch is enabled. The container runtime has no codex
+  // provider support (mirrors the guard in message-loop's runAgent).
   const runtime = group.runtime || DEFAULT_RUNTIME;
-  const codexPrimary = isScheduledTasksCodexPrimary() && runtime === 'sandbox';
+  const codexPrimary =
+    isScheduledTasksCodexPrimary() && runtime === 'sandbox' && ownerAuthorized;
 
   // For group context mode, use the group's current session — but first run the
   // same transcript-size guard as the message loop: a group whose only traffic

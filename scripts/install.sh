@@ -6,7 +6,7 @@ CANONICAL_REPO="https://github.com/barmashovdmitrii-droid/skoobi-agent.git"
 REF_DEFAULT="main"
 EXPECTED_COMMIT_DEFAULT=""
 APP_NAME="skoobi-agent"
-VERSION="2.0.0-rc.1"
+VERSION="2.0.0-rc.2"
 
 PREFIX="${SKOOBI_PREFIX:-$HOME/.skoobi}"
 INSTANCE="default"
@@ -310,7 +310,7 @@ node_major() {
 }
 
 node_bin() {
-  command -v node
+  node -p 'process.execPath'
 }
 
 xml_escape() {
@@ -332,7 +332,11 @@ systemd_escape() {
 }
 
 launchd_plist() {
-  local node_path="$1"
+  local node_path="$1" node_dir
+  case "$node_path" in
+    *$'\n'*|*$'\r'*|*:*) die "Node executable path is unsafe for service PATH" ;;
+  esac
+  node_dir="$(dirname "$node_path")"
   cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -356,7 +360,7 @@ launchd_plist() {
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$(xml_escape "$HOME")/.local/bin</string>
+    <string>$(xml_escape "$node_dir"):/opt/homebrew/opt/node@22/bin:/usr/local/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$(xml_escape "$HOME")/.local/bin</string>
     <key>HOME</key>
     <string>$(xml_escape "$HOME")</string>
     <key>SKOOBI_SERVICE_LABEL</key>
@@ -372,7 +376,11 @@ EOF
 }
 
 systemd_unit() {
-  local node_path="$1"
+  local node_path="$1" node_dir
+  case "$node_path" in
+    *$'\n'*|*$'\r'*|*:*) die "Node executable path is unsafe for service PATH" ;;
+  esac
+  node_dir="$(dirname "$node_path")"
   cat <<EOF
 [Unit]
 Description=Skoobi ($INSTANCE)
@@ -386,7 +394,7 @@ Restart=always
 RestartSec=5
 UMask=0077
 Environment="HOME=$(systemd_escape "$HOME")"
-Environment="PATH=/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$(systemd_escape "$HOME")/.local/bin"
+Environment="PATH=$(systemd_escape "$node_dir"):/opt/homebrew/opt/node@22/bin:/usr/local/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$(systemd_escape "$HOME")/.local/bin"
 Environment="SKOOBI_SERVICE_LABEL=$(systemd_escape "$SERVICE_LABEL")"
 
 [Install]
@@ -396,9 +404,9 @@ EOF
 
 if [[ -n "$PRINT_SERVICE" ]]; then
   if [[ "$PRINT_SERVICE" == "macos" ]]; then
-    launchd_plist "$(command -v node || printf '/usr/bin/node')"
+    launchd_plist "$(node_bin || printf '/usr/bin/node')"
   else
-    systemd_unit "$(command -v node || printf '/usr/bin/node')"
+    systemd_unit "$(node_bin || printf '/usr/bin/node')"
   fi
   exit 0
 fi
@@ -570,9 +578,14 @@ check_requirements() {
   require_command npm
   require_command node
   require_command sqlite3
+  require_command rg
   major="$(node_major)"
   [[ "$major" -ge 22 ]] ||
     die "Node.js >= 22 is required"
+  if [[ "$os_name" == "linux" ]]; then
+    require_command bwrap
+    require_command socat
+  fi
   if [[ "$NO_SERVICE" == "0" ]]; then
     if [[ "$os_name" == "macos" ]]; then
       require_command launchctl
@@ -580,6 +593,101 @@ check_requirements() {
       require_command systemctl
     fi
   fi
+}
+
+env_value_for_key() {
+  local key="$1" line value="" trimmed="" found=0
+  [[ -f "$ENV_FILE" ]] || {
+    printf ''
+    return 0
+  }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*${key}= ]] || continue
+    [[ "$found" == "0" ]] ||
+      die "Instance .env contains duplicate $key entries"
+    found=1
+    value="${line#*=}"
+  done <"$ENV_FILE"
+  [[ "$found" == "1" ]] || {
+    printf ''
+    return 0
+  }
+  trimmed="${value#"${value%%[![:space:]]*}"}"
+  trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+  if [[ "$trimmed" == \"* ]]; then
+    trimmed="${trimmed#\"}"
+    [[ "$trimmed" == *\"* ]] ||
+      die "Instance .env contains malformed $key"
+    trimmed="${trimmed%%\"*}"
+  elif [[ "$trimmed" == \'* ]]; then
+    trimmed="${trimmed#\'}"
+    [[ "$trimmed" == *\'* ]] ||
+      die "Instance .env contains malformed $key"
+    trimmed="${trimmed%%\'*}"
+  else
+    trimmed="${trimmed%%#*}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+  fi
+  printf '%s' "$trimmed"
+}
+
+check_provider_requirements() {
+  local provider="${SKOOBI_INSTALL_PROVIDER:-codex}" gateway=""
+  local codex_command="" configured_command=""
+  if [[ "${SKOOBI_INSTALLER_SKIP_REQUIREMENTS:-}" == "1" ]]; then
+    return 0
+  fi
+  if [[ -f "$ENV_FILE" && "$RECONFIGURE" == "0" ]]; then
+    gateway="$(env_value_for_key SKOOBI_MODEL_GATEWAY_TYPE)"
+    if [[ "$gateway" == "codex_subscription_cli" ]]; then
+      provider="codex"
+      configured_command="$(env_value_for_key SKOOBI_CODEX_COMMAND)"
+    else
+      log "Existing non-Codex provider configuration will be preserved."
+      return 0
+    fi
+  fi
+  case "$provider" in
+    codex)
+      if [[ -n "$configured_command" ]]; then
+        case "$configured_command" in
+          /*)
+            [[ -f "$configured_command" && -x "$configured_command" ]] ||
+              die "Configured Codex executable is missing or not executable"
+            codex_command="$configured_command"
+            ;;
+          *[!A-Za-z0-9._-]*)
+            die "Configured Codex command is unsafe"
+            ;;
+          *)
+            require_command "$configured_command"
+            codex_command="$(type -P "$configured_command")"
+            ;;
+        esac
+      else
+        require_command codex
+        codex_command="$(type -P codex)"
+      fi
+      "$codex_command" login status >/dev/null 2>&1 ||
+        die "Codex CLI is not authenticated; run 'codex login' first"
+      ;;
+    claude)
+      if ! env_has_nonempty_value ANTHROPIC_API_KEY &&
+        ! env_has_nonempty_value CLAUDE_CODE_OAUTH_TOKEN &&
+        ! env_has_nonempty_value ANTHROPIC_AUTH_TOKEN; then
+        require_command claude
+        claude auth status >/dev/null 2>&1 ||
+          die "Claude CLI is not authenticated; run 'claude auth login' first"
+      fi
+      ;;
+    openai)
+      if [[ -z "${SKOOBI_MODEL_GATEWAY_KEY:-}" ]] &&
+        ! env_has_nonempty_value SKOOBI_MODEL_GATEWAY_KEY; then
+        die "OpenAI-compatible provider key is required"
+      fi
+      ;;
+    *) die "Unknown provider selection" ;;
+  esac
 }
 
 preflight_service_path() {
@@ -801,8 +909,24 @@ set_env_key() {
   mv "$tmp" "$ENV_FILE"
 }
 
-env_has_key() {
-  [[ -f "$ENV_FILE" ]] && grep -Eq "^[[:space:]]*$1=" "$ENV_FILE"
+env_has_nonempty_value() {
+  local key="$1" line value trimmed
+  [[ -f "$ENV_FILE" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*${key}= ]] || continue
+    value="${line#*=}"
+    trimmed="${value#"${value%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ "$trimmed" == \"*\" && "$trimmed" == *\" ]]; then
+      trimmed="${trimmed:1:${#trimmed}-2}"
+    elif [[ "$trimmed" == \'*\' && "$trimmed" == *\' ]]; then
+      trimmed="${trimmed:1:${#trimmed}-2}"
+    fi
+    trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    [[ -n "$trimmed" ]] && return 0
+  done <"$ENV_FILE"
+  return 1
 }
 
 assert_instance_path_types() {
@@ -840,7 +964,7 @@ prepare_instance() {
       log "[dry-run] back up existing .env before explicit reconfiguration"
       return 0
     fi
-    backup="$(mktemp "$BACKUP_DIR/${INSTANCE}.env.XXXXXXXX.bak")"
+    backup="$(mktemp "$BACKUP_DIR/${INSTANCE}.env.bak.XXXXXXXX")"
     ENV_BACKUP="$backup"
     log "Backing up existing .env before explicit reconfiguration: $backup"
     cp "$ENV_FILE" "$backup"
@@ -875,7 +999,8 @@ configure_env() {
   set_env_key SKOOBI_LIVE_CANARY_ENABLED "false"
 
   local token="${SKOOBI_TELEGRAM_BOT_TOKEN:-}"
-  if [[ -z "$token" && "$YES" == "0" ]] && ! env_has_key TELEGRAM_BOT_TOKEN; then
+  if [[ -z "$token" && "$YES" == "0" ]] &&
+    ! env_has_nonempty_value TELEGRAM_BOT_TOKEN; then
     read -r -s -p "Telegram bot token (input hidden, leave blank to skip): " token || true
     printf '\n'
   fi
@@ -884,15 +1009,43 @@ configure_env() {
   local provider="${SKOOBI_INSTALL_PROVIDER:-codex}"
   case "$provider" in
     codex)
+      local codex_path
+      codex_path="$(type -P codex || true)"
+      if [[ -n "$codex_path" ]]; then
+        case "$codex_path" in
+          /*) ;;
+          *) die "Codex executable path must be absolute" ;;
+        esac
+        case "$codex_path" in
+          *$'\n'*|*$'\r'*) die "Codex executable path must not contain newlines" ;;
+        esac
+        set_env_key SKOOBI_CODEX_COMMAND "$codex_path"
+      fi
       set_env_key SKOOBI_MODEL_GATEWAY_TYPE "codex_subscription_cli"
       set_env_key SKOOBI_CODEX_SUBSCRIPTION_ENABLED "true"
+      set_env_key SKOOBI_TELEGRAM_OWNER_LIVE_ENABLED "true"
+      set_env_key SKOOBI_CODEX_OWNER_FULL_AGENT_ENABLED "true"
+      set_env_key SKOOBI_CODEX_OWNER_FULL_AGENT_MODE "always"
+      set_env_key SKOOBI_SANDBOX_CODEX_PRIMARY "false"
+      set_env_key SKOOBI_SCHEDULED_TASKS_CODEX_PRIMARY "true"
       ;;
     claude)
       set_env_key SKOOBI_MODEL_GATEWAY_TYPE "disabled"
       set_env_key SKOOBI_CODEX_SUBSCRIPTION_ENABLED "false"
+      set_env_key SKOOBI_TELEGRAM_OWNER_LIVE_ENABLED "false"
+      set_env_key SKOOBI_CODEX_OWNER_FULL_AGENT_ENABLED "false"
+      set_env_key SKOOBI_CODEX_OWNER_FULL_AGENT_MODE "auto"
+      set_env_key SKOOBI_SANDBOX_CODEX_PRIMARY "false"
+      set_env_key SKOOBI_SCHEDULED_TASKS_CODEX_PRIMARY "false"
       ;;
     openai)
       set_env_key SKOOBI_MODEL_GATEWAY_TYPE "openai_compatible"
+      set_env_key SKOOBI_CODEX_SUBSCRIPTION_ENABLED "false"
+      set_env_key SKOOBI_TELEGRAM_OWNER_LIVE_ENABLED "true"
+      set_env_key SKOOBI_CODEX_OWNER_FULL_AGENT_ENABLED "false"
+      set_env_key SKOOBI_CODEX_OWNER_FULL_AGENT_MODE "auto"
+      set_env_key SKOOBI_SANDBOX_CODEX_PRIMARY "false"
+      set_env_key SKOOBI_SCHEDULED_TASKS_CODEX_PRIMARY "false"
       set_env_key SKOOBI_MODEL_GATEWAY_BASE_URL \
         "${SKOOBI_MODEL_GATEWAY_BASE_URL:-https://api.openai.com/v1}"
       [[ -z "${SKOOBI_MODEL_GATEWAY_KEY:-}" ]] ||
@@ -914,12 +1067,7 @@ install_cli_symlink() {
     die "HOME must be a real directory"
   assert_home_directory_chain ".local/bin"
   if [[ ! -d "$CLI_LINK_DIR" ]]; then
-    if [[ "$YES" == "1" || "$DRY_RUN" == "1" ]]; then
-      run mkdir -p "$CLI_LINK_DIR"
-    else
-      log "CLI directory does not exist; skipping optional CLI link."
-      return 0
-    fi
+    run mkdir -p "$CLI_LINK_DIR"
   fi
   assert_home_directory_chain ".local/bin"
   [[ ! -L "$CLI_LINK_DIR" ]] || die "Refusing to use a symlinked CLI directory"
@@ -1155,6 +1303,8 @@ main() {
   [[ "$DRY_RUN" == "0" ]] || log "mode: dry-run"
 
   check_requirements
+  assert_instance_path_types
+  check_provider_requirements
   preflight_service_path
   acquire_operation_lock
   assert_existing_install_safe
@@ -1185,6 +1335,14 @@ main() {
   log "App: $APP_DIR"
   log "Instance data: $INSTANCE_DIR"
   log "Existing configuration is preserved unless --reconfigure is explicit."
+  if ! env_has_nonempty_value TELEGRAM_BOT_TOKEN; then
+    log "Telegram is not configured. Rerun with --reconfigure and enter the bot token."
+  else
+    log "Next: send /chatid to the bot, then run:"
+    log "  skoobi owner init <the-private-tg-id>"
+    log "  skoobi restart"
+  fi
+  log "If skoobi is not found, add $CLI_LINK_DIR to your shell PATH."
 }
 
 main "$@"
