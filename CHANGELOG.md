@@ -2,6 +2,23 @@
 
 All notable public changes to Skoobi Agent are documented here.
 
+## 2.0.0
+
+- Added one fail-closed operation lock shared by install, update, uninstall,
+  and owner initialization. A lock is recovered only when its process identity
+  is proven stale; active or uncertain locks remain protected.
+- Added early non-terminal input checks, strict Telegram token parsing, and a
+  live `getMe` authentication check before service activation.
+- Preserved the selected provider, custom OpenAI-compatible base URL, and
+  pinned Codex executable during token-only reconfiguration.
+- Fixed managed CLI cleanup when an installation prefix has a symlinked
+  ancestor, while continuing to preserve foreign or relative CLI links.
+- Cleared failed Telegram startup state so health checks do not report a
+  rejected bot connection as connected.
+- Added regression coverage for stale and active cross-runtime locks,
+  unattended input, provider preservation, Telegram preflight, and lifecycle
+  cleanup.
+
 ## 2.0.0-rc.3
 
 - Fixed managed Linux service generation and added systemd unit validation.
