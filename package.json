@@ -76,7 +76,7 @@
   "overrides": {
     "gaxios": "^7.3.0",
     "postcss": "^8.5.23",
-    "shell-quote": "^1.10.0"
+    "shell-quote": "^1.12.0"
   },
   "workspaces": [
     "packages/*",
