@@ -8,7 +8,7 @@ import {Readable} from 'node:stream';
 import {spawn,spawnSync} from 'node:child_process';
 import {once} from 'node:events';
 import {fileURLToPath} from 'node:url';
-import {JobStore,atomicWrite,privateRead,privateDirectory,sha256,validateSnapshot,validateRequest,validateInputs,rpc,captureArtifact,readRpc,acquireProcessLock} from './skoobi-peer-core.mjs';
+import {JobStore,atomicWrite,privateRead,privateDirectory,sha256,validateSnapshot,validateRequest,validateInputs,rpc,captureArtifact,readRpc,acquireProcessLock,acquireFileLock} from './skoobi-peer-core.mjs';
 import {submit,cancel,reconcile,watchOnce,acquireCoordinatorLock,downloadArtifacts,enqueueResult,portableOwnerInstructions} from './skoobi-peer.mjs';
 
 function fixture(t){const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'skoobi-peer-test-')));fs.chmodSync(root,0o700);t.after(()=>fs.rmSync(root,{recursive:true,force:true}));return root;}
@@ -243,6 +243,16 @@ test('kernel lock survives helper exit, rejects another process and recovers aft
 test('coordinator lock rejects a symlink without altering its target',t=>{
   const root=fixture(t),outside=path.join(root,'preserved');atomicWrite(outside,'preserved',true);fs.symlinkSync(outside,path.join(root,'coordinator.guard'));
   assert.throws(()=>acquireCoordinatorLock(root));assert.equal(fs.readFileSync(outside,'utf8'),'preserved');
+});
+
+test('legacy and protocol-2 coordinators contend on the same persistent OS lock',t=>{
+  const root=fixture(t),guard=path.join(root,'coordinator.guard');
+  const legacy=acquireCoordinatorLock(root),inode=fs.statSync(guard).ino;
+  try{assert.throws(()=>acquireFileLock(root,'coordinator'),{code:'PEER_BUSY'});}finally{legacy();}
+  const current=acquireFileLock(root,'coordinator');
+  try{assert.throws(()=>acquireCoordinatorLock(root),{code:'PEER_BUSY'});}finally{current();}
+  assert.equal(fs.statSync(guard).ino,inode);
+  const again=acquireCoordinatorLock(root);again();
 });
 
 

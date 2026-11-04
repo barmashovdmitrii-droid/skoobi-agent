@@ -304,6 +304,10 @@ def prepare(root, release, receipt_path, plan_path, enable_gui=False):
     manifest = read_json(release / 'runtime/codex-toolchain.json', False)
     if manifest.get('version') != receipt.get('cliVersion'):
         fail('release_cli_version_mismatch')
+    tools_relative = Path(manifest['destination']) / Path(manifest['binary']).parent.parent / 'codex-path'
+    if tools_relative.is_absolute() or '..' in tools_relative.parts: fail('invalid_pinned_tools_path')
+    rg = regular(release / tools_relative / 'rg')
+    if not rg.stat().st_mode & stat.S_IXUSR: fail('pinned_ripgrep_not_executable')
     cli = str(root / manifest['destination'] / manifest['launcher'])
     changed = dict(config, protocol=2, codexCommand=cli, authJsonPath=inv['authJsonPath'])
     if enable_gui:
@@ -314,6 +318,7 @@ def prepare(root, release, receipt_path, plan_path, enable_gui=False):
             'receiptPath': str(Path(receipt_path).absolute()), 'receiptSha256': digest(receipt_path),
             'inventory': inv, 'existingCode': existing, 'createdAt': time.time(),
             'configAfter': changed, 'environmentAfterSha256': hashlib.sha256(after_env).hexdigest(),
+            'codexToolsPath': str(root / tools_relative),
             'converted': [], 'pendingConversion': None, 'afterConfigHashes': {},
             'newProtocol': 2, 'previousProtocol': 2 if inv['pointer'] else 1}
     if inv['pointer']:
@@ -460,11 +465,14 @@ def configured_files(plan_path, plan):
                 (Path(inv['configPath']), inv['configSha256'],
                  (json.dumps(plan['configAfter'], ensure_ascii=False, indent=2) + '\n').encode())]
     browser = root / POINTER / '.peer-browsers'
-    if browser.is_dir():
-        for s in inv['services']:
-            content = dict(s['definition']); env = dict(content.get('EnvironmentVariables', {}))
-            env['PLAYWRIGHT_BROWSERS_PATH'] = str(browser); content['EnvironmentVariables'] = env
-            mappings.append((Path(s['path']), s['sha256'], plistlib.dumps(content)))
+    for s in inv['services']:
+        content = dict(s['definition']); env = dict(content.get('EnvironmentVariables', {}))
+        prior_path = env.get('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')
+        if not isinstance(prior_path, str): fail('invalid_service_path')
+        env['PATH'] = plan['codexToolsPath'] + (':' + prior_path if prior_path else '')
+        if browser.is_dir(): env['PLAYWRIGHT_BROWSERS_PATH'] = str(browser)
+        content['EnvironmentVariables'] = env
+        mappings.append((Path(s['path']), s['sha256'], plistlib.dumps(content)))
     for p, before, data in mappings:
         after = hashlib.sha256(data).hexdigest()
         plan['afterConfigHashes'][str(p)] = after; save(plan_path, plan)

@@ -6,9 +6,10 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {spawn,spawnSync} from 'node:child_process';
 import {once} from 'node:events';
+import {fileURLToPath} from 'node:url';
 import {JobStore,privateDirectory,atomicWrite,privateJson,contentHash,validatePeerContract,validatePeerContext,acquireProcessLock,readMaintenanceGate,readGuiSlot,allocateGuiSlot,peerStorageBytes,rpc,sha256} from './skoobi-peer-core.mjs';
 import {executePeerJob,collectPeerResult,createWorkerOutputState,choosePeerJob} from './skoobi-peer-worker.mjs';
-import {createNativeOutputState,boundedWorkspaceUsage,launchContainedPeer,reapInterruptedExecutions} from './skoobi-peer-runtime.mjs';
+import {createNativeOutputState,boundedWorkspaceUsage,launchContainedPeer,reapInterruptedExecutions,peerBundledSearchTool} from './skoobi-peer-runtime.mjs';
 import {verifyPeerResult} from './skoobi-peer-acceptance.mjs';
 
 function fixture(t){const p=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'skoobi-peer-v2-worker-')));fs.chmodSync(p,0o700);t.after(()=>fs.rmSync(p,{recursive:true,force:true}));return p;}
@@ -193,5 +194,23 @@ test('versioned symlink layout permits only the resolved executable directory in
   const allowed=spawnSync('/usr/bin/sandbox-exec',['-f',profile,executable,path.join(path.dirname(executable),'allowed')],{encoding:'utf8'});
   assert.equal(allowed.status,0);assert.equal(allowed.stdout,'synthetic allowed');
   const denied=spawnSync('/usr/bin/sandbox-exec',['-f',profile,executable,path.join(release,'private')],{encoding:'utf8'});
+  assert.notEqual(denied.status,0);assert.equal(denied.stdout,'');
+});
+test('pinned bundled rg works through versioned symlinks inside Seatbelt without a global rg',{skip:process.platform!=='darwin'},async t=>{
+  const code=fileURLToPath(new URL('../..',import.meta.url)),manifest=JSON.parse(fs.readFileSync(path.join(code,'runtime/codex-toolchain.json')));
+  const native=path.join(code,manifest.destination,manifest.binary);
+  if(!fs.existsSync(native)){t.skip('Pinned native CLI bundle unavailable');return;}
+  const root=fixture(t),workspace=privateDirectory(path.join(root,'workspace'),true),live=privateDirectory(path.join(root,'live'),true);
+  for(const name of ['inputs','output','scratch','home'])privateDirectory(path.join(workspace,name),true);
+  fs.symlinkSync(path.dirname(fs.realpathSync(native)),path.join(live,'bin'));
+  const tool=peerBundledSearchTool(path.join(live,'bin/codex'));
+  assert.equal(tool.directory,fs.realpathSync(tool.directory));assert.match(tool.sha256,/^[a-f0-9]{64}$/);
+  atomicWrite(path.join(workspace,'inputs/sample.txt'),'needle synthetic line\n',true);atomicWrite(path.join(root,'private.txt'),'needle must stay unavailable\n',true);
+  const {artifactJobSeatbeltProfile}=await import('../../packages/core/dist/orchestrator/artifact-job.js');
+  const profile=path.join(root,'execution.sb');atomicWrite(profile,artifactJobSeatbeltProfile(workspace,[tool.executable,tool.directory]),true);
+  const env={PATH:tool.directory+':/usr/bin:/bin',HOME:path.join(workspace,'home'),TMPDIR:path.join(workspace,'scratch')};
+  const allowed=spawnSync('/usr/bin/sandbox-exec',['-f',profile,'/bin/sh','-c','rg --fixed-strings --no-config --no-heading --line-number needle inputs/sample.txt'],{cwd:workspace,env,encoding:'utf8'});
+  assert.equal(allowed.status,0,allowed.stderr);assert.equal(allowed.stdout,'1:needle synthetic line\n');
+  const denied=spawnSync('/usr/bin/sandbox-exec',['-f',profile,tool.executable,'--fixed-strings','--no-config','needle',path.join(root,'private.txt')],{cwd:workspace,env,encoding:'utf8'});
   assert.notEqual(denied.status,0);assert.equal(denied.stdout,'');
 });

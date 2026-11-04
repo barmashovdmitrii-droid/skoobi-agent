@@ -22,13 +22,29 @@ class ReleaseTests(unittest.TestCase):
         if not node or not npm: self.skipTest('native npm and Node required')
         with tempfile.TemporaryDirectory() as temp:
             stage = Path(temp).resolve(); code = stage / 'code'; code.mkdir(mode=0o700)
-            env = m.build_environment(stage, code, Path(node))
+            native = {'destination':'node_modules/pinned-codex','binary':'vendor/darwin/bin/codex'}
+            tmp = stage / 'tmp'; tmp.mkdir(mode=0o700)
+            env = m.build_environment(stage, code, Path(node), tmp, native)
+            self.assertEqual(env['PATH'].split(':')[1], str(code / 'node_modules/pinned-codex/vendor/darwin/codex-path'))
             self.assertNotEqual(env['npm_config_userconfig'], env['npm_config_globalconfig'])
             for key in ('npm_config_userconfig', 'npm_config_globalconfig'):
                 self.assertEqual(Path(env[key]).read_bytes(), b'')
             result = subprocess.run([npm, 'config', 'get', 'registry'], cwd=code, env=env, capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), 'https://registry.npmjs.org/')
+
+    def test_native_temp_is_private_os_temp_and_cleaned_on_failure(self):
+        from unittest.mock import patch
+        seen = []
+        def fail_build(bundle, stage, node, tmp):
+            seen.append(tmp)
+            self.assertEqual(tmp.parent, Path('/tmp').resolve())
+            self.assertEqual(tmp.stat().st_mode & 0o777, 0o700)
+            (tmp / 'fixture').write_text('temporary data')
+            raise RuntimeError('synthetic_native_failure')
+        with patch.object(m, 'build_native', side_effect=fail_build):
+            with self.assertRaisesRegex(RuntimeError, 'synthetic_native_failure'): m.build('unused', 'unused', 'unused')
+        self.assertFalse(seen[0].exists())
 
     def test_real_pack_overrides_writable_git_archive_default_without_config_mutation(self):
         with tempfile.TemporaryDirectory() as temp:

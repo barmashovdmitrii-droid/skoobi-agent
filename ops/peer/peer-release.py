@@ -164,14 +164,15 @@ def pack(source, commit, output, toolchain):
     return {'status': 'packed', 'sourceCommit': commit, 'privateStateIncluded': False}
 
 
-def build_environment(stage, code, node):
-    home = stage / 'isolated-home'; home.mkdir(mode=0o700); tmp = stage / 'tmp'; tmp.mkdir(mode=0o700)
+def build_environment(stage, code, node, tmp, native):
+    home = stage / 'isolated-home'; home.mkdir(mode=0o700)
     # npm rejects loading the same path as both user and global configuration.
     # Distinct empty files keep account/user registry credentials out of builds.
     configs = [home / 'npm-user.conf', home / 'npm-global.conf']
     for config in configs:
         fd = os.open(config, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600); os.close(fd)
-    return {'HOME': str(home), 'PATH': str(node.parent) + ':/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+    codex_tools = code / native['destination'] / Path(native['binary']).parent.parent / 'codex-path'
+    return {'HOME': str(home), 'PATH': str(node.parent) + ':' + str(codex_tools) + ':/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
            'TMPDIR': str(tmp), 'CI': 'true', 'HUSKY': '0', 'LC_ALL': 'en_US.UTF-8',
            'npm_config_cache': str(home / 'npm-cache'), 'npm_config_userconfig': str(configs[0]),
            'npm_config_globalconfig': str(configs[1]), 'XDG_CONFIG_HOME': str(home / 'config'),
@@ -180,6 +181,13 @@ def build_environment(stage, code, node):
 
 
 def build(bundle, stage, node):
+    # Destructive-operation test fixtures deliberately accept only OS temp
+    # locations. Keep an owned private directory there, never disable the guard.
+    with tempfile.TemporaryDirectory(prefix='skoobi-peer-build-', dir=Path('/tmp').resolve()) as tmp:
+        return build_native(bundle, stage, node, Path(tmp).resolve())
+
+
+def build_native(bundle, stage, node, tmp):
     if sys.platform != 'darwin' or os.uname().machine != 'arm64': deployment.fail('native_darwin_arm64_required')
     bundle = deployment.directory(bundle); stage = Path(stage).absolute()
     deployment.directory(stage.parent)
@@ -204,7 +212,7 @@ def build(bundle, stage, node):
                     {'schema': 1, 'sourceCommit': receipt['sourceCommit'], 'sourceArchiveSha256': receipt['archiveSha256'],
                      'cliVersion': native['version'], 'cliBinarySha256': native['binarySha256'],
                      'bridgeFiles': bridge_files, 'bridgeSha256': bridge_sha}, True)
-    env = build_environment(stage, code, node)
+    env = build_environment(stage, code, node, tmp, native)
     version = deployment.command([node, '--version'], env=env).strip()
     if not version.startswith('v22.'): deployment.fail('native_node22_required')
     npm = node.parent / 'npm'

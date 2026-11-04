@@ -167,6 +167,14 @@ export async function launchContainedPeer({profile,executable,args,workspace,inp
   });
 }
 
+/** Native execution bypasses the CLI wrapper which normally adds bundled rg. */
+export function peerBundledSearchTool(executable){
+  const native=fs.realpathSync(executable),directory=path.join(path.dirname(path.dirname(native)),'codex-path');
+  const tool=path.join(directory,'rg'),s=fs.lstatSync(tool);
+  if(fs.realpathSync(directory)!==directory||fs.realpathSync(tool)!==tool||!s.isFile()||s.isSymbolicLink()||s.nlink!==1||s.uid!==process.getuid()||s.mode&0o022||!(s.mode&0o111)||s.size>64*1024*1024)throw Error('bundled_search_tool_invalid');
+  return{executable:tool,directory,sha256:sha256(fs.readFileSync(tool))};
+}
+
 export async function executeIsolatedPeerTask({c,store,job,payload,signal,onProgress}){
   const runtime=inspectPeerRuntime(c);if(!runtime.cliVerified)throw Error('runtime_not_verified');
   const module=await import(pathToFileURL(path.join(c.projectRoot,'packages/core/dist/orchestrator/artifact-job.js')));
@@ -176,6 +184,7 @@ export async function executeIsolatedPeerTask({c,store,job,payload,signal,onProg
   // node_modules at a versioned release; grant only the pinned binary's real
   // directory, never the whole release or the operator's home.
   const executable=fs.realpathSync(path.join(c.projectRoot,manifest.destination,manifest.binary));
+  const search=peerBundledSearchTool(executable);
   const workspace=privateDirectory(path.join(store.dir(job.id),'workspace'),true);
   for(const name of ['inputs','output','scratch','home'])privateDirectory(path.join(workspace,name),true);
   // Original prompt stays a file, preventing a large task from overflowing CLI input limits.
@@ -189,8 +198,8 @@ export async function executeIsolatedPeerTask({c,store,job,payload,signal,onProg
     authHome=path.join(workspace,'home','.codex');
     const launch=model.prepareArtifactJobCodex(workspace,{model:payload.contract.runtime.model,reasoningEffort:payload.contract.runtime.reasoningEffort,authJsonPath:c.authJsonPath,prompt});
     proxy=await model.startArtifactModelProxy();const proxyUrl='http://127.0.0.1:'+proxy.port;
-    Object.assign(launch.env,{HTTP_PROXY:proxyUrl,HTTPS_PROXY:proxyUrl,http_proxy:proxyUrl,https_proxy:proxyUrl,NO_PROXY:'',no_proxy:''});
-    const profile=module.artifactJobSeatbeltProfile(workspace,[executable,path.dirname(executable),process.execPath],proxy.port);
+    Object.assign(launch.env,{PATH:search.directory+':'+path.dirname(fs.realpathSync(process.execPath))+':/usr/bin:/bin:/usr/sbin:/sbin',HTTP_PROXY:proxyUrl,HTTPS_PROXY:proxyUrl,http_proxy:proxyUrl,https_proxy:proxyUrl,NO_PROXY:'',no_proxy:''});
+    const profile=module.artifactJobSeatbeltProfile(workspace,[executable,path.dirname(executable),search.executable,search.directory,process.execPath],proxy.port);
     atomicWrite(profilePath,profile,true);
     onProgress({stage:'containment_check',lastActivityAt:now(),nextStep:'start_model'});
     const containment=await module.preflightArtifactJobContainment(profilePath,workspace,store.dir(job.id));
@@ -200,7 +209,7 @@ export async function executeIsolatedPeerTask({c,store,job,payload,signal,onProg
     if(signal.aborted)throw Error(String(signal.reason||'cancel_requested'));
     const result=await launchContainedPeer({profile:profilePath,executable,args:launch.args,workspace,input:launch.input,env:launch.env,timeoutMs:payload.contract.execution.timeoutMs,signal,onProgress,onProcess:child=>recordExecutionProcess(store,job.id,child),onProcessExit:()=>recordExecutionStopped(store,job.id),maxWorkspaceBytes:payload.contract.execution.maxWorkspaceBytes,maxResidentBytes:c.maxResidentBytes||2*1024*1024*1024,contextCheckpoint:{request:request=>store.requestContext(job.id,request),response:requestId=>{const state=store.state(job.id),entry=state.contextRequests?.find(x=>x.requestId===requestId);return entry?.state==='answered'?privateJson(path.join(store.dir(job.id),'extra-context-'+requestId+'.json')):null;}}});
     await reapInterruptedExecutions(store);
-    return{...result,outputRoot:path.join(workspace,'output'),runtime:{...runtime,requestedModel:payload.contract.runtime.model,requestedEffort:payload.contract.runtime.reasoningEffort,reportedModel:result.reportedModel,reportedEffort:result.reportedEffort},isolation:{policy:'macos-seatbelt-artifact-v1',profileSha256:sha256(profile),containmentPassed:true,executableSha256:runtime.cliSha256,boundary:'task_workspace',checkedAt:now()}};
+    return{...result,outputRoot:path.join(workspace,'output'),runtime:{...runtime,requestedModel:payload.contract.runtime.model,requestedEffort:payload.contract.runtime.reasoningEffort,reportedModel:result.reportedModel,reportedEffort:result.reportedEffort},isolation:{policy:'macos-seatbelt-artifact-v1',profileSha256:sha256(profile),containmentPassed:true,executableSha256:runtime.cliSha256,bundledTools:[{name:'rg',sha256:search.sha256}],boundary:'task_workspace',checkedAt:now()}};
   }finally{
     try{
       if(authHome&&fs.existsSync(authHome)){

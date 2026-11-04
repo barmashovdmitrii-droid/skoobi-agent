@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import plistlib
 from pathlib import Path
 import shutil
 import sqlite3
@@ -37,7 +38,9 @@ class DeploymentTests(unittest.TestCase):
         for name in ('node_modules', 'dist', 'agent', 'packages', 'ops', 'scripts', 'runtime', 'helper'):
             (self.release / name).mkdir(mode=0o700)
         private(self.release / 'package.json', {'name': 'synthetic-peer'})
-        private(self.release / 'runtime/codex-toolchain.json', {'version': '0.166.0', 'destination': 'node_modules/.skoobi-codex-0.166.0', 'launcher': 'node_modules/.bin/codex'})
+        private(self.release / 'runtime/codex-toolchain.json', {'version': '0.166.0', 'destination': 'node_modules/.skoobi-codex-0.166.0', 'launcher': 'node_modules/.bin/codex', 'binary': 'vendor/darwin/bin/codex'})
+        self.rg_relative = Path('node_modules/.skoobi-codex-0.166.0/vendor/darwin/codex-path/rg')
+        private(self.release / self.rg_relative, b'#!/bin/sh\necho pinned-fixture-rg\n'); (self.release / self.rg_relative).chmod(0o700)
         private(self.release / 'scripts/code.js', b'new-code')
         private(self.root / 'scripts/code.js', b'original-code')
         private(self.root / '.env', b'KEEP_PRIVATE="untouched"\nSKOOBI_CODEX_COMMAND="old-command"\n')
@@ -58,7 +61,7 @@ class DeploymentTests(unittest.TestCase):
         for number, label in enumerate((config['label'], config['helperLabel'])):
             path = self.base / (label + '.plist'); private(path, b'original-plist')
             self.services[label] = {'label': label, 'path': str(path), 'sha256': m.digest(path), 'loaded': True,
-                                    'pid': 100 + number, 'definition': {'Label': label, 'EnvironmentVariables': {'KEEP': 'same'}}}
+                                    'pid': 100 + number, 'definition': {'Label': label, 'EnvironmentVariables': {'KEEP': 'same', 'PATH':'/usr/bin:/bin'}}}
         self.receipt = self.audit / 'release-receipt.json'
         self.write_receipt()
         self.plan = self.audit / 'plan.json'
@@ -134,6 +137,16 @@ class DeploymentTests(unittest.TestCase):
         self.assertTrue(m.read_json(self.plan)['configAfter']['allowGui'])
         self.assertNotIn('allowGui', m.read_json(self.config_path))
         self.assertFalse((self.state / 'gui-permit.json').exists())
+
+    def test_worker_and_helper_get_pinned_ripgrep_without_global_install(self):
+        self.activate()
+        for service in self.services.values():
+            env = plistlib.loads(Path(service['path']).read_bytes())['EnvironmentVariables']
+            self.assertEqual(env['KEEP'], 'same')
+            self.assertTrue(env['PATH'].endswith(':/usr/bin:/bin'))
+            self.assertEqual(env['PATH'].split(':')[0], str((self.root / self.rg_relative).parent))
+            result = subprocess.run(['rg', '--version'], env={'PATH':env['PATH']}, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0); self.assertEqual(result.stdout.strip(), 'pinned-fixture-rg')
 
     def test_internal_dependency_symlink_is_bound_by_hash(self):
         private(self.release / 'packages/example/package.json', {})

@@ -3,8 +3,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {createRequire} from 'node:module';
 import {fileURLToPath} from 'node:url';
-import {spawn,spawnSync} from 'node:child_process';
-import {JobStore,atomicWrite,privateDirectory,privateRead,privateJson,loadConfig,validateRequest,validateSnapshot,validateInputs,sha256,terminalStates,now,MAX_RPC_BYTES,acquireProcessLock} from './skoobi-peer-core.mjs';
+import {spawn} from 'node:child_process';
+import {JobStore,atomicWrite,privateDirectory,privateRead,privateJson,loadConfig,validateRequest,validateSnapshot,validateInputs,sha256,terminalStates,now,MAX_RPC_BYTES,acquireProcessLock,acquireFileLock} from './skoobi-peer-core.mjs';
 
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 export function portableOwnerInstructions(text,networkId){
@@ -120,19 +120,16 @@ function atomicIpc(file,value){
   try{const fd=fs.openSync(temp,fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);try{fs.writeFileSync(fd,JSON.stringify(value));fs.fsyncSync(fd);}finally{fs.closeSync(fd);}fs.renameSync(temp,file);}finally{if(fs.existsSync(temp))fs.unlinkSync(temp);}
 }
 
-// macOS lockf's fd form locks the inherited open file description. The
-// parent's fd retains it after lockf exits; close or process death releases it.
-// Keep this inode permanently: unlink/recreate would split the lock domain.
+// Keep the historical coordinator.guard inode and error codes, using the same
+// inherited-fd lock as protocol 2 (macOS lockf / Linux flock). Process death
+// releases ownership; unlink/recreate would split the lock domain.
 export function acquireCoordinatorLock(root){
-  privateDirectory(root);
-  const fd=fs.openSync(path.join(root,'coordinator.guard'),fs.constants.O_RDWR|fs.constants.O_CREAT|fs.constants.O_NOFOLLOW,0o600);
-  try{
-    const s=fs.fstatSync(fd);
-    if(!s.isFile()||s.uid!==process.getuid()||s.nlink!==1||s.mode&0o077)throw Error('Unsafe coordinator lock');
-    const result=spawnSync('/usr/bin/lockf',['-s','-t','0','3'],{stdio:['ignore','ignore','pipe',fd],timeout:3000});
-    if(result.status!==0){const error=Error(result.status===75?'Peer process is already running':'Coordinator lock unavailable');error.code=result.status===75?'PEER_BUSY':'PEER_LOCK_ERROR';throw error;}
-    return()=>fs.closeSync(fd);
-  }catch(error){fs.closeSync(fd);throw error;}
+  try{return acquireFileLock(root,'coordinator');}
+  catch(error){
+    if(error.code==='PEER_LOCK_ERROR')error.message='Coordinator lock unavailable';
+    else if(error.message==='Unsafe peer lock')error.message='Unsafe coordinator lock';
+    throw error;
+  }
 }
 
 function pendingOperation(store,id){
