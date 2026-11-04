@@ -15,26 +15,101 @@
  */
 
 import { createHash } from 'crypto';
+import { TASK_CONTINUITY_POLICY, withTaskContinuityPolicy } from './task-continuity.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import {
-  query,
+// Load the optional Claude SDK only when the selected provider uses it.
+import type {
   HookCallback,
   PreCompactHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
+
+type ClaudeQuery = typeof import('@anthropic-ai/claude-agent-sdk').query;
+let cachedQuery: ClaudeQuery | undefined;
+async function loadClaudeQuery(): Promise<ClaudeQuery> {
+  if (!cachedQuery) {
+    cachedQuery = (await import('@anthropic-ai/claude-agent-sdk')).query;
+  }
+  return cachedQuery;
+}
 import { fileURLToPath, pathToFileURL } from 'url';
 import {
   buildCodexPreamble,
   canSafelyRerunCodexTurn,
+  codexAccountUsedPercent,
+  codexThreadContextFill,
+  codexThreadNearCompaction,
+  DEFAULT_CODEX_TURN_TIMEOUT_MS,
+  isCodexServiceHiccup,
   removeCodexConfigToml,
+  resolveCodexTurnServiceTier,
   runCodexExecTurn,
+  terminateActiveCodexTurns,
+  withEarlierAttemptAccounting,
   writeCodexConfigToml,
   type CodexImageArtifact,
   type CodexRunnerConfig,
   type CodexTurnResult,
+  type CodexTurnTelemetry,
 } from './codex-exec.js';
+import {
+  applyLinkCheck,
+  createLinkCheckRun,
+  defaultProbeDeps,
+  describeLinkCheckSummary,
+  FIX_MAX_CONTEXT_FILL,
+  foreignUrlsFilePath,
+  LINK_CHECK_MODES,
+  proxyConfiguredInEnv,
+  type LinkCheckMode,
+  type LinkCheckSummary,
+} from './link-check.js';
+import {
+  answerAfterFinalizeHold,
+  deferFinalizeHold,
+  finalizeHoldFallbackNote,
+  joinIpcInputWithHoldNote,
+  listIpcInputNames,
+  markFailedHoldInput,
+  peekIpcInputFiles,
+  readIpcInputFile,
+  runFinalizeHold,
+  takeIpcInputFiles,
+  type FinalizeHoldOutcome,
+  type FinalizeHoldReport,
+  type IpcInputFile,
+} from './finalize-hold.js';
 import { isMultiSenderChatJid } from './telegram-jid.js';
+import { inputAfterSupersede } from './supersede-input.js';
+
+/**
+ * How long a running codex gets to exit on SIGTERM before SIGKILL when the
+ * runner itself is stopped. The host waits 1 s after «стоп» before its own
+ * SIGKILL, so this stays under that.
+ */
+const CODEX_STOP_GRACE_MS = 700;
+/** Set once the runner is going down: no more output frames after that. */
+let runnerStopping = false;
+/** This runner wrote $CODEX_HOME/config.toml (the codex provider loop). */
+let codexConfigWritten = false;
+
+/**
+ * Exit, but stop the codex children first. codex runs in its own process
+ * group, so a signal to the runner never reaches it: after «стоп» the orphan
+ * kept writing to the thread while the next run already resumed it.
+ */
+function stopCodexThenExit(exitCode: number): void {
+  if (runnerStopping) return;
+  runnerStopping = true;
+  const exit = (): void => {
+    // Same cleanup as a normal end of the codex loop, which a stopped
+    // runner never reaches: the run-scoped MCP config goes with the run.
+    if (codexConfigWritten) removeCodexConfigToml(process.env.CODEX_HOME);
+    process.exit(exitCode);
+  };
+  terminateActiveCodexTurns(CODEX_STOP_GRACE_MS).then(exit, exit);
+}
 
 // EPIPE resilience. Parent (orchestrator) может закрыть stdout/stderr после
 // max-retries / kill, и ProcessTransport SDK может умереть до того как мы
@@ -46,13 +121,14 @@ import { isMultiSenderChatJid } from './telegram-jid.js';
     name
   ];
   stream?.on?.('error', (err: NodeJS.ErrnoException) => {
-    if (err?.code === 'EPIPE') process.exit(0);
+    if (err?.code === 'EPIPE') stopCodexThenExit(0);
   });
 });
 process.on('uncaughtException', (err) => {
   const code = (err as NodeJS.ErrnoException)?.code;
   if (code === 'EPIPE') {
-    process.exit(0);
+    stopCodexThenExit(0);
+    return;
   }
   try {
     console.error(
@@ -61,7 +137,7 @@ process.on('uncaughtException', (err) => {
   } catch {
     /* stderr может быть тоже закрыт */
   }
-  process.exit(2);
+  stopCodexThenExit(2);
 });
 process.on('unhandledRejection', (reason) => {
   try {
@@ -73,7 +149,7 @@ process.on('unhandledRejection', (reason) => {
   } catch {
     /* stderr закрыт */
   }
-  process.exit(2);
+  stopCodexThenExit(2);
 });
 
 interface AgentConfig {
@@ -94,11 +170,36 @@ interface AgentConfig {
 
 interface ContainerInput {
   prompt: string;
+  /** Разрешение хоста эмитить промежуточные реплики на ЭТОМ ходе. */
+  emitProgressMessages?: boolean;
   sessionId?: string;
   groupFolder: string;
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  /**
+   * The owner's batch carries forwarded/quoted foreign text: run it on a
+   * throw-away thread (the host also pins codex read-only).
+   */
+  indirectOwnerContent?: boolean;
+  /**
+   * The host can fold piped follow-ups into the running turn (it handles the
+   * absorbedFollowUps heartbeat), so an early turn may be superseded.
+   */
+  allowFollowUpSupersede?: boolean;
+  /**
+   * Hold a finished answer while short follow-ups that came in during the
+   * turn are folded into it by one hold turn (finalize-hold.ts, C12). The
+   * host grants it per run (SKOOBI_FINALIZE_HOLD_GROUPS); it needs
+   * allowFollowUpSupersede too, since it relies on absorbedFollowUps.
+   */
+  finalizeHold?: boolean;
+  /**
+   * Check the links of the final answer before it is sent (see link-check.ts).
+   * The host grants it per run, only to the owner's own turns on the direct
+   * network; absent = no check, exactly as before.
+   */
+  linkCheck?: { mode: LinkCheckMode; fixReasoningEffort?: string };
   assistantName?: string;
   agentConfig?: AgentConfig;
   tenantId?: string;
@@ -116,6 +217,11 @@ interface ContainerInput {
     columnCount: number;
     maxRowsPerCall: number;
   }>;
+  /**
+   * Host grant for the read-only chat_history MCP tool (owner-tier main runs
+   * only). Absent ⇒ the tool is not registered.
+   */
+  chatHistory?: ChatHistoryRunGrant;
   /**
    * LLM backend for this run. Default 'claude_sdk'. 'codex_cli' runs the same
    * workspace/tools/memory via the Codex CLI (provider reserve fallback).
@@ -137,6 +243,16 @@ interface ContainerInput {
 }
 
 interface ContainerOutput {
+  /**
+   * Промежуточная реплика модели внутри хода. Едет ТОЛЬКО на кадре heartbeat и
+   * никогда в result: непустой result планировщик задач принимает за результат
+   * прогона и закрывает ход.
+   */
+  progressText?: string;
+  /** Heartbeat only: piped follow-ups folded into the running turn. */
+  absorbedFollowUps?: number;
+  /** Heartbeat only: piped follow-ups taken as a turn of their own. */
+  consumedFollowUps?: number;
   // 'heartbeat' frames are pure liveness signals emitted while the SDK query
   // is genuinely progressing (recent message yield or a tool_use awaiting its
   // tool_result). The host re-arms its no-output/progress watchdogs on them
@@ -163,6 +279,58 @@ interface ContainerOutput {
   sideEffected?: boolean;
   /** Exact side-effecting tool names observed by the Codex JSON stream. */
   sideEffectTools?: string[];
+  /**
+   * What the codex turn ran with and did: where its token numbers come from,
+   * requests to the model, the applied tier and effort, the account limit,
+   * tool calls. The host writes it next to the run (agent_runs/model_traces).
+   */
+  codexTurn?: CodexTurnTelemetry;
+  /**
+   * Heartbeat only: codex answered on this attempt (its first completed
+   * item). A half-open breaker probe is settled on it instead of waiting for
+   * the end of a turn that may run for an hour.
+   */
+  providerResponded?: boolean;
+  /**
+   * Heartbeat only: the chat's codex thread was dropped before this turn and
+   * a fresh one starts. Rotations used to be visible only in debug logs.
+   */
+  threadRotated?: {
+    // 'stale' / 'resume-error': dropped after codex could not resume it —
+    // unplanned, and silent until 26.10.
+    reason:
+      | 'context-changed'
+      | 'expired'
+      | 'oversized'
+      | 'stale'
+      | 'resume-error';
+    threadId: string;
+    rolloutBytes?: number;
+  };
+  /**
+   * Heartbeat only: an early codex turn was stopped for newer messages and
+   * restarts with them (see SUPERSEDE_WINDOW_MS). The host records it as an
+   * event — this stderr is kept only for failed runs.
+   */
+  supersedeRestart?: {
+    restart: number;
+    newerMessages: number;
+    turnAgeMs: number;
+    threadHeld: boolean;
+  };
+  /**
+   * Heartbeat only: follow-ups were waiting when the answer was ready, and
+   * what the finalize hold did with them (finalize-hold.ts). The host records
+   * it as a late_followup_merged event.
+   */
+  finalizeHold?: FinalizeHoldReport;
+  /** IPC input basenames to retire only after the host confirms delivery. */
+  finalizedInputFiles?: string[];
+  /**
+   * Success frame only: what the link check found and did (counts, hosts of
+   * dead links — never full URLs). Absent when the answer had no links.
+   */
+  linkCheck?: LinkCheckSummary;
 }
 
 interface SessionEntry {
@@ -196,6 +364,108 @@ const WORKSPACE_EXTRA = process.env.CLAUDECLAW_EXTRA_DIR || '/workspace/extra';
 
 const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
+/**
+ * How long into a turn a newer message may still restart it (see supersede).
+ * 45 s: a second voice note reaches the runner 4–10 s after the turn starts
+ * (transcription, host poll), and the window used to close at the model's
+ * first commentary anyway (check 09.10, Q2); now only real work closes it.
+ */
+const SUPERSEDE_WINDOW_MS = 45_000;
+/** Restarts per user turn; after that the next message waits its own turn. */
+const MAX_SUPERSEDE_RESTARTS = 3;
+/**
+ * Пометка догоняющему ходу: сообщения, легшие в ipc/input, пока предыдущий
+ * ход ещё шёл, — продолжение того обращения, а ответ на него уже отправлен.
+ * Без пометки модель отвечала на них как на новый вопрос и пересказывала
+ * рекомендацию (06.10 — «Mercusys ME30» три раза подряд, 08.10 — «Plast Team
+ * 14 л» дважды; проверка 09.10, Q4). «Только на новое», а не «кратко»: иначе
+ * реальный новый вопрос получит огрызок. «Отправлен», а не «получил»: пометка
+ * ставится по success-кадру, а не по подтверждённой доставке — при сбое
+ * доставки (429, обрыв) пользователь ответа не видел, и если он переспрашивает,
+ * рекомендацию надо повторить (проверка 09.10, Q-3).
+ */
+export const FOLLOW_UP_CONTINUATION_NOTE =
+  '[Эти сообщения пришли, пока ты готовил предыдущий ответ. Предыдущий ход завершён; эта пометка не подтверждает отправку или доставку и не означает, что новые сообщения уже учтены. Учти новые сообщения вместе с незавершённой целью и прежними разрешениями. На вопрос о статусе ответь и продолжи разрешённую работу; явную отмену, замену задачи и новые ограничения выполни. Не повторяй прежний ответ без необходимости; если пользователь его не видел или переспрашивает — повтори нужную часть. Не объявляй работу законченной по факту окончания ответа.]';
+
+function russianMessagesNoun(count: number): string {
+  const mod10 = count % 10;
+  const mod100 = count % 100;
+  if (mod10 === 1 && mod100 !== 11) return 'сообщение';
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) {
+    return 'сообщения';
+  }
+  return 'сообщений';
+}
+
+/**
+ * Пометка для хода, собранного из IPC-файлов (см. waitForIpcMessage). Ставится
+ * только если хотя бы один файл лёг ДО того, как предыдущий ход отдал ответ
+ * (writeOutput success): такие сообщения пользователь слал, ещё не видя
+ * ответа. Файлы, подхваченные в 15-секундном ожидании ПОСЛЕ ответа, — реакция
+ * на него, им пометка только мешает. null — без пометки.
+ */
+export function followUpContinuationNote(input: {
+  arrivedDuringTurn: number;
+  messageCount: number;
+  /**
+   * The messages were taken for a finalize hold that failed: the thread was
+   * told the answer is not sent yet; the marker has no delivery receipt.
+   */
+  afterFailedHold?: boolean;
+  /** Observed tool calls with unknown outcomes; verify before any retry. */
+  holdDoneTools?: readonly string[];
+  holdOriginalText?: string;
+}): string | null {
+  if (input.arrivedDuringTurn <= 0) return null;
+  const note =
+    input.afterFailedHold === true
+      ? finalizeHoldFallbackNote(input.holdDoneTools, input.holdOriginalText)
+      : FOLLOW_UP_CONTINUATION_NOTE;
+  if (input.messageCount > 1) {
+    return `${note}\n[Это ${input.messageCount} ${russianMessagesNoun(input.messageCount)} одной серии — ответь на все одним сообщением.]`;
+  }
+  return note;
+}
+
+/**
+ * Сколько пользовательских сообщений в тексте хода: хост заворачивает каждое
+ * в <message …> (router.ts), один IPC-файл может нести несколько. Если
+ * обёртки нет (голый текст) — считаем по файлам.
+ */
+export function countPipedMessages(text: string, files: number): number {
+  const tagged = text.match(/<message\b/g)?.length ?? 0;
+  return tagged > 0 ? tagged : Math.max(1, files);
+}
+
+/**
+ * Сколько IPC-файлов легли до ответа предыдущего хода. mtime файла — момент
+ * записи хостом (атомарная запись + rename её не меняет); undefined
+ * `answeredAt` (первый ход run-а) — ни одного.
+ */
+export function ipcBatchArrivedDuringTurn(
+  batch: ReadonlyArray<{ mtimeMs: number }>,
+  answeredAt: number | undefined,
+): number {
+  if (answeredAt === undefined) return 0;
+  return batch.filter((file) => file.mtimeMs <= answeredAt).length;
+}
+
+/**
+ * Промежуточная реплика повторной попытки того же хода подавляется, если на
+ * первой уже что-то ушло. Повтор — это не только свежий тред после stale
+ * (progressAttempt), но и перезапуск по supersede: раньше он не считался, и
+ * пользователь мог получить второй «⏳» на тот же вопрос (проверка 09.10, Q2).
+ */
+export function interimProgressSuppressedOnRetry(input: {
+  progressEmitted: boolean;
+  progressAttempt: number;
+  supersedeRestarts: number;
+}): boolean {
+  return (
+    input.progressEmitted &&
+    (input.progressAttempt > 0 || input.supersedeRestarts > 0)
+  );
+}
 const IPC_POLL_MS = 500;
 const RUNNER_IDLE_WAIT_MS = Math.max(
   1000,
@@ -237,6 +507,7 @@ export function memoryRuntimeIsolationOptions(input: {
  */
 export function assembleSystemContext(
   containerInput: ContainerInput,
+  includeTaskContinuity = true,
 ): string | undefined {
   const globalClaudeMdPath = path.join(WORKSPACE_GLOBAL, 'CLAUDE.md');
   let globalClaudeMd: string | undefined;
@@ -278,7 +549,115 @@ export function assembleSystemContext(
       ? `${globalClaudeMd}\n\n${identityBoundary}\n\n${relationshipMemory}`
       : `${identityBoundary}\n\n${relationshipMemory}`;
   }
-  return globalClaudeMd;
+  // SDK reads its system context each run. Codex instead receives this policy
+  // as a tracked standing block: changing it must not rotate a live thread.
+  return includeTaskContinuity
+    ? [globalClaudeMd, TASK_CONTINUITY_POLICY].filter(Boolean).join('\n\n')
+    : globalClaudeMd;
+}
+
+interface ChatHistoryRunGrant {
+  dbPath: string;
+  timeZone: string;
+  sources: Array<'whatsapp' | 'bot'>;
+  botChatJids: string[];
+  mediaRoots: Record<string, string>;
+  observerMediaRoot?: string;
+}
+
+const CHAT_HISTORY_BOT_JID_RE =
+  /^(?:tg:[A-Za-z0-9_=:-]{1,120}|\d{5,20}@s\.whatsapp\.net)$/;
+
+function isAbsoluteHostPath(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 4096 &&
+    !value.includes('\0') &&
+    path.isAbsolute(value)
+  );
+}
+
+/**
+ * CLAUDECLAW_CHAT_HISTORY_* for the MCP server. Empty strings (tool not
+ * registered) unless this is a trusted owner run that is not a scheduled task
+ * and the host sent a well-formed grant. Malformed parts are dropped, never
+ * widened.
+ */
+export function buildChatHistoryMcpEnv(
+  containerInput: Pick<
+    ContainerInput,
+    'isMain' | 'credentialProxyTier' | 'isScheduledTask' | 'chatHistory'
+  >,
+): Record<string, string> {
+  const empty = {
+    CLAUDECLAW_CHAT_HISTORY_DB: '',
+    CLAUDECLAW_CHAT_HISTORY_TZ: '',
+    CLAUDECLAW_CHAT_HISTORY_SOURCES: '',
+    CLAUDECLAW_CHAT_HISTORY_BOT_JIDS: '',
+    CLAUDECLAW_CHAT_HISTORY_MEDIA_ROOTS_JSON: '',
+    CLAUDECLAW_CHAT_HISTORY_OBSERVER_MEDIA_ROOT: '',
+  };
+  const grant = containerInput.chatHistory;
+  if (
+    containerInput.isMain !== true ||
+    containerInput.credentialProxyTier !== 'owner' ||
+    containerInput.isScheduledTask === true ||
+    !grant ||
+    typeof grant !== 'object'
+  ) {
+    return empty;
+  }
+  if (
+    !isAbsoluteHostPath(grant.dbPath) ||
+    path.basename(grant.dbPath) !== 'messages.db'
+  ) {
+    return empty;
+  }
+  const sources = [
+    ...new Set(
+      (Array.isArray(grant.sources) ? grant.sources : []).filter(
+        (source) => source === 'whatsapp' || source === 'bot',
+      ),
+    ),
+  ];
+  const botChatJids = [
+    ...new Set(
+      (Array.isArray(grant.botChatJids) ? grant.botChatJids : []).filter(
+        (jid): jid is string =>
+          typeof jid === 'string' && CHAT_HISTORY_BOT_JID_RE.test(jid),
+      ),
+    ),
+  ];
+  const usableSources = sources.filter(
+    (source) => source !== 'bot' || botChatJids.length > 0,
+  );
+  if (usableSources.length === 0) return empty;
+  const mediaRoots: Record<string, string> = {};
+  if (grant.mediaRoots && typeof grant.mediaRoots === 'object') {
+    for (const [jid, dir] of Object.entries(grant.mediaRoots)) {
+      if (botChatJids.includes(jid) && isAbsoluteHostPath(dir)) {
+        mediaRoots[jid] = dir;
+      }
+    }
+  }
+  return {
+    CLAUDECLAW_CHAT_HISTORY_DB: grant.dbPath,
+    CLAUDECLAW_CHAT_HISTORY_TZ:
+      typeof grant.timeZone === 'string' && grant.timeZone.length <= 64
+        ? grant.timeZone
+        : '',
+    CLAUDECLAW_CHAT_HISTORY_SOURCES: usableSources.join(','),
+    CLAUDECLAW_CHAT_HISTORY_BOT_JIDS: usableSources.includes('bot')
+      ? botChatJids.join(',')
+      : '',
+    CLAUDECLAW_CHAT_HISTORY_MEDIA_ROOTS_JSON: JSON.stringify(mediaRoots),
+    CLAUDECLAW_CHAT_HISTORY_OBSERVER_MEDIA_ROOT:
+      usableSources.includes('whatsapp') &&
+      isAbsoluteHostPath(grant.observerMediaRoot)
+        ? grant.observerMediaRoot
+        : '',
+  };
 }
 
 /**
@@ -352,9 +731,16 @@ export function buildClaudeclawMcpEnv(
     CLAUDECLAW_GOOGLE_ALLOWED_TOOLS: trustedOwner
       ? (containerInput.googleAllowedTools || []).join(',')
       : '',
-    CLAUDECLAW_GOOGLE_SHEET_TARGET_HINTS_JSON: directOwnerRun
-      ? JSON.stringify(containerInput.googleSheetTargetHints || [])
-      : '[]',
+    // Host-made coordinates of the append targets the host policy allows.
+    // They follow the capability that authorizes the append: a direct owner
+    // turn, and an owner-created scheduled task in a main chat, whose policy
+    // comes from its own text or the chat's standing access.
+    CLAUDECLAW_GOOGLE_SHEET_TARGET_HINTS_JSON:
+      trustedOwner && Boolean(containerInput.taskAuthorizationCapability)
+        ? JSON.stringify(containerInput.googleSheetTargetHints || [])
+        : '[]',
+    // Read-only chat history: host-chosen DB path, sources and JID allowlist.
+    ...buildChatHistoryMcpEnv(containerInput),
   };
 }
 
@@ -458,6 +844,9 @@ const SDK_ENV_ALLOW_EXACT: readonly string[] = [
   'CLAUDECLAW_IPC_DIR',
   'CLAUDECLAW_SHARED_USER_MEMORY_DIR',
   'CLAUDECLAW_RUNNER_IDLE_WAIT_MS',
+  'CLAUDECLAW_CODEX_THREAD_MAX_ROLLOUT_BYTES',
+  'CLAUDECLAW_CODEX_THREAD_ROLLOUT_HARD_BYTES',
+  'CLAUDECLAW_CODEX_THREAD_OVERSIZE_IDLE_MS',
   'CLAUDECLAW_GLOBAL_DIR',
   'CLAUDECLAW_PROJECT_DIR',
   'CLAUDECLAW_EXTRA_DIR',
@@ -575,6 +964,9 @@ export function neutralizeOutputMarkers(serialized: string): string {
 }
 
 function writeOutput(output: ContainerOutput): void {
+  // The host is already tearing the run down (it sent the signal): a frame
+  // written now would only race its own kill handling.
+  if (runnerStopping) return;
   console.log(OUTPUT_START_MARKER);
   console.log(neutralizeOutputMarkers(JSON.stringify(output)));
   console.log(OUTPUT_END_MARKER);
@@ -601,24 +993,246 @@ function log(message: string): void {
  * The Claude path re-assembles its system context on EVERY run; a resumed
  * codex thread only ever saw the preamble from its FIRST turn. Hashing the
  * current preamble lets us detect that the operating context changed (persona
- * edit, CLAUDE.md update, disallowedTools change) and rotate to a fresh
- * thread so the reserve doesn't keep answering with a stale system prompt.
+ * edit, preamble text change) and rotate to a fresh thread so the reserve
+ * doesn't keep answering with a stale system prompt.
+ *
+ * The chat's CLAUDE.md is NOT part of that hash (C25, 26.10): the host sends
+ * it on every turn as <tenant_long_term_context>, and a changed copy reaches
+ * the thread in full (elideUnchangedStandingBlocks), so an edit of the rules
+ * no longer costs the conversation. Only a thread whose first turn had no
+ * host copy got the runner's own copy; `workspaceClaudeMdHash` remembers it.
  */
 export interface CodexThreadMeta {
   preambleHash: string;
   createdAt: string;
+  /**
+   * Hash of the latest full copy of each standing context block the thread
+   * has received (see elideUnchangedStandingBlocks). Cleared on compaction.
+   */
+  standingBlocks?: Record<string, string>;
+  /**
+   * Set only when the thread's preamble carried the runner's copy of CLAUDE.md
+   * (no host copy in its first prompt): the hash of that preamble. A run that
+   * still relies on the runner's copy rotates the thread when it changed.
+   */
+  workspaceClaudeMdHash?: string;
+}
+
+/**
+ * The host's copy of the chat's CLAUDE.md (message-loop
+ * prependTenantLongTermPromptContext). Only `source="CLAUDE.md"` counts: an
+ * AGENT.md/SKOOBI.md block is a different file, and CLAUDE.md then reaches
+ * codex only through the runner's copy.
+ */
+const HOST_CLAUDE_MD_BLOCK_RE =
+  /<tenant_long_term_context\b[^>]*\bsource="CLAUDE\.md"/;
+
+export function promptCarriesHostClaudeMd(prompt: string): boolean {
+  return HOST_CLAUDE_MD_BLOCK_RE.test(prompt);
+}
+
+/** Short hash used for thread-meta fields. */
+function shortHash(text: string): string {
+  return createHash('sha256').update(text).digest('hex').slice(0, 16);
+}
+
+/**
+ * The two preambles of a run and what identifies its thread. `bare` never
+ * carries the runner's copy of CLAUDE.md, `withClaudeMd` does when the chat
+ * may get it (main or a single-sender chat with a CLAUDE.md). `identityHash`
+ * is the hash of `bare` — what shouldRotateCodexThread compares — so a
+ * CLAUDE.md edit never rotates a thread whose rules come from the host; and
+ * `claudeMdCopyHash` identifies the runner's copy ('' — there is none).
+ */
+export interface CodexPreambleSet {
+  bare: string;
+  withClaudeMd: string;
+  identityHash: string;
+  claudeMdCopyHash: string;
+}
+
+export function buildCodexPreambleSet(input: {
+  systemContext?: string;
+  cwd: string;
+  includeWorkspaceClaudeMd: boolean;
+}): CodexPreambleSet {
+  const base = { systemContext: input.systemContext, cwd: input.cwd };
+  const bare = buildCodexPreamble({ ...base, includeWorkspaceClaudeMd: false });
+  const withClaudeMd = input.includeWorkspaceClaudeMd
+    ? buildCodexPreamble({ ...base, includeWorkspaceClaudeMd: true })
+    : bare;
+  return {
+    bare,
+    withClaudeMd,
+    identityHash: createHash('sha256').update(bare).digest('hex'),
+    claudeMdCopyHash: withClaudeMd === bare ? '' : shortHash(withClaudeMd),
+  };
+}
+
+/**
+ * The preamble a FRESH thread gets for this prompt: the runner's CLAUDE.md
+ * copy only when the prompt has no host copy (scheduled tasks, WhatsApp, a
+ * follow-up turn that starts a fresh thread after a stale resume). The first
+ * message of a thread used to carry both, 13 KB each (check 26.10, C25).
+ */
+export function codexPreambleForFreshThread(
+  set: CodexPreambleSet,
+  prompt: string,
+): { preamble: string; workspaceClaudeMdHash?: string } {
+  if (promptCarriesHostClaudeMd(prompt) || !set.claudeMdCopyHash) {
+    return { preamble: set.bare };
+  }
+  return {
+    preamble: set.withClaudeMd,
+    workspaceClaudeMdHash: set.claudeMdCopyHash,
+  };
+}
+
+/**
+ * Host-assembled context blocks that repeat on every turn although the thread
+ * already has them: the chat's CLAUDE.md again (~11 KB) and the memory indexes
+ * (~22 KB). Re-sending them was ~27% of all input tokens and made the thread
+ * compact every ~7 turns, each compaction blocking a turn for 22–131 s — and
+ * compaction keeps user messages, so the repeats survived it as bloat.
+ *
+ * Проверка 09.10.2026 (MEM-5): cross_channel_owner_context (5 238 зн., один
+ * md5 во всех 30/30 ходах владельца — входящих WhatsApp нет) и skoobi_skills
+ * (4 141 зн. у Андрея, 5 вариантов на 41 ход) повторялись целиком. Теперь они
+ * стабятся по тем же правилам: только при равном хеше, полностью после
+ * компакции.
+ */
+export const STANDING_CONTEXT_TAGS = [
+  'tenant_long_term_context',
+  'shared_user_memory_index',
+  'chat_memory_index',
+  'cross_channel_owner_context',
+  'skoobi_skills',
+  'task_continuity',
+] as const;
+
+function standingBlockRegExp(tag: string): RegExp {
+  return new RegExp(`<${tag}(?:\\s[^>]*)?>[\\s\\S]*?</${tag}>`);
+}
+
+/**
+ * Volatile attributes of a `<memory_file …/>` entry of the lazy memory index
+ * (packages/memory/src/memory-context.ts, memoryIndexSectionsFromRoot).
+ */
+const MEMORY_FILE_VOLATILE_ATTR_RE = /\s(?:size_bytes|size|modified)="[^"]*"/g;
+/** Per-turn match score of a `<skill …>` block (skill-registry.ts). */
+const SKILL_SCORE_ATTR_RE = /\sscore="\d+"/;
+
+/**
+ * What a standing block is hashed by. The memory index stamps every file with
+ * its size and mtime and lists files newest first, so each memory_save re-sent
+ * the whole index (15.5 KB in 21 of 30 owner turns, MEM-5). The model is told
+ * to read exact details through memory_search/memory_get, so size, date and
+ * order are informational: the hash covers what the model acts on — which
+ * files exist, their provenance/scope and the `large` hint — and the stub may
+ * lag on the rest. The index goes in full again when a file appears or
+ * disappears (or the thread compacts). A skill's match score is likewise
+ * per-turn noise: the same skills in the same order hash the same. Blocks
+ * without such entries hash as is.
+ */
+export function standingBlockCanonicalForm(block: string): string {
+  const entries: string[] = [];
+  const rest: string[] = [];
+  for (const line of block.split('\n')) {
+    if (line.startsWith('<memory_file ')) {
+      entries.push(line.replace(MEMORY_FILE_VOLATILE_ATTR_RE, ''));
+    } else if (line.startsWith('<skill ')) {
+      rest.push(line.replace(SKILL_SCORE_ATTR_RE, ''));
+    } else {
+      rest.push(line);
+    }
+  }
+  if (entries.length === 0) return rest.join('\n');
+  return [...rest, ...entries.sort()].join('\n');
+}
+
+/**
+ * On a resumed thread, replace every standing block whose content equals the
+ * copy the thread already received with a one-line `unchanged` marker; a block
+ * that changed goes in full. Returns the prompt to send and the hash of every
+ * standing block present in the ORIGINAL prompt.
+ */
+export function elideUnchangedStandingBlocks(
+  prompt: string,
+  alreadySent: Record<string, string> | undefined,
+): { prompt: string; blocks: Record<string, string> } {
+  let out = prompt;
+  const blocks: Record<string, string> = {};
+  for (const tag of STANDING_CONTEXT_TAGS) {
+    const match = standingBlockRegExp(tag).exec(prompt);
+    if (!match) continue;
+    const hash = createHash('sha256')
+      .update(standingBlockCanonicalForm(match[0]))
+      .digest('hex')
+      .slice(0, 16);
+    blocks[tag] = hash;
+    if (alreadySent?.[tag] === hash) {
+      out = out.replace(match[0], `<${tag} unchanged="true"/>`);
+    }
+  }
+  return { prompt: out, blocks };
 }
 
 /** Upper bound on codex thread age — bounds rollout growth the same way the
  * Claude path's transcript-rotation guard bounds session size. */
 export const CODEX_THREAD_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** Byte cap on a codex thread's rollout .jsonl before we rotate to a fresh
- * thread — the codex analogue of the Claude path's MAX_TRANSCRIPT_BYTES (40MB)
- * transcript rotation. A resumed rollout is replayed in full every turn, so an
- * unbounded one drives per-turn cost/latency up and can trip a context-length
- * failure well inside the 7-day age window. */
-export const CODEX_THREAD_MAX_ROLLOUT_BYTES = 40 * 1024 * 1024;
+/** Parse a positive integer env value; the default on anything else. */
+function envIntAtLeast(
+  name: string,
+  defaultValue: number,
+  floor: number,
+): number {
+  return Math.max(
+    floor,
+    parseInt(process.env[name] || String(defaultValue), 10) || defaultValue,
+  );
+}
+
+/**
+ * Soft byte cap on a codex thread's rollout .jsonl: past it the thread is
+ * rotated to a fresh one, but only once it has sat idle for
+ * CODEX_THREAD_OVERSIZE_IDLE_MS — a thread in active use is never cut.
+ * Tunable from .env via CLAUDECLAW_CODEX_THREAD_MAX_ROLLOUT_BYTES, which the
+ * host forwards into the runner env (see config.ts / sandbox-runner.ts); 1MB
+ * floor, 512MB default.
+ *
+ * A rollout is an append-only disk log, not the current model context.
+ * Screenshot outputs can dominate its size even while compaction keeps the
+ * context small. Avoid rotating a usable thread merely because its log grew.
+ * Resume still parses that file, so the hard cap below bounds memory use.
+ */
+export const CODEX_THREAD_MAX_ROLLOUT_BYTES = envIntAtLeast(
+  'CLAUDECLAW_CODEX_THREAD_MAX_ROLLOUT_BYTES',
+  512 * 1024 * 1024,
+  1024 * 1024,
+);
+
+/**
+ * Hard byte cap: past it the thread is rotated even while in use, so the
+ * per-resume parse never grows without bound. Env
+ * CLAUDECLAW_CODEX_THREAD_ROLLOUT_HARD_BYTES; 1MB floor, 2GB default.
+ */
+export const CODEX_THREAD_ROLLOUT_HARD_BYTES = envIntAtLeast(
+  'CLAUDECLAW_CODEX_THREAD_ROLLOUT_HARD_BYTES',
+  2 * 1024 * 1024 * 1024,
+  1024 * 1024,
+);
+
+/**
+ * How long a thread past the soft cap must have been idle (no rollout write)
+ * before it is rotated. Env CLAUDECLAW_CODEX_THREAD_OVERSIZE_IDLE_MS; 3h
+ * default.
+ */
+export const CODEX_THREAD_OVERSIZE_IDLE_MS = envIntAtLeast(
+  'CLAUDECLAW_CODEX_THREAD_OVERSIZE_IDLE_MS',
+  3 * 60 * 60 * 1000,
+  0,
+);
 
 /**
  * Decide whether a persisted codex thread must be abandoned before this turn.
@@ -626,24 +1240,44 @@ export const CODEX_THREAD_MAX_ROLLOUT_BYTES = 40 * 1024 * 1024;
  * without meta is rotated: we cannot prove its preamble matches the current
  * context (pre-meta threads date from before this guard existed).
  * `rolloutBytes` is the size of the thread's rollout file (0/undefined when it
- * can't be located — then the size check is skipped, never a false rotate).
+ * can't be located — then the size check is skipped, never a false rotate);
+ * `rolloutMtimeMs` is its last write. Past the soft cap a thread rotates only
+ * when that write is at least CODEX_THREAD_OVERSIZE_IDLE_MS old (an unknown
+ * mtime counts as in use); past the hard cap it rotates regardless.
+ * `workspaceClaudeMdHash` is given only for a run whose prompt has no host
+ * copy of CLAUDE.md: the runner's copy as it is now ('' — none). The thread
+ * then rotates when the copy it holds differs — a thread that relies on it
+ * would otherwise keep a stale CLAUDE.md. A run with the host's copy passes
+ * undefined: that copy reaches the thread anyway.
  */
 export function shouldRotateCodexThread(
   meta: CodexThreadMeta | null,
   currentPreambleHash: string,
   now: number,
   rolloutBytes?: number,
+  rolloutMtimeMs?: number,
+  workspaceClaudeMdHash?: string,
 ): 'context-changed' | 'expired' | 'oversized' | null {
   if (!meta || meta.preambleHash !== currentPreambleHash) {
+    return 'context-changed';
+  }
+  if (
+    workspaceClaudeMdHash !== undefined &&
+    (meta.workspaceClaudeMdHash ?? '') !== workspaceClaudeMdHash
+  ) {
     return 'context-changed';
   }
   const created = Date.parse(meta.createdAt);
   if (Number.isFinite(created) && now - created > CODEX_THREAD_MAX_AGE_MS) {
     return 'expired';
   }
+  if (typeof rolloutBytes !== 'number' || !(rolloutBytes > 0)) return null;
+  if (rolloutBytes > CODEX_THREAD_ROLLOUT_HARD_BYTES) return 'oversized';
   if (
-    typeof rolloutBytes === 'number' &&
-    rolloutBytes > CODEX_THREAD_MAX_ROLLOUT_BYTES
+    rolloutBytes > CODEX_THREAD_MAX_ROLLOUT_BYTES &&
+    typeof rolloutMtimeMs === 'number' &&
+    Number.isFinite(rolloutMtimeMs) &&
+    now - rolloutMtimeMs >= CODEX_THREAD_OVERSIZE_IDLE_MS
   ) {
     return 'oversized';
   }
@@ -651,18 +1285,19 @@ export function shouldRotateCodexThread(
 }
 
 /**
- * Best-effort byte size of the rollout .jsonl for `threadId` under a codex
- * home. Codex stores it at $CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl;
- * we locate it by the thread id embedded in the filename. Returns 0 when the
- * file cannot be found (no rotation is forced on a miss).
+ * Best-effort size and last write of the rollout .jsonl for `threadId` under
+ * a codex home. Codex stores it at
+ * $CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl; we locate it by the
+ * thread id embedded in the filename. Returns null when the file cannot be
+ * found (no rotation is forced on a miss).
  */
-export function codexRolloutBytes(
+export function codexRolloutStat(
   codexHome: string | undefined,
   threadId: string,
-): number {
-  if (!codexHome) return 0;
+): { bytes: number; mtimeMs: number } | null {
+  if (!codexHome) return null;
   const sessionsRoot = path.join(codexHome, 'sessions');
-  let found = 0;
+  let found: { bytes: number; mtimeMs: number } | null = null;
   const walk = (dir: string): void => {
     if (found) return;
     let entries: fs.Dirent[];
@@ -678,7 +1313,8 @@ export function codexRolloutBytes(
         walk(full);
       } else if (e.name.includes(threadId) && e.name.endsWith('.jsonl')) {
         try {
-          found = fs.statSync(full).size;
+          const st = fs.statSync(full);
+          found = { bytes: st.size, mtimeMs: st.mtimeMs };
         } catch {
           /* ignore */
         }
@@ -690,6 +1326,154 @@ export function codexRolloutBytes(
 }
 
 /** A stale resume may start fresh only before any non-repeatable work ran. */
+/**
+ * Whether the thread a codex attempt ended on becomes the chat's thread.
+ * - `persist`: a new thread that completed a turn, or was interrupted while
+ *   working (timeout, «стоп») — it holds the preamble and the partial work;
+ * - `mismatch`: we resumed one thread and codex answered on another, so the
+ *   new one never saw the preamble;
+ * - `keep`: nothing to change (same thread, a failure, or no id at all).
+ *
+ * A fresh attempt that was cut short before codex recorded the preamble
+ * (`anchored === false`: stopped between thread creation and the first user
+ * message, ~1.8 s) is not saved — that thread may lack the operating
+ * context. A completed turn needs no such proof: codex answered the message
+ * that carried the preamble.
+ */
+export function codexThreadPersistenceDecision(
+  result: Pick<
+    CodexTurnResult,
+    'status' | 'threadId' | 'interrupted' | 'anchored'
+  >,
+  attemptThreadId: string | undefined,
+  currentThreadId: string | undefined,
+): 'persist' | 'mismatch' | 'keep' {
+  const persistable =
+    result.status === 'success' || result.interrupted === true;
+  if (!persistable || !result.threadId) return 'keep';
+  if (attemptThreadId && result.threadId !== attemptThreadId) return 'mismatch';
+  if (
+    !attemptThreadId &&
+    result.status !== 'success' &&
+    result.anchored === false
+  ) {
+    return 'keep';
+  }
+  return result.threadId !== currentThreadId ? 'persist' : 'keep';
+}
+
+/**
+ * A fresh thread saved early (anchored) whose first turn then failed plainly
+ * — no timeout or «стоп», no action taken, not a network or quota hiccup —
+ * is dropped again: that keeps the old rule that a failed fresh thread which
+ * did nothing is not continued. One that acted or was interrupted is kept,
+ * and a thread that later fails to resume clears itself.
+ */
+export function shouldDropAnchoredFreshThread(
+  result: Pick<
+    CodexTurnResult,
+    | 'status'
+    | 'interrupted'
+    | 'superseded'
+    | 'acted'
+    | 'error'
+    | 'sideEffected'
+    | 'imageArtifacts'
+  >,
+): boolean {
+  return (
+    result.status === 'error' &&
+    result.interrupted !== true &&
+    result.superseded !== true &&
+    result.acted !== true &&
+    canSafelyRerunCodexTurn(result) &&
+    !isCodexServiceHiccup(result.error ?? '')
+  );
+}
+
+/**
+ * A resume failed for a reason the stale-thread regex didn't catch (e.g.
+ * 'failed to load rollout'): drop the thread id so the next run starts fresh
+ * instead of failing forever on the same dead thread. Not after an action
+ * (the thread holds it) and not for a failure of the service, the link or
+ * the login (isCodexServiceHiccup) — those leave the thread intact.
+ */
+export function shouldClearThreadAfterResumeError(
+  result: Pick<
+    CodexTurnResult,
+    'status' | 'error' | 'sideEffected' | 'imageArtifacts'
+  >,
+  threadId: string | undefined,
+): boolean {
+  return (
+    result.status === 'error' &&
+    Boolean(threadId) &&
+    canSafelyRerunCodexTurn(result) &&
+    !isCodexServiceHiccup(result.error ?? '')
+  );
+}
+
+/** Write a small file so a reader sees the old or the new content, never half. */
+function writeFileAtomicSync(file: string, data: string): void {
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* never created */
+    }
+    throw err;
+  }
+}
+
+/**
+ * Save the chat's codex thread: the meta first, then the id, each atomically.
+ * A crash between the two leaves a new meta next to the old (for a fresh
+ * thread: absent) id, which only means a fresh start — never an id whose
+ * meta belongs to another thread. No-op for runs that do not share the
+ * chat's thread (scheduled tasks, forwarded text). Returns true on success.
+ */
+export function persistCodexThread(input: {
+  idFile: string;
+  metaFile: string;
+  threadId: string;
+  meta: CodexThreadMeta;
+  sharesChatThread: boolean;
+}): boolean {
+  if (!input.sharesChatThread) return false;
+  try {
+    writeFileAtomicSync(input.metaFile, JSON.stringify(input.meta));
+    writeFileAtomicSync(input.idFile, input.threadId);
+    return true;
+  } catch {
+    return false; /* thread continuity is best-effort */
+  }
+}
+
+/**
+ * Whether the runner still sends liveness heartbeats to the host. Without an
+ * idle stop, a codex silent for 5 minutes with nothing in flight is presumed
+ * wedged and the host's watchdogs are left to kill the run. With one, the
+ * runner stops such a turn itself — gracefully, keeping the thread — so the
+ * heartbeats run a minute past that limit and the host's timers stay
+ * backstops for a wedged runner.
+ */
+export function codexHeartbeatAlive(input: {
+  now: number;
+  lastEventAt: number;
+  itemsInFlight: number;
+  inactivityMs?: number;
+}): boolean {
+  const windowMs =
+    typeof input.inactivityMs === 'number' && input.inactivityMs > 0
+      ? input.inactivityMs + 60_000
+      : 300_000;
+  return input.itemsInFlight > 0 || input.now - input.lastEventAt < windowMs;
+}
+
 export function shouldRetryCodexStaleThreadFresh(
   result: Pick<
     CodexTurnResult,
@@ -703,18 +1487,283 @@ export function shouldRetryCodexStaleThreadFresh(
   );
 }
 
-/** Preserve ambiguous host-side effects across the runner/host boundary. */
-export function codexTurnErrorOutput(result: CodexTurnResult): ContainerOutput {
+/**
+ * Preserve ambiguous host-side effects across the runner/host boundary — and
+ * what the failed turn cost: a turn cut at its cap still burned its tokens
+ * (25.10: 22.6 M on a scheduled turn written down as 0).
+ */
+export function codexTurnErrorOutput(
+  result: CodexTurnResult,
+  requested?: RequestedCodexTurnSettings,
+): ContainerOutput {
+  const codexTurn = codexTurnTelemetry(result, undefined, requested);
+  const { usage } = mergeTurnAccounting(result);
   return {
     status: 'error',
     result: null,
     error: result.error || 'codex turn failed',
+    ...(usage ? { usage } : {}),
+    ...(codexTurn?.modelRequests ? { turns: codexTurn.modelRequests } : {}),
     imageArtifacts: result.imageArtifacts,
     imageGenerationCompleted: result.imageGenerationCompleted,
     imageGenerationCallIds: result.imageGenerationCallIds,
     sideEffected: result.sideEffected,
     sideEffectTools: result.sideEffectTools,
+    ...(codexTurn ? { codexTurn } : {}),
   };
+}
+
+const LINK_FIX_REASONING_EFFORTS = new Set([
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+]);
+
+/**
+ * Whether this run checks the links of its answers. Scheduled tasks answer
+ * into their own thread, a forwarded/quoted turn is pinned read-only on
+ * purpose (a fetcher of model-made URLs would reopen that channel), and
+ * behind a proxy Node's fetch goes direct anyway while a refusal could be the
+ * proxy's — the host strips those runs too, this is the second lock.
+ */
+export function linkCheckGateForInput(
+  input: Pick<
+    ContainerInput,
+    'linkCheck' | 'isScheduledTask' | 'indirectOwnerContent'
+  >,
+  env: NodeJS.ProcessEnv,
+):
+  | { allowed: true; mode: LinkCheckMode; fixReasoningEffort?: string }
+  | { allowed: false; reason: string } {
+  const cfg = input.linkCheck;
+  if (!cfg) return { allowed: false, reason: 'not-granted' };
+  if (!LINK_CHECK_MODES.includes(cfg.mode)) {
+    return { allowed: false, reason: 'bad-mode' };
+  }
+  if (input.isScheduledTask === true) {
+    return { allowed: false, reason: 'scheduled-task' };
+  }
+  if (input.indirectOwnerContent === true) {
+    return { allowed: false, reason: 'indirect-content' };
+  }
+  if (proxyConfiguredInEnv(env)) return { allowed: false, reason: 'proxy' };
+  const effort = cfg.fixReasoningEffort;
+  return {
+    allowed: true,
+    mode: cfg.mode,
+    ...(effort && LINK_FIX_REASONING_EFFORTS.has(effort)
+      ? { fixReasoningEffort: effort }
+      : {}),
+  };
+}
+
+type TurnAccounting = Pick<
+  CodexTurnResult,
+  | 'usage'
+  | 'usageSource'
+  | 'modelRequests'
+  | 'appliedServiceTier'
+  | 'appliedReasoningEffort'
+  | 'accountUsedPercent'
+  | 'toolCalls'
+  | 'subagentTokens'
+  | 'toolErrors'
+  | 'toolExitNonzero'
+  | 'toolWallMsTotal'
+  | 'toolWallMsMax'
+  | 'codexCliVersion'
+  | 'sideEffected'
+  | 'sideEffectTools'
+>;
+
+/** What the runner asked codex for on this turn (the tier decision). */
+export interface RequestedCodexTurnSettings {
+  requestedServiceTier: 'priority' | null;
+  fastTierDroppedForQuota: boolean;
+}
+
+/**
+ * The telemetry of a turn (and its link-correction turn) for the host:
+ * requests and tool calls add up, the applied settings and the account limit
+ * are the newest observed. Undefined when nothing at all was observed (no
+ * CODEX_HOME, codex died before writing). Exported for tests.
+ */
+export function codexTurnTelemetry(
+  result: TurnAccounting,
+  fix?: TurnAccounting,
+  requested?: RequestedCodexTurnSettings,
+): CodexTurnTelemetry | undefined {
+  const out: CodexTurnTelemetry = {};
+  // A correction on a resumed thread is always a delta; the pair is as
+  // honest as its weaker half.
+  const usageSource =
+    result.usageSource && fix?.usageSource && fix.usageSource !== 'turn_delta'
+      ? fix.usageSource
+      : (result.usageSource ?? fix?.usageSource);
+  if (usageSource) out.usageSource = usageSource;
+  const modelRequests = (result.modelRequests ?? 0) + (fix?.modelRequests ?? 0);
+  if (modelRequests > 0) out.modelRequests = modelRequests;
+  const serviceTier = fix?.appliedServiceTier ?? result.appliedServiceTier;
+  if (serviceTier !== undefined) out.serviceTier = serviceTier;
+  const reasoningEffort =
+    fix?.appliedReasoningEffort ?? result.appliedReasoningEffort;
+  if (reasoningEffort !== undefined) out.reasoningEffort = reasoningEffort;
+  const accountUsedPercent =
+    fix?.accountUsedPercent ?? result.accountUsedPercent;
+  if (accountUsedPercent !== undefined) out.accountUsedPercent = accountUsedPercent;
+  const toolCalls: Record<string, number> = {};
+  for (const source of [result.toolCalls, fix?.toolCalls]) {
+    for (const [name, count] of Object.entries(source ?? {})) {
+      toolCalls[name] = (toolCalls[name] ?? 0) + count;
+    }
+  }
+  if (Object.keys(toolCalls).length > 0) out.toolCalls = toolCalls;
+  const subagentTokens =
+    (result.subagentTokens ?? 0) + (fix?.subagentTokens ?? 0);
+  if (subagentTokens > 0) out.subagentTokens = subagentTokens;
+  const toolErrors: Record<string, number> = {};
+  for (const source of [result.toolErrors, fix?.toolErrors]) {
+    for (const [name, count] of Object.entries(source ?? {})) {
+      toolErrors[name] = (toolErrors[name] ?? 0) + count;
+    }
+  }
+  if (Object.keys(toolErrors).length > 0) out.toolErrors = toolErrors;
+  const toolExitNonzero =
+    (result.toolExitNonzero ?? 0) + (fix?.toolExitNonzero ?? 0);
+  if (toolExitNonzero > 0) out.toolExitNonzero = toolExitNonzero;
+  if (result.toolWallMsTotal !== undefined || fix?.toolWallMsTotal !== undefined) {
+    out.toolWallMsTotal =
+      (result.toolWallMsTotal ?? 0) + (fix?.toolWallMsTotal ?? 0);
+    out.toolWallMsMax = Math.max(
+      result.toolWallMsMax ?? 0,
+      fix?.toolWallMsMax ?? 0,
+    );
+  }
+  const codexCliVersion = fix?.codexCliVersion ?? result.codexCliVersion;
+  if (codexCliVersion) out.codexCliVersion = codexCliVersion;
+  if (requested) {
+    out.requestedServiceTier = requested.requestedServiceTier;
+    if (requested.fastTierDroppedForQuota) out.fastTierDroppedForQuota = true;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * One success frame covers the turn and its link-correction turn: tokens are
+ * summed, and a side effect of either stays visible to the host's bookkeeping.
+ * Without a correction the fields are exactly what the turn reported.
+ */
+export function mergeTurnAccounting(
+  result: TurnAccounting,
+  fix?: TurnAccounting,
+): Pick<ContainerOutput, 'usage' | 'sideEffected' | 'sideEffectTools'> {
+  const usages = [result.usage, fix?.usage].filter(
+    (usage): usage is NonNullable<TurnAccounting['usage']> => Boolean(usage),
+  );
+  const cacheReads = usages
+    .map((usage) => usage.cacheReadInputTokens)
+    .filter((value): value is number => typeof value === 'number');
+  const usage =
+    usages.length > 0
+      ? {
+          inputTokens: usages.reduce((sum, u) => sum + u.inputTokens, 0),
+          outputTokens: usages.reduce((sum, u) => sum + u.outputTokens, 0),
+          cacheReadInputTokens:
+            cacheReads.length > 0
+              ? cacheReads.reduce((sum, value) => sum + value, 0)
+              : undefined,
+        }
+      : undefined;
+  const tools =
+    result.sideEffectTools || fix?.sideEffectTools
+      ? [
+          ...new Set([
+            ...(result.sideEffectTools ?? []),
+            ...(fix?.sideEffectTools ?? []),
+          ]),
+        ]
+      : undefined;
+  return {
+    usage,
+    sideEffected:
+      fix?.sideEffected === true ? true : result.sideEffected,
+    sideEffectTools: tools,
+  };
+}
+
+/**
+ * A turn and its finalize-hold turn as one turn for the accounting above:
+ * tokens, requests and tool calls add up, the applied settings and the
+ * account limit are the newest, a side effect of either stays visible.
+ * Exported for tests.
+ */
+export function combineTurnAccounting(
+  turn: TurnAccounting,
+  hold?: TurnAccounting,
+): TurnAccounting {
+  if (!hold) return turn;
+  const merged = mergeTurnAccounting(turn, hold);
+  const telemetry = codexTurnTelemetry(turn, hold);
+  return {
+    usage: merged.usage,
+    sideEffected: merged.sideEffected,
+    sideEffectTools: merged.sideEffectTools,
+    usageSource: telemetry?.usageSource,
+    modelRequests: telemetry?.modelRequests,
+    appliedServiceTier: telemetry?.serviceTier,
+    appliedReasoningEffort: telemetry?.reasoningEffort,
+    accountUsedPercent: telemetry?.accountUsedPercent,
+    toolCalls: telemetry?.toolCalls,
+    // The turn telemetry of 26.10 (C41, G1.4): without these a held turn's
+    // success frame lost its sub-agent tokens, tool failures and CLI version.
+    ...(telemetry?.subagentTokens !== undefined
+      ? { subagentTokens: telemetry.subagentTokens }
+      : {}),
+    ...(telemetry?.toolErrors ? { toolErrors: telemetry.toolErrors } : {}),
+    ...(telemetry?.toolExitNonzero !== undefined
+      ? { toolExitNonzero: telemetry.toolExitNonzero }
+      : {}),
+    ...(telemetry?.toolWallMsTotal !== undefined
+      ? {
+          toolWallMsTotal: telemetry.toolWallMsTotal,
+          toolWallMsMax: telemetry.toolWallMsMax,
+        }
+      : {}),
+    ...(telemetry?.codexCliVersion
+      ? { codexCliVersion: telemetry.codexCliVersion }
+      : {}),
+  };
+}
+
+/** Retain artifact references as evidence for a continuation, never as a new
+ * delivery command. The regular host send tools still validate every path. */
+export function deferredResultDraft(
+  result: Pick<
+    CodexTurnResult,
+    'text' | 'imageArtifacts' | 'imageGenerationCompleted'
+  >,
+): string | undefined {
+  const artifacts = (result.imageArtifacts ?? [])
+    .filter(
+      (artifact) =>
+        typeof artifact.savedPath === 'string' &&
+        artifact.savedPath.length <= 2048,
+    )
+    .slice(0, 8)
+    .map((artifact) => ({
+      call_id: String(artifact.callId).slice(0, 200),
+      saved_path: artifact.savedPath,
+    }));
+  if (artifacts.length === 0 && !result.imageGenerationCompleted)
+    return result.text ?? undefined;
+  return [
+    '[В прошлом ходе наблюдалась генерация изображения. Ниже ссылки на её результат как данные для проверки; доставка пользователю не подтверждена. Новое уточнение может отменять или менять изображение: не отправляй старый вариант автоматически. Проверь актуальность, наличие файла и допустимость пути обычным инструментом отправки.]',
+    JSON.stringify({ generated_artifacts: artifacts }),
+    result.text ?? '',
+  ].join('\n');
 }
 
 function getSessionSummary(
@@ -747,7 +1796,84 @@ function getSessionSummary(
 }
 
 /**
- * Archive the full transcript to conversations/ before compaction.
+ * Per-session archive bookkeeping, kept next to the archives themselves.
+ *
+ * Without it every compaction re-dumped the WHOLE transcript under a filename
+ * derived from the (mutable) session summary, so one session left N files that
+ * were byte-prefixes of each other — 497 MB of duplicates on the live instance,
+ * which also crowded the real memory/*.md out of the memory_search budget.
+ */
+interface ArchiveStateEntry {
+  /** Archive file this session appends to, relative to conversations/. */
+  file: string;
+  /** How many parsed messages have already been written to that file. */
+  archived: number;
+  /** Fingerprint of those messages, to detect a transcript reset. */
+  fingerprint: string;
+  /** Whether `file` was named from a real summary (vs. a fallback name). */
+  named: boolean;
+}
+
+type ArchiveState = Record<string, ArchiveStateEntry>;
+
+const ARCHIVE_STATE_FILE = '.archive-state.json';
+
+function readArchiveState(conversationsDir: string): ArchiveState {
+  try {
+    const raw = fs.readFileSync(
+      path.join(conversationsDir, ARCHIVE_STATE_FILE),
+      'utf-8',
+    );
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? (parsed as ArchiveState) : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeArchiveState(conversationsDir: string, state: ArchiveState): void {
+  const target = path.join(conversationsDir, ARCHIVE_STATE_FILE);
+  const tmp = `${target}.tmp-${process.pid}`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+    fs.renameSync(tmp, target);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* ignore */
+    }
+    log(
+      `Failed to persist archive state: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
+ * Cheap fingerprint over the first `count` messages. Compaction rewrites the
+ * transcript, so a matching fingerprint is what proves the new transcript still
+ * extends what we already archived and the tail can simply be appended.
+ */
+function fingerprintMessages(
+  messages: ParsedMessage[],
+  count: number,
+): string {
+  const hash = createHash('sha256');
+  for (let i = 0; i < count && i < messages.length; i++) {
+    hash.update(messages[i].role);
+    hash.update('\0');
+    hash.update(messages[i].content.slice(0, 200));
+    hash.update('\0');
+  }
+  return hash.digest('hex');
+}
+
+/**
+ * Archive the transcript to conversations/ before compaction.
+ *
+ * Appends only the messages added since the previous compaction of this
+ * session; falls back to a fresh file when the transcript no longer extends
+ * what was archived.
  */
 function createPreCompactHook(assistantName?: string): HookCallback {
   return async (input, _toolUseId, _context) => {
@@ -776,17 +1902,94 @@ function createPreCompactHook(assistantName?: string): HookCallback {
       fs.mkdirSync(conversationsDir, { recursive: true });
 
       const date = new Date().toISOString().split('T')[0];
-      const filename = `${date}-${name}.md`;
+      const state = readArchiveState(conversationsDir);
+      const prior = sessionId ? state[sessionId] : undefined;
+
+      // Resume the session's existing archive only if the file is still there
+      // and the transcript still starts with what we already wrote.
+      let entry: ArchiveStateEntry | undefined;
+      if (
+        prior &&
+        prior.archived <= messages.length &&
+        fs.existsSync(path.join(conversationsDir, prior.file)) &&
+        fingerprintMessages(messages, prior.archived) === prior.fingerprint
+      ) {
+        entry = prior;
+      }
+
+      let filename: string;
+      let appended: number;
+
+      if (entry) {
+        filename = entry.file;
+        const filePath = path.join(conversationsDir, filename);
+
+        // A summary that only materialised later gets the file its real name.
+        if (summary && !entry.named) {
+          const renamed = `${date}-${name}.md`;
+          const renamedPath = path.join(conversationsDir, renamed);
+          if (renamed !== filename && !fs.existsSync(renamedPath)) {
+            try {
+              fs.renameSync(filePath, renamedPath);
+              filename = renamed;
+              entry.named = true;
+            } catch {
+              /* keep the old name */
+            }
+          }
+        }
+
+        const fresh = messages.slice(entry.archived);
+        appended = fresh.length;
+        if (appended > 0) {
+          fs.appendFileSync(
+            path.join(conversationsDir, filename),
+            renderTranscriptMessages(fresh, assistantName),
+          );
+        }
+        entry.file = filename;
+        entry.archived = messages.length;
+        entry.fingerprint = fingerprintMessages(messages, messages.length);
+      } else {
+        // New session, or the transcript no longer extends the old archive.
+        // Never reuse an existing name: that file belongs to another session and
+        // overwriting it is exactly the data loss this rewrite is meant to end.
+        filename = `${date}-${name}.md`;
+        let filePath = path.join(conversationsDir, filename);
+        for (let n = 2; fs.existsSync(filePath); n++) {
+          filename = `${date}-${name}-${n}.md`;
+          filePath = path.join(conversationsDir, filename);
+        }
+        fs.writeFileSync(
+          filePath,
+          formatTranscriptMarkdown(messages, summary, assistantName),
+        );
+        appended = messages.length;
+        entry = {
+          file: filename,
+          archived: messages.length,
+          fingerprint: fingerprintMessages(messages, messages.length),
+          named: Boolean(summary),
+        };
+      }
+
+      if (sessionId) {
+        state[sessionId] = entry;
+        // Drop entries whose archive is gone (pruned, renamed by hand) so the
+        // state file stays bounded instead of growing one entry per session.
+        for (const [id, e] of Object.entries(state)) {
+          if (id === sessionId) continue;
+          if (!fs.existsSync(path.join(conversationsDir, e.file))) {
+            delete state[id];
+          }
+        }
+        writeArchiveState(conversationsDir, state);
+      }
+
       const filePath = path.join(conversationsDir, filename);
-
-      const markdown = formatTranscriptMarkdown(
-        messages,
-        summary,
-        assistantName,
+      log(
+        `Archived conversation to ${filePath} (+${appended} of ${messages.length} messages)`,
       );
-      fs.writeFileSync(filePath, markdown);
-
-      log(`Archived conversation to ${filePath}`);
 
       // Memory flush: extract key facts and append to daily memory log
       try {
@@ -800,8 +2003,8 @@ function createPreCompactHook(assistantName?: string): HookCallback {
 
         // Save a compaction marker with summary and message count
         const flushEntry = summary
-          ? `- [${new Date().toISOString().split('T')[1].split('.')[0]}] [compaction] ${summary} (${messages.length} messages archived)\n`
-          : `- [${new Date().toISOString().split('T')[1].split('.')[0]}] [compaction] ${messages.length} messages archived to conversations/${filename}\n`;
+          ? `- [${new Date().toISOString().split('T')[1].split('.')[0]}] [compaction] ${summary} (${appended} new messages archived, ${messages.length} total)\n`
+          : `- [${new Date().toISOString().split('T')[1].split('.')[0]}] [compaction] ${appended} new messages archived to conversations/${filename} (${messages.length} total)\n`;
         fs.appendFileSync(memoryFile, flushEntry);
         log(`Memory flush: wrote summary to ${memoryFile}`);
       } catch (memErr) {
@@ -916,13 +2119,30 @@ function formatTranscriptMarkdown(
       hour12: true,
     });
 
-  const lines: string[] = [];
-  lines.push(`# ${title || 'Conversation'}`);
-  lines.push('');
-  lines.push(`Archived: ${formatDateTime(now)}`);
-  lines.push('');
-  lines.push('---');
-  lines.push('');
+  const header =
+    [
+      `# ${title || 'Conversation'}`,
+      '',
+      `Archived: ${formatDateTime(now)}`,
+      '',
+      '---',
+    ].join('\n') + '\n\n';
+
+  return header + renderTranscriptMessages(messages, assistantName);
+}
+
+/**
+ * Render just the message block — no header — so later compactions of the same
+ * session can append their tail instead of re-dumping the whole transcript.
+ *
+ * Every block is terminated with a blank line so an appended chunk is spaced
+ * exactly like the messages already in the file.
+ */
+function renderTranscriptMessages(
+  messages: ParsedMessage[],
+  assistantName?: string,
+): string {
+  let out = '';
 
   for (const msg of messages) {
     const sender = msg.role === 'user' ? 'User' : assistantName || 'Assistant';
@@ -930,11 +2150,10 @@ function formatTranscriptMarkdown(
       msg.content.length > 2000
         ? msg.content.slice(0, 2000) + '...'
         : msg.content;
-    lines.push(`**${sender}**: ${content}`);
-    lines.push('');
+    out += `**${sender}**: ${content}\n\n`;
   }
 
-  return lines.join('\n');
+  return out;
 }
 
 /**
@@ -957,22 +2176,31 @@ function shouldClose(): boolean {
  * Returns messages found, or empty array.
  */
 function drainIpcInput(): string[] {
-  try {
-    fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
-    const files = fs
-      .readdirSync(IPC_INPUT_DIR)
-      .filter((f) => f.endsWith('.json'))
-      .sort();
+  return drainIpcInputDetailed().map((file) => file.text);
+}
 
-    const messages: string[] = [];
+/**
+ * Same, with each file's mtime: when the host wrote it. A follow-up turn
+ * tells «sent before the previous answer» from «a reaction to it» by this —
+ * and whether a finalize hold on it failed (finalize-hold.ts). Exported for
+ * tests (`dir`).
+ */
+export function drainIpcInputDetailed(
+  dir: string = IPC_INPUT_DIR,
+  excludedNames: ReadonlySet<string> = new Set(),
+): IpcInputFile[] {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const files = listIpcInputNames(dir);
+
+    const messages: IpcInputFile[] = [];
     for (const file of files) {
-      const filePath = path.join(IPC_INPUT_DIR, file);
+      if (excludedNames.has(file)) continue;
+      const filePath = path.join(dir, file);
       try {
-        const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        const message = readIpcInputFile(dir, file);
         fs.unlinkSync(filePath);
-        if (data.type === 'message' && data.text) {
-          messages.push(data.text);
-        }
+        if (message) messages.push(message);
       } catch (err) {
         log(
           `Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`,
@@ -991,11 +2219,38 @@ function drainIpcInput(): string[] {
   }
 }
 
+/** True when a follow-up message is waiting in the IPC input dir (not consumed). */
+function ipcInputPending(): boolean {
+  try {
+    return fs.readdirSync(IPC_INPUT_DIR).some((f) => f.endsWith('.json'));
+  } catch {
+    return false;
+  }
+}
+
+/** How many IPC files the last waitForIpcMessage() drained. */
+let lastIpcDrainCount = 0;
+/**
+ * How many of them the host wrote BEFORE the previous turn's answer went out
+ * (see followUpContinuationNote). 0 when the caller gave no answer time.
+ */
+let lastIpcDrainArrivedDuringTurn = 0;
+/** One of them is a message a finalize hold failed on (finalize-hold.ts). */
+let lastIpcDrainAfterFailedHold = false;
+/** What those failed holds already did (tools). */
+let lastIpcDrainHoldDoneTools: string[] = [];
+let lastIpcDrainHoldOriginalText: string | undefined;
+
 /**
  * Wait for a new IPC message or _close sentinel.
  * Returns the messages as a single string, or null if _close.
+ * `turnAnsweredAt` — when the previous turn's answer was written (success
+ * frame); files older than that were sent while that turn still ran.
  */
-function waitForIpcMessage(): Promise<string | null> {
+function waitForIpcMessage(
+  turnAnsweredAt?: number,
+  excludedNames: ReadonlySet<string> = new Set(),
+): Promise<string | null> {
   return new Promise((resolve) => {
     let done = false;
     let pollTimer: NodeJS.Timeout | undefined;
@@ -1026,9 +2281,23 @@ function waitForIpcMessage(): Promise<string | null> {
         finish(null);
         return;
       }
-      const messages = drainIpcInput();
-      if (messages.length > 0) {
-        finish(messages.join('\n'));
+      const batch = drainIpcInputDetailed(IPC_INPUT_DIR, excludedNames);
+      if (batch.length > 0) {
+        lastIpcDrainCount = batch.length;
+        lastIpcDrainArrivedDuringTurn = ipcBatchArrivedDuringTurn(
+          batch,
+          turnAnsweredAt,
+        );
+        lastIpcDrainAfterFailedHold = batch.some(
+          (file) => file.afterFailedHold === true,
+        );
+        lastIpcDrainHoldDoneTools = batch.flatMap(
+          (file) => file.holdDoneTools ?? [],
+        );
+        lastIpcDrainHoldOriginalText = batch.find(
+          (file) => file.holdOriginalText,
+        )?.holdOriginalText;
+        finish(batch.map((file) => file.text).join('\n'));
         return;
       }
       pollTimer = setTimeout(poll, IPC_POLL_MS);
@@ -1422,6 +2691,7 @@ async function runQuery(
   }, 30_000);
 
   try {
+    const query = await loadClaudeQuery();
     for await (const message of query({
       prompt: stream,
       options: queryOptions,
@@ -1622,10 +2892,11 @@ async function runQuery(
  * a stale thread transparently falls back to a fresh one (same pattern as the
  * SDK's stale-session recovery).
  */
-async function runCodexProviderLoop(
+export async function runCodexProviderLoop(
   containerInput: ContainerInput,
   mcpServerPath: string,
   initialPrompt: string,
+  initialPending: readonly IpcInputFile[] = [],
 ): Promise<void> {
   const codexCfg = containerInput.codex;
   if (!codexCfg?.command) {
@@ -1641,7 +2912,30 @@ async function runCodexProviderLoop(
   const sharedUserMemoryDir = senderIdentity?.identity_id
     ? process.env.CLAUDECLAW_SHARED_USER_MEMORY_DIR || '/workspace/user-memory'
     : undefined;
-  const mcpEnv = buildClaudeclawMcpEnv(containerInput, sharedUserMemoryDir);
+  // Проверка ссылок финала: разрешение хоста на этот прогон плюс свои замки.
+  // Чтения чужого текста (почта, WhatsApp, документы) MCP-сервер отмечает
+  // файлом-меткой этого прогона, а их ссылки дописывает в список чата в
+  // каталоге группы (тред помнит прочитанное и в следующих ходах); метку или
+  // список нельзя завести — проверки нет вовсе.
+  const linkCheckGrant = linkCheckGateForInput(containerInput, process.env);
+  const linkRun = createLinkCheckRun({
+    enabled: linkCheckGrant.allowed,
+    ipcDir: WORKSPACE_IPC,
+    noteFile: path.join(WORKSPACE_GROUP, '.codex-link-fix-note'),
+    foreignUrlsFile: foreignUrlsFilePath(WORKSPACE_GROUP),
+    log,
+  });
+  const linkCheckGate: ReturnType<typeof linkCheckGateForInput> =
+    linkCheckGrant.allowed && !linkRun.foreignReadMarker
+      ? { allowed: false, reason: 'foreign-read-marker' }
+      : linkCheckGrant;
+  if (!linkCheckGate.allowed && containerInput.linkCheck) {
+    log(`Link check off for this run: ${linkCheckGate.reason}`);
+  }
+  const mcpEnv = {
+    ...buildClaudeclawMcpEnv(containerInput, sharedUserMemoryDir),
+    ...linkRun.mcpEnv,
+  };
   const mcp = {
     serverPath: mcpServerPath,
     nodePath: process.execPath,
@@ -1652,33 +2946,70 @@ async function runCodexProviderLoop(
   // (ps-visible to same-user processes). Falls back to secret-stripped argv
   // overrides when CODEX_HOME is unavailable.
   const mcpViaConfig = writeCodexConfigToml(process.env.CODEX_HOME, mcp);
+  codexConfigWritten = mcpViaConfig;
   if (!mcpViaConfig) {
     log(
       'WARNING: CODEX_HOME unset — MCP config via argv (secrets stripped); memory/tools still work',
     );
   }
-  const preamble = buildCodexPreamble({
-    systemContext: assembleSystemContext(containerInput),
+  // The thread identity leaves the chat's CLAUDE.md out, and a fresh thread
+  // gets the runner's copy only when its prompt has no host copy (C25).
+  const preambles = buildCodexPreambleSet({
+    systemContext: assembleSystemContext(containerInput, false),
     cwd: WORKSPACE_GROUP,
-    disallowedTools: agentCfg?.disallowedTools,
     includeWorkspaceClaudeMd:
       containerInput.isMain || !isMultiSenderChatJid(containerInput.chatJid),
   });
+  const disallowedTools = agentCfg?.disallowedTools ?? [];
+  // The disabled-tool list changes per turn (a turn that carries foreign text
+  // quarantines outbound tools; an image job drops the send_* tools), so it is
+  // neither part of the thread-identity hash (it rotated the owner's thread on
+  // and off 4 times in one week) nor of the preamble a new thread keeps for
+  // good — there it would read «disabled for this chat» for days. The MCP
+  // server does not register those tools at all; every turn that has a list
+  // gets it as a note in front of its own prompt.
+  const disabledToolsNote =
+    disallowedTools.length > 0
+      ? `<disabled_tools>\nThe following tools are disabled for this turn and must never be called: ${disallowedTools.join(', ')}.\n</disabled_tools>`
+      : '';
+  const withToolsNote = (text: string): string =>
+    disabledToolsNote ? `${disabledToolsNote}\n\n${text}` : text;
 
   // Same memory dir the SDK path guarantees — memory_* tools expect it.
   fs.mkdirSync(path.join(WORKSPACE_GROUP, 'memory'), { recursive: true });
 
   const threadIdFile = path.join(WORKSPACE_GROUP, '.codex-thread-id');
   const threadMetaFile = path.join(WORKSPACE_GROUP, '.codex-thread-meta.json');
+  // A scheduled task runs on its own fresh thread and never touches the
+  // chat's: its persona differs, so sharing the file rotated the live thread
+  // twice per task run (the task dropped it, the next chat turn dropped the
+  // task's) and the chat lost its conversation — 8 of 30 resets in a week.
+  // A turn carrying forwarded/quoted foreign text also runs on a throw-away
+  // thread: that text must not sit in the owner's fully privileged thread for
+  // the turns that follow (the host still shows it in recent history, as
+  // data).
+  const sharesChatThread =
+    containerInput.isScheduledTask !== true &&
+    containerInput.indirectOwnerContent !== true;
+  // Finalize hold (C12): granted by the host per run. It relies on the host's
+  // absorbedFollowUps handling (allowFollowUpSupersede) and resumes the
+  // chat's own thread.
+  const finalizeHoldAllowed =
+    containerInput.finalizeHold === true &&
+    containerInput.allowFollowUpSupersede === true &&
+    sharesChatThread;
   let threadId: string | undefined;
   try {
-    const raw = fs.readFileSync(threadIdFile, 'utf-8').trim();
+    const raw = sharesChatThread
+      ? fs.readFileSync(threadIdFile, 'utf-8').trim()
+      : '';
     if (/^[0-9a-f][0-9a-f-]{8,}$/i.test(raw)) threadId = raw;
   } catch {
     /* no persisted thread — start fresh */
   }
   const clearThreadId = () => {
     threadId = undefined;
+    if (!sharesChatThread) return;
     for (const f of [threadIdFile, threadMetaFile]) {
       try {
         fs.unlinkSync(f);
@@ -1687,13 +3018,27 @@ async function runCodexProviderLoop(
       }
     }
   };
+  // The chat's thread is dropped because codex could not resume it: the host
+  // records it like a planned rotation. Both paths used to be silent, so the
+  // loss of the owner's thread on 26.10 left no trace at all.
+  const reportUnplannedThreadReset = (
+    reason: 'stale' | 'resume-error',
+    droppedThreadId: string,
+  ): void => {
+    if (!sharesChatThread) return;
+    writeOutput({
+      status: 'heartbeat',
+      result: null,
+      threadRotated: { reason, threadId: droppedThreadId },
+    });
+  };
 
   // Rotate the thread when the operating context changed since the thread's
   // first turn (the preamble is only ever sent on turn one), the thread
   // outlived its age cap, or its rollout grew past the byte cap — parity with
   // the Claude path, which re-reads its system context every run and rotates
   // oversized transcripts.
-  const preambleHash = createHash('sha256').update(preamble).digest('hex');
+  const preambleHash = preambles.identityHash;
   if (threadId) {
     let threadMeta: CodexThreadMeta | null = null;
     try {
@@ -1704,50 +3049,268 @@ async function runCodexProviderLoop(
     } catch {
       /* missing/corrupt meta → rotate below */
     }
-    const rolloutBytes = codexRolloutBytes(process.env.CODEX_HOME, threadId);
+    const rollout = codexRolloutStat(process.env.CODEX_HOME, threadId);
     const rotate = shouldRotateCodexThread(
       threadMeta,
       preambleHash,
       Date.now(),
-      rolloutBytes,
+      rollout?.bytes,
+      rollout?.mtimeMs,
+      promptCarriesHostClaudeMd(initialPrompt)
+        ? undefined
+        : preambles.claudeMdCopyHash,
     );
     if (rotate) {
       log(
-        `Rotating codex thread ${threadId} (${rotate}); starting fresh so the reserve picks up the current system context.`,
+        `Rotating codex thread ${threadId} (${rotate}${rollout ? `, rollout ${rollout.bytes} bytes` : ''}); starting fresh so the reserve picks up the current system context.`,
       );
+      const rotatedThreadId = threadId;
       clearThreadId();
+      // The host records it as an event: a rotation loses the thread's tool
+      // state, and until now it showed up only in debug-level runner logs.
+      writeOutput({
+        status: 'heartbeat',
+        result: null,
+        threadRotated: {
+          reason: rotate,
+          threadId: rotatedThreadId,
+          ...(rollout ? { rolloutBytes: rollout.bytes } : {}),
+        },
+      });
     }
   }
 
+  const readThreadMeta = (): CodexThreadMeta | null => {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(threadMetaFile, 'utf-8'));
+      return parsed && typeof parsed.preambleHash === 'string'
+        ? (parsed as CodexThreadMeta)
+        : null;
+    } catch {
+      return null;
+    }
+  };
+  // Standing context blocks this thread already holds (hash per block).
+  let standingSent: Record<string, string> | undefined =
+    threadId && sharesChatThread ? readThreadMeta()?.standingBlocks : undefined;
+
   // Liveness heartbeats for the host watchdogs, mirroring the SDK path: emit a
-  // frame every ≥60s while codex is provably alive — either a JSONL/stderr
-  // event flowed recently OR an item is still in flight (a long silent tool or
-  // xhigh reasoning block). A genuinely wedged codex (no events, no open item)
-  // stops the pulse and is still bounded by the per-turn timeout.
+  // frame every ≥60s while codex is provably alive — either a JSONL event or
+  // rollout growth came recently OR an item is still in flight (a long silent
+  // tool or xhigh reasoning block). A genuinely wedged codex (no events, no
+  // open item) stops the pulse and is still bounded by the per-turn timeout —
+  // or, with an idle stop configured, stopped by codex-exec itself first
+  // (see codexHeartbeatAlive).
   let lastEventAt = Date.now();
   let lastFrameAt = 0;
   let itemsInFlight = 0;
+  // Промежуточные реплики модели: разрешение на ход, счётчик попыток и
+  // признак «уже что-то отправили» (см. onProgressMessage ниже).
+  const progressAllowed =
+    containerInput.emitProgressMessages === true &&
+    containerInput.isScheduledTask !== true;
+  let progressEmitted = false;
+  let progressAttempt = 0;
   const hbTimer = setInterval(() => {
     log('still working (codex)...');
-    const alive = itemsInFlight > 0 || Date.now() - lastEventAt < 300_000;
+    const alive = codexHeartbeatAlive({
+      now: Date.now(),
+      lastEventAt,
+      itemsInFlight,
+      inactivityMs: codexCfg.inactivityTimeoutMs,
+    });
     if (alive && Date.now() - lastFrameAt >= 60_000) {
       lastFrameAt = Date.now();
       writeOutput({ status: 'heartbeat', result: null });
     }
   }, 30_000);
 
-  let prompt = initialPrompt;
+  // A link correction the user never got is explained to this thread first.
+  let prompt = linkRun.startUserTurn(initialPrompt, {
+    id: threadId,
+    sharesChatThread,
+  });
+  // Everything still unanswered, in full — what a FRESH thread must receive.
+  // `prompt` may be only a continuation for a thread that already holds the
+  // earlier messages (after a supersede restart).
+  let freshPrompt = initialPrompt;
   let firstTurn = true;
+  let supersedeRestarts = 0;
+  // Attempts of the current user turn that were stopped for newer messages:
+  // their tokens ride on the turn's next success/error frame.
+  let supersededAttempts: CodexTurnResult[] = [];
+  // Meaningful follow-ups replace a stale final with a normal continuation.
+  // Keep their IPC files until the combined answer is accepted. In particular,
+  // a close sentinel or a failed continuation must not discard the draft or
+  // acknowledge input merely because a new Codex process was started.
+  const deferredInputFiles = new Map<string, IpcInputFile>(
+    initialPending.map((file) => [file.name, file]),
+  );
+  // Startup can race a freshly piped batch. It is retained like a deferred
+  // correction, so give even an ordinary IPC input the durable marker which
+  // the host requires before acknowledging/deleting its exact filename.
+  if (initialPending.length > 0) {
+    markFailedHoldInput(IPC_INPUT_DIR, initialPending, log);
+  }
+  const finalizedInputFiles = new Set<string>();
+  let deferredAccounting: TurnAccounting | undefined;
+  const pendingOutsideContinuation = (): IpcInputFile[] =>
+    peekIpcInputFiles(IPC_INPUT_DIR).filter(
+      (file) =>
+        !deferredInputFiles.has(file.name) &&
+        !finalizedInputFiles.has(file.name),
+    );
+  // The fresh thread this turn saved as soon as codex recorded its preamble
+  // (see onThreadAnchored), and when it was saved.
+  let anchoredThreadId: string | undefined;
+  let anchoredCreatedAt: string | undefined;
+  // The thread this attempt asked to resume (undefined = a fresh thread
+  // that receives the preamble).
+  let attemptThreadId: string | undefined;
+  // A compaction mid-turn: the thread now holds only a summary of the
+  // standing blocks. Write that to disk at once, so a turn killed before its
+  // end does not leave a meta that still claims the thread has them.
+  const markCompactedOnDisk = (): void => {
+    const running = attemptThreadId ?? anchoredThreadId;
+    if (!sharesChatThread || !running) return;
+    try {
+      if (fs.readFileSync(threadIdFile, 'utf-8').trim() !== running) return;
+    } catch {
+      return;
+    }
+    const meta = readThreadMeta();
+    if (!meta) return;
+    try {
+      writeFileAtomicSync(
+        threadMetaFile,
+        JSON.stringify({
+          ...meta,
+          standingBlocks: {},
+        } satisfies CodexThreadMeta),
+      );
+    } catch {
+      /* best-effort: the end of the turn writes it again */
+    }
+  };
+  // An extra turn on the chat's thread (link fix, finalize hold) compacted
+  // it: the thread holds only a summary of the standing context now.
+  const forgetStandingBlocks = (): void => {
+    if (!sharesChatThread || !threadId) return;
+    standingSent = {};
+    const meta = readThreadMeta();
+    if (!meta) return;
+    try {
+      fs.writeFileSync(
+        threadMetaFile,
+        JSON.stringify({
+          ...meta,
+          standingBlocks: {},
+        } satisfies CodexThreadMeta),
+      );
+    } catch {
+      /* best-effort: worst case the blocks are re-sent */
+    }
+  };
+  // Start of the current USER turn — supersede restarts do not move it. The
+  // link-correction turn may only use what is left of this turn's budget: the
+  // host's global timer is not reset by heartbeats.
+  let userTurnStartedAt = Date.now();
+  // A normal continuation may perform real work, so it has ordinary progress
+  // and recovery. It is never a hidden auxiliary turn with a three-minute cap.
+  const prepareDeferredContinuation = (
+    hold: FinalizeHoldOutcome,
+    result: CodexTurnResult,
+    settings: RequestedCodexTurnSettings,
+  ): boolean => {
+    deferredAccounting = deferredAccounting
+      ? combineTurnAccounting(deferredAccounting, result)
+      : result;
+    const newer = hold.failed.map((file) => {
+      try {
+        return readIpcInputFile(IPC_INPUT_DIR, file.name) ?? file;
+      } catch {
+        return {
+          ...file,
+          afterFailedHold: true,
+          holdOriginalText: result.text ?? undefined,
+        };
+      }
+    });
+    for (const file of newer) deferredInputFiles.set(file.name, file);
+    if (runnerStopping || shouldClose()) {
+      markFailedHoldInput(
+        IPC_INPUT_DIR,
+        [...deferredInputFiles.values()],
+        log,
+        deferredAccounting.sideEffectTools ?? [],
+      );
+      writeOutput(
+        codexTurnErrorOutput(
+          {
+            ...result,
+            ...deferredAccounting,
+            status: 'error',
+            text: null,
+            interrupted: true,
+            error:
+              'codex continuation interrupted; pending user messages remain on disk',
+          },
+          settings,
+        ),
+      );
+      return false;
+    }
+    writeOutput({
+      status: 'heartbeat',
+      result: null,
+      progressText: 'Получил уточнение. Учитываю его и продолжаю задачу.',
+    });
+    const continuation = joinIpcInputWithHoldNote(newer);
+    linkRun.addPrompt(newer.map((file) => file.text).join('\n'));
+    prompt = linkRun.startUserTurn(continuation, {
+      id: threadId,
+      sharesChatThread,
+    });
+    freshPrompt = `${freshPrompt}\n\n${continuation}`;
+    progressEmitted = false;
+    progressAttempt = 0;
+    return true;
+  };
   try {
     while (true) {
+      // Going down (the host stopped the run): never start another codex
+      // that nobody would stop.
+      if (runnerStopping) break;
       log(
         `Starting codex turn (thread: ${threadId || 'new'}, prompt: ${prompt.length} chars)...`,
       );
       lastEventAt = Date.now();
       itemsInFlight = 0;
+      anchoredThreadId = undefined;
+      anchoredCreatedAt = undefined;
+      // Fast-tier ceiling: this group's own rollouts and the host's reading
+      // across every CODEX_HOME (codexCfg.accountUsedPercent), the larger
+      // one counts. Re-read every turn — the other chat burns the quota too.
+      const tierDecision = resolveCodexTurnServiceTier(
+        codexCfg,
+        codexCfg.serviceTier === 'priority'
+          ? codexAccountUsedPercent(process.env.CODEX_HOME)
+          : null,
+      );
+      const serviceTier = tierDecision.serviceTier;
+      if (tierDecision.droppedForQuota) {
+        log(
+          `Codex account limit at ${tierDecision.usedPercent}% (ceiling ${codexCfg.serviceTierMaxUsedPercent ?? 80}%) — this turn runs at standard speed, not the fast tier`,
+        );
+      }
+      const requestedTurnSettings: RequestedCodexTurnSettings = {
+        requestedServiceTier: serviceTier ?? null,
+        fastTierDroppedForQuota: tierDecision.droppedForQuota,
+      };
       const turnOptions = {
         config: {
           ...codexCfg,
+          serviceTier,
           imagePaths: firstTurn ? codexCfg.imagePaths : undefined,
         },
         cwd: WORKSPACE_GROUP,
@@ -1755,12 +3318,36 @@ async function runCodexProviderLoop(
         mcp,
         mcpViaConfig,
         log,
+        // A burst of messages gets one answer: see CodexTurnOptions.supersede.
+        // Capped per user turn so a user who keeps typing still gets a reply.
+        ...(containerInput.allowFollowUpSupersede === true &&
+        sharesChatThread &&
+        deferredInputFiles.size === 0 &&
+        supersedeRestarts < MAX_SUPERSEDE_RESTARTS &&
+        !codexThreadNearCompaction(process.env.CODEX_HOME, threadId)
+          ? {
+              supersede: {
+                windowMs: SUPERSEDE_WINDOW_MS,
+                pending: ipcInputPending,
+              },
+            }
+          : {}),
         onActivity: () => {
           lastEventAt = Date.now();
         },
         onInFlight: (count: number) => {
           itemsInFlight = count;
         },
+        onProviderResponded: () => {
+          lastEventAt = Date.now();
+          lastFrameAt = Date.now();
+          writeOutput({
+            status: 'heartbeat',
+            result: null,
+            providerResponded: true,
+          });
+        },
+        onContextCompacted: markCompactedOnDisk,
         onSideEffect: (tool: string) => {
           lastEventAt = Date.now();
           lastFrameAt = Date.now();
@@ -1793,21 +3380,121 @@ async function runCodexProviderLoop(
             imageGenerationCallIds: [callId],
           });
         },
+        onProgressMessage: (text: string) => {
+          // Разрешение выдаёт хост на конкретный ход; плановым задачам не
+          // выдаётся никогда — они отвечают в свой тред.
+          if (!progressAllowed) return;
+          // Повторная попытка того же хода (свежий тред после stale или
+          // перезапуск по supersede) молчит, если на первой уже что-то ушло:
+          // сам повтор при этом НЕ блокируется — надёжность важнее.
+          if (
+            interimProgressSuppressedOnRetry({
+              progressEmitted,
+              progressAttempt,
+              supersedeRestarts,
+            })
+          ) {
+            return;
+          }
+          progressEmitted = true;
+          lastEventAt = Date.now();
+          lastFrameAt = Date.now();
+          writeOutput({
+            status: 'heartbeat',
+            result: null,
+            progressText: text,
+          });
+        },
+      };
+      attemptThreadId = threadId;
+      // Policy updates reach resumed threads without discarding their goal,
+      // tool state or scoped authorization. Hashes reset after compaction.
+      const contextualPrompt = withTaskContinuityPolicy(prompt);
+      const contextualFreshPrompt = withTaskContinuityPolicy(freshPrompt);
+      const standing = elideUnchangedStandingBlocks(
+        contextualPrompt,
+        threadId ? standingSent : undefined,
+      );
+      if (standing.prompt.length < contextualPrompt.length) {
+        log(
+          `Standing context unchanged in this thread; prompt ${contextualPrompt.length} → ${standing.prompt.length} chars`,
+        );
+      }
+      let freshStandingBlocks = standing.blocks;
+      // What a fresh attempt of this turn starts with (both fresh attempts
+      // below send `freshPrompt`): the runner's CLAUDE.md copy only when that
+      // prompt has no host copy.
+      const fresh = codexPreambleForFreshThread(preambles, contextualFreshPrompt);
+      const freshThreadMeta = (createdAt: string): CodexThreadMeta => ({
+        preambleHash,
+        createdAt,
+        standingBlocks: { ...freshStandingBlocks },
+        ...(fresh.workspaceClaudeMdHash
+          ? { workspaceClaudeMdHash: fresh.workspaceClaudeMdHash }
+          : {}),
+      });
+      // Fresh attempts only: save the new thread the moment codex has
+      // recorded the message with the preamble, not at the end of the turn.
+      // A «стоп», a host kill or a crash in turn one used to lose it, and the
+      // next message started over (26.08, 03.09). The end-of-turn logic below
+      // stays authoritative; `threadId` is not touched here.
+      const anchorFreshThread = (id: string): void => {
+        if (!sharesChatThread) return;
+        const createdAt = new Date().toISOString();
+        const saved = persistCodexThread({
+          idFile: threadIdFile,
+          metaFile: threadMetaFile,
+          threadId: id,
+          meta: freshThreadMeta(createdAt),
+          sharesChatThread,
+        });
+        if (!saved) return;
+        anchoredThreadId = id;
+        anchoredCreatedAt = createdAt;
+        log(
+          `Saved new codex thread ${id} as soon as codex recorded its preamble`,
+        );
       };
       let result = await runCodexExecTurn({
         ...turnOptions,
-        preamble: threadId ? undefined : preamble,
+        prompt: withToolsNote(threadId ? standing.prompt : contextualFreshPrompt),
+        preamble: threadId ? undefined : fresh.preamble,
         threadId,
+        ...(threadId ? {} : { onThreadAnchored: anchorFreshThread }),
       });
-      if (shouldRetryCodexStaleThreadFresh(result)) {
+      if (!runnerStopping && shouldRetryCodexStaleThreadFresh(result)) {
         log(`Stale codex thread (${threadId}); retrying with a fresh thread.`);
+        if (threadId) reportUnplannedThreadReset('stale', threadId);
         clearThreadId();
         itemsInFlight = 0;
-        result = await runCodexExecTurn({
-          ...turnOptions,
-          preamble,
-          threadId: undefined,
-        });
+        progressAttempt += 1;
+        attemptThreadId = undefined;
+        // A fresh thread holds nothing yet: send everything still unanswered.
+        freshStandingBlocks = elideUnchangedStandingBlocks(
+          contextualFreshPrompt,
+          undefined,
+        ).blocks;
+        const staleAttempt = result;
+        result = withEarlierAttemptAccounting(
+          await runCodexExecTurn({
+            ...turnOptions,
+            prompt: withToolsNote(contextualFreshPrompt),
+            preamble: fresh.preamble,
+            threadId: undefined,
+            onThreadAnchored: anchorFreshThread,
+          }),
+          [staleAttempt],
+        );
+      } else if (
+        result.status === 'error' &&
+        result.interrupted === true &&
+        threadId
+      ) {
+        // Timed out or stopped while working: the thread is fine and holds
+        // everything done so far. Keep it so «продолжай» resumes the work.
+        log(
+          `Codex turn interrupted on thread ${threadId}; keeping the thread so the next message continues it.`,
+        );
       } else if (result.status === 'error' && result.staleThread) {
         // The stale-thread classifier is intentionally broad. If this attempt
         // nevertheless completed a paid image generation (or another external
@@ -1818,20 +3505,53 @@ async function runCodexProviderLoop(
           `Codex stale-thread error observed after a side effect; NOT retrying with a fresh thread.`,
         );
       } else if (
-        result.status === 'error' &&
         threadId &&
-        canSafelyRerunCodexTurn(result)
+        shouldClearThreadAfterResumeError(result, threadId)
       ) {
         // A resume failed for a reason our stale-thread regex didn't catch
         // (e.g. 'failed to load rollout'). Don't retry now (could duplicate a
         // side effect), but drop the thread id so the NEXT reserve run starts
-        // fresh instead of failing forever on the same dead thread.
+        // fresh instead of failing forever on the same dead thread. A lost
+        // login is not such a reason (isCodexServiceHiccup): 26.10 this
+        // branch silently dropped the owner's week-long thread on a 401.
         log(
           `Codex resume error not classified as stale; clearing thread id so the next run starts fresh: ${result.error?.slice(0, 160)}`,
         );
+        reportUnplannedThreadReset('resume-error', threadId);
         clearThreadId();
       }
-      firstTurn = false;
+      if (!attemptThreadId && result.anchored === false) {
+        log(
+          result.status === 'success'
+            ? `WARNING: codex finished a new thread (${result.threadId}) but its rollout never showed the preamble message — the rollout format may have changed; saving the thread at the end of the turn only.`
+            : `New codex thread ${result.threadId || '(none)'} ended before codex recorded the preamble; not saving it.`,
+        );
+      }
+      if (anchoredThreadId && shouldDropAnchoredFreshThread(result)) {
+        // Saved early, then failed without doing anything: drop it again so
+        // the next message starts fresh, as before early saving existed.
+        let onDisk = '';
+        try {
+          onDisk = fs.readFileSync(threadIdFile, 'utf-8').trim();
+        } catch {
+          /* already gone */
+        }
+        if (onDisk === anchoredThreadId) {
+          log(
+            `New codex thread ${anchoredThreadId} failed before doing anything; dropping it: ${result.error?.slice(0, 160)}`,
+          );
+          for (const f of [threadIdFile, threadMetaFile]) {
+            try {
+              fs.unlinkSync(f);
+            } catch {
+              /* already gone */
+            }
+          }
+        }
+        anchoredThreadId = undefined;
+        anchoredCreatedAt = undefined;
+      }
+      if (!result.superseded) firstTurn = false;
       // Only persist a thread id from a SUCCESSFUL turn. A failed resume
       // returns result.threadId = the SAME (stale) id it was given; without
       // the success guard the write-back below would resurrect the dead id
@@ -1839,52 +3559,466 @@ async function runCodexProviderLoop(
       // group's reserve poisoned forever — every future run resumes the dead
       // thread and hard-fails. Guarding on success also means a fresh thread's
       // id is only saved once codex actually completed a turn on it.
-      if (
-        result.status === 'success' &&
-        result.threadId &&
-        result.threadId !== threadId
-      ) {
+      //
+      // An interrupted fresh thread (timeout, «стоп») is saved too: it got the
+      // preamble and holds the partial work, and dropping it made every
+      // «продолжай» start the same investigation from zero (22.09: three
+      // 15-minute runs in a row). A failed resume of a stale id never reaches
+      // here with a new id — the stale id equals attemptThreadId.
+      const threadDecision = codexThreadPersistenceDecision(
+        result,
+        attemptThreadId,
+        threadId,
+      );
+      if (threadDecision === 'mismatch') {
+        // We asked codex to resume one thread and it answered on another:
+        // that thread never received the preamble. Keep the requested one.
+        log(
+          `Codex answered on thread ${result.threadId} instead of resumed ${attemptThreadId}; not persisting it.`,
+        );
+      } else if (threadDecision === 'persist' && result.threadId) {
         threadId = result.threadId;
-        try {
-          fs.writeFileSync(threadIdFile, threadId);
-          fs.writeFileSync(
-            threadMetaFile,
-            JSON.stringify({
-              preambleHash,
-              createdAt: new Date().toISOString(),
-            } satisfies CodexThreadMeta),
-          );
-        } catch {
-          /* thread continuity is best-effort */
+        standingSent =
+          result.contextCompacted || result.inputPersisted !== true
+            ? {}
+            : { ...(attemptThreadId ? standing.blocks : freshStandingBlocks) };
+        // Which CLAUDE.md copy the thread's preamble holds: the fresh
+        // attempt's, or whatever the resumed thread was born with.
+        const workspaceClaudeMdHash = attemptThreadId
+          ? readThreadMeta()?.workspaceClaudeMdHash
+          : fresh.workspaceClaudeMdHash;
+        persistCodexThread({
+          idFile: threadIdFile,
+          metaFile: threadMetaFile,
+          threadId,
+          meta: {
+            preambleHash,
+            // Saved early (anchored): keep that birth time for the age cap.
+            createdAt:
+              anchoredThreadId === threadId && anchoredCreatedAt
+                ? anchoredCreatedAt
+                : new Date().toISOString(),
+            standingBlocks: standingSent,
+            ...(workspaceClaudeMdHash ? { workspaceClaudeMdHash } : {}),
+          },
+          sharesChatThread,
+        });
+      } else if (
+        threadDecision === 'keep' &&
+        sharesChatThread &&
+        threadId &&
+        result.threadId === threadId &&
+        (result.inputPersisted === true || result.contextCompacted === true)
+      ) {
+        // Mark standing blocks sent only with the same input acknowledgement.
+        // An interrupted task_started can precede the actual user message.
+        // After a compaction — on ANY attempt, even a failed one — it holds
+        // only a summary: send them in full next time.
+        const next = result.contextCompacted
+          ? {}
+          : { ...(standingSent ?? {}), ...standing.blocks };
+        if (JSON.stringify(next) !== JSON.stringify(standingSent ?? {})) {
+          standingSent = next;
+          const meta = readThreadMeta();
+          if (meta) {
+            try {
+              writeFileAtomicSync(
+                threadMetaFile,
+                JSON.stringify({
+                  ...meta,
+                  standingBlocks: next,
+                } satisfies CodexThreadMeta),
+              );
+            } catch {
+              /* best-effort: worst case the blocks are re-sent */
+            }
+          }
         }
       }
 
+      if (result.superseded) {
+        supersedeRestarts += 1;
+        supersededAttempts.push(result);
+        const newer = drainIpcInput();
+        const nextInput = inputAfterSupersede({
+          freshPrompt,
+          newer,
+          threadId,
+          result,
+        });
+        freshPrompt = nextInput.freshPrompt;
+        if (newer.length > 0) {
+          linkRun.addPrompt(newer.join('\n'));
+        }
+        // A matching thread id does not prove its input was persisted. Keep
+        // the full unanswered batch after a kill before input acknowledgement.
+        const threadHoldsEarlier = nextInput.threadHeld;
+        // Tell the host the coming answer covers these follow-ups, or it
+        // would keep them pending and answer them a second time — and that
+        // a restart happened at all: the runner's stderr is kept only for
+        // failed runs, so the host records it as an event (check 09.10, Q2).
+        writeOutput({
+          status: 'heartbeat',
+          result: null,
+          ...(newer.length > 0 ? { absorbedFollowUps: newer.length } : {}),
+          supersedeRestart: {
+            restart: supersedeRestarts,
+            newerMessages: newer.length,
+            turnAgeMs: Date.now() - userTurnStartedAt,
+            threadHeld: threadHoldsEarlier,
+          },
+        });
+        prompt = nextInput.prompt;
+        log(
+          `Restarting the codex turn with ${newer.length} newer message(s) (restart ${supersedeRestarts}/${MAX_SUPERSEDE_RESTARTS})`,
+        );
+        continue;
+      }
+      result = withEarlierAttemptAccounting(result, supersededAttempts);
+      supersededAttempts = [];
+
       if (result.status === 'error') {
-        log(`Codex turn failed: ${result.error}`);
-        writeOutput(codexTurnErrorOutput(result));
+        log(
+          `Codex turn failed${result.stopKind ? ` (stopped: ${result.stopKind})` : ''}: ${result.error}`,
+        );
+        const failedResult = deferredAccounting
+          ? { ...result, ...combineTurnAccounting(deferredAccounting, result) }
+          : result;
+        markFailedHoldInput(
+          IPC_INPUT_DIR,
+          [...deferredInputFiles.values()],
+          log,
+          failedResult.sideEffectTools ?? [],
+        );
+        writeOutput(codexTurnErrorOutput(failedResult, requestedTurnSettings));
         break; // host error path (roll back / retry / notify) takes over
       }
+      supersedeRestarts = 0;
+      // The extra turns below share what is left of this user turn's budget:
+      // the host's global timer is not reset by heartbeats.
+      const turnDeadlineAt =
+        userTurnStartedAt +
+        (codexCfg.timeoutMs ?? DEFAULT_CODEX_TURN_TIMEOUT_MS);
 
+      // Short messages that came in while this turn ran, past the supersede
+      // window, are folded into ONE answer before it leaves (C12). Before the
+      // link check, so that checks the answer that really goes out.
+      let hold: FinalizeHoldOutcome | undefined;
+      if (finalizeHoldAllowed && !runnerStopping) {
+        const holdThreadId = threadId;
+        const holdThreadOk =
+          Boolean(holdThreadId) && result.threadId === holdThreadId;
+        try {
+          hold = await runFinalizeHold(
+            {
+              result,
+              threadId: holdThreadId,
+              threadOk: holdThreadOk,
+              contextFill: holdThreadOk
+                ? codexThreadContextFill(process.env.CODEX_HOME, holdThreadId)
+                : null,
+              turnStartedAt: userTurnStartedAt,
+              turnDeadlineAt,
+            },
+            {
+              peekPending: pendingOutsideContinuation,
+              takePending: (files) => takeIpcInputFiles(IPC_INPUT_DIR, files),
+              markFailed: (files, observedTools, originalText) =>
+                markFailedHoldInput(
+                  IPC_INPUT_DIR,
+                  files,
+                  log,
+                  observedTools,
+                  deferredResultDraft({
+                    ...result,
+                    text: originalText ?? result.text,
+                  }),
+                ),
+              log,
+            },
+          );
+        } catch (err) {
+          log(
+            `Finalize handoff failed; checking pending input before sending: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          const pending = pendingOutsideContinuation();
+          hold =
+            pending.length > 0
+              ? deferFinalizeHold(
+                  deferredResultDraft(result),
+                  pending,
+                  result.sideEffectTools ?? [],
+                  (files, tools, draft) =>
+                    markFailedHoldInput(
+                      IPC_INPUT_DIR,
+                      files,
+                      log,
+                      tools,
+                      draft,
+                    ),
+                  Date.now() - userTurnStartedAt,
+                )
+              : undefined;
+        }
+        if (hold) {
+          // The user's own links in those messages are never probed.
+          if (hold.seen.length > 0) {
+            linkRun.addPrompt(hold.seen.map((file) => file.text).join('\n'));
+          }
+          // The coming answer covers these follow-ups (only a ping or an
+          // accepted hold): the host moves its cursor over exactly them.
+          if (hold.absorbed > 0 || hold.report) {
+            writeOutput({
+              status: 'heartbeat',
+              result: null,
+              ...(hold.absorbed > 0
+                ? { absorbedFollowUps: hold.absorbed }
+                : {}),
+              ...(hold.report ? { finalizeHold: hold.report } : {}),
+            });
+          }
+          if (hold.holdResult?.contextCompacted === true) {
+            forgetStandingBlocks();
+          }
+        }
+      }
+      if (hold?.deferred) {
+        if (!prepareDeferredContinuation(hold, result, requestedTurnSettings))
+          break;
+        continue;
+      }
+      const holdResult = hold?.holdResult;
+      const answer = answerAfterFinalizeHold(result, hold);
+      const answerText = answer.text;
+
+      // Links of the final answer are checked before it leaves: a dead one
+      // gets ONE correction turn on this same thread, or a visible mark.
+      // Nothing here may turn a successful answer into an error.
+      let finalText = answerText;
+      let linkSummary: LinkCheckSummary | undefined;
+      let fix: CodexTurnResult | undefined;
+      if (
+        linkCheckGate.allowed &&
+        answerText &&
+        answer.imageArtifacts.length === 0 &&
+        !answer.imageGenerationCompleted
+      ) {
+        try {
+          // The answer already went out through a tool: a rewritten final
+          // could contradict what the user has read — mark only.
+          const sentMidTurn = answer.sideEffectTools.some(
+            (tool) => tool === 'send_message' || tool === 'send_voice_message',
+          );
+          const fixThreadId = threadId;
+          const threadOk =
+            Boolean(fixThreadId) && result.threadId === fixThreadId;
+          const fill = threadOk
+            ? codexThreadContextFill(process.env.CODEX_HOME, fixThreadId)
+            : null;
+          const outcome = await applyLinkCheck<CodexTurnResult>({
+            text: answerText,
+            // Every prompt of this run, not only this turn's message.
+            promptText: linkRun.promptLinks(),
+            mode: linkCheckGate.mode,
+            foreignContentReads: linkRun.foreignContentReads,
+            foreignUrls: linkRun.foreignUrls,
+            fixBlockedReason: sentMidTurn
+              ? 'sent-mid-turn'
+              : answer.linkFixBlockedReason
+                ? answer.linkFixBlockedReason
+                : !threadOk
+                  ? 'thread'
+                  : (fill ?? 0) >= FIX_MAX_CONTEXT_FILL
+                    ? 'context-fill'
+                    : undefined,
+            turnDeadlineAt,
+            deps: defaultProbeDeps(),
+            log,
+            runCorrection: (fixPrompt, timeoutMs) => {
+              log(
+                `Link check: one correction turn on thread ${fixThreadId} (timeout ${timeoutMs}ms)`,
+              );
+              // No supersede and no interim messages: a follow-up waits for
+              // the next turn, and «⏳» must not carry link-check chatter.
+              return runCodexExecTurn({
+                ...turnOptions,
+                supersede: undefined,
+                onProgressMessage: undefined,
+                config: {
+                  ...turnOptions.config,
+                  timeoutMs,
+                  imagePaths: undefined,
+                  ...(linkCheckGate.fixReasoningEffort
+                    ? { reasoningEffort: linkCheckGate.fixReasoningEffort }
+                    : {}),
+                },
+                prompt: withToolsNote(fixPrompt),
+                preamble: undefined,
+                threadId: fixThreadId,
+              });
+            },
+          });
+          finalText = outcome.text;
+          fix = outcome.correctionResult;
+          if (outcome.summary.found > 0) {
+            linkSummary = outcome.summary;
+            log(describeLinkCheckSummary(outcome.summary));
+          }
+          // A rejected or failed correction stays in the thread as if the
+          // user had read it: the next turn of this thread is told otherwise.
+          linkRun.afterCheck(outcome.summary, {
+            sharesChatThread,
+            fixThreadId,
+            threadId,
+          });
+          if (fix?.contextCompacted === true) {
+            // The correction compacted the thread: it now holds only a
+            // summary, so the standing context must be sent in full again.
+            forgetStandingBlocks();
+          }
+        } catch (err) {
+          log(
+            `Link check failed; sending the answer unchanged: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          finalText = answerText;
+          linkSummary = undefined;
+        }
+      }
+
+      // Link checking can itself take time. Recheck immediately before routing
+      // so a correction arriving during that check cannot receive a stale final.
+      if (finalizeHoldAllowed && pendingOutsideContinuation().length > 0) {
+        const checkedResult: CodexTurnResult = {
+          ...result,
+          ...combineTurnAccounting(result, fix),
+          text: finalText,
+        };
+        const lateHold = await runFinalizeHold(
+          {
+            result: checkedResult,
+            threadId,
+            threadOk: true,
+            contextFill: null,
+            turnStartedAt: userTurnStartedAt,
+            turnDeadlineAt,
+          },
+          {
+            peekPending: pendingOutsideContinuation,
+            takePending: (files) => takeIpcInputFiles(IPC_INPUT_DIR, files),
+            markFailed: (files, tools, draft) =>
+              markFailedHoldInput(
+                IPC_INPUT_DIR,
+                files,
+                log,
+                tools,
+                deferredResultDraft({
+                  ...checkedResult,
+                  text: draft ?? checkedResult.text,
+                }),
+              ),
+            log,
+          },
+        );
+        if (lateHold.report || lateHold.absorbed > 0) {
+          writeOutput({
+            status: 'heartbeat',
+            result: null,
+            ...(lateHold.report ? { finalizeHold: lateHold.report } : {}),
+            ...(lateHold.absorbed > 0
+              ? { absorbedFollowUps: lateHold.absorbed }
+              : {}),
+          });
+        }
+        if (lateHold.deferred) {
+          if (
+            !prepareDeferredContinuation(
+              lateHold,
+              checkedResult,
+              requestedTurnSettings,
+            )
+          )
+            break;
+          continue;
+        }
+      }
+
+      // The hold turn counts as part of this turn; the link fix on top.
+      const latestPart = combineTurnAccounting(result, holdResult);
+      const turnPart = deferredAccounting
+        ? combineTurnAccounting(deferredAccounting, latestPart)
+        : latestPart;
+      const accounting = mergeTurnAccounting(turnPart, fix);
+      const codexTurn = codexTurnTelemetry(
+        turnPart,
+        fix,
+        requestedTurnSettings,
+      );
+      log(
+        `codex turn settings: tier=${codexTurn?.serviceTier ?? 'unknown'} (asked ${requestedTurnSettings.requestedServiceTier ?? 'default'}), effort=${codexTurn?.reasoningEffort ?? 'unknown'}, used=${codexTurn?.accountUsedPercent ?? '?'}%, requests=${codexTurn?.modelRequests ?? 0}, usage=${codexTurn?.usageSource ?? 'none'}`,
+      );
+      if (deferredInputFiles.size > 0) {
+        writeOutput({
+          status: 'heartbeat',
+          result: null,
+          absorbedFollowUps: deferredInputFiles.size,
+        });
+      }
       writeOutput({
         status: 'success',
-        result: result.text,
-        usage: result.usage
+        result: finalText,
+        usage: accounting.usage,
+        // Requests to the model this turn (token_count events), as the
+        // Claude path counts its messages; 1 when the rollout was not seen.
+        turns: codexTurn?.modelRequests || 1,
+        // Exactly the turn's own fields unless a hold turn ran too.
+        ...(holdResult
           ? {
-              inputTokens: result.usage.inputTokens,
-              outputTokens: result.usage.outputTokens,
-              cacheReadInputTokens: result.usage.cacheReadInputTokens,
+              imageArtifacts:
+                answer.imageArtifacts.length > 0
+                  ? answer.imageArtifacts
+                  : undefined,
+              imageGenerationCompleted:
+                answer.imageGenerationCompleted || undefined,
+              imageGenerationCallIds:
+                answer.imageGenerationCallIds.length > 0
+                  ? answer.imageGenerationCallIds
+                  : undefined,
             }
-          : undefined,
-        turns: 1,
-        imageArtifacts: result.imageArtifacts,
-        imageGenerationCompleted: result.imageGenerationCompleted,
-        imageGenerationCallIds: result.imageGenerationCallIds,
-        sideEffected: result.sideEffected,
-        sideEffectTools: result.sideEffectTools,
+          : {
+              imageArtifacts: result.imageArtifacts,
+              imageGenerationCompleted: result.imageGenerationCompleted,
+              imageGenerationCallIds: result.imageGenerationCallIds,
+            }),
+        sideEffected: accounting.sideEffected,
+        sideEffectTools: accounting.sideEffectTools,
+        ...(codexTurn ? { codexTurn } : {}),
+        ...(linkSummary ? { linkCheck: linkSummary } : {}),
+        ...(deferredInputFiles.size > 0
+          ? { finalizedInputFiles: [...deferredInputFiles.keys()] }
+          : {}),
       });
+      // Output framing is not a delivery receipt. The host retires these only
+      // after successful routing; until then leave their recovery drafts on
+      // disk and keep this runner from consuming them for a second time.
+      for (const name of deferredInputFiles.keys())
+        finalizedInputFiles.add(name);
+      deferredInputFiles.clear();
+      deferredAccounting = undefined;
 
+      // When the answer left the runner: IPC files older than this came in
+      // while the turn still ran (the host delivers a second or two later,
+      // so a file from that gap counts as «after» — the safe direction).
+      const turnAnsweredAt = Date.now();
+
+      // A failed finalize hold left its messages in ipc/input, marked: the
+      // first poll drains them as the next turn, or, on `_close`, the next
+      // run's initial drain does. The host was not told they are covered, so
+      // they are neither lost nor answered twice.
       log('Codex turn done, waiting for next IPC message...');
-      const nextMessage = await waitForIpcMessage();
+      const nextMessage = await waitForIpcMessage(
+        turnAnsweredAt,
+        finalizedInputFiles,
+      );
       if (nextMessage === null) {
         log('Close sentinel received, exiting');
         break;
@@ -1892,10 +4026,47 @@ async function runCodexProviderLoop(
       log(
         `Got new message (${nextMessage.length} chars), starting new codex turn`,
       );
-      prompt = nextMessage;
+      // Sent before the previous answer reached the user: say so, or the
+      // model answers them as a fresh question and repeats the answer.
+      const continuationNote = followUpContinuationNote({
+        arrivedDuringTurn: lastIpcDrainArrivedDuringTurn,
+        messageCount: countPipedMessages(nextMessage, lastIpcDrainCount),
+        afterFailedHold: lastIpcDrainAfterFailedHold,
+        holdDoneTools: lastIpcDrainHoldDoneTools,
+        holdOriginalText: lastIpcDrainHoldOriginalText,
+      });
+      if (continuationNote) {
+        log(
+          `Follow-up turn: ${lastIpcDrainArrivedDuringTurn} of ${lastIpcDrainCount} piped file(s) arrived before the previous answer; continuation note added`,
+        );
+      }
+      const turnText = continuationNote
+        ? `${continuationNote}\n\n${nextMessage}`
+        : nextMessage;
+      prompt = linkRun.startUserTurn(turnText, {
+        id: threadId,
+        sharesChatThread,
+      });
+      freshPrompt = turnText;
+      userTurnStartedAt = Date.now();
+      // A new user turn: its «⏳» budget is its own (the flag used to live
+      // for the whole run, so one stale-thread retry silenced every later
+      // turn's interim notes).
+      progressEmitted = false;
+      progressAttempt = 0;
+      // Keep the host's list of piped batches in step: these files start a
+      // turn of their own, they are not folded into an earlier one.
+      if (lastIpcDrainCount > 0) {
+        writeOutput({
+          status: 'heartbeat',
+          result: null,
+          consumedFollowUps: lastIpcDrainCount,
+        });
+      }
     }
   } finally {
     clearInterval(hbTimer);
+    linkRun.close();
     removeCodexConfigToml(process.env.CODEX_HOME);
   }
 }
@@ -1948,17 +4119,49 @@ async function main(): Promise<void> {
   if (containerInput.isScheduledTask) {
     prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
   }
-  const pending = drainIpcInput();
+  const pending =
+    containerInput.provider === 'codex_cli'
+      ? peekIpcInputFiles(IPC_INPUT_DIR)
+      : drainIpcInputDetailed();
   if (pending.length > 0) {
     log(`Draining ${pending.length} pending IPC messages into initial prompt`);
-    prompt += '\n' + pending.join('\n');
+    // A finalize hold of the previous run failed on some of them and a
+    // `_close` ended it: this thread was told its answer is not sent yet.
+    if (pending.some((file) => file.afterFailedHold === true)) {
+      log('Some of them were left by a failed finalize hold; note added');
+    }
+    prompt += '\n' + joinIpcInputWithHoldNote(pending);
+    // The first answer covers these too: without saying so, the host kept
+    // them as unanswered follow-ups and re-sent them after the run.
+    if (containerInput.provider !== 'codex_cli') {
+      writeOutput({
+        status: 'heartbeat',
+        result: null,
+        absorbedFollowUps: pending.length,
+      });
+    }
   }
 
   // Provider fork: the codex reserve path runs the same workspace/tools via
   // the Codex CLI instead of the Claude Agent SDK.
   if (containerInput.provider === 'codex_cli') {
+    // The host stops a run («стоп», its own timers) with SIGTERM to the
+    // runner's process group. codex sits in a group of its own and used to
+    // outlive the runner: the next run resumed a thread the orphan was still
+    // writing to. Pass the stop on, then exit.
+    const onStopSignal = (signal: NodeJS.Signals): void => {
+      log(`Received ${signal}; stopping codex before exiting`);
+      stopCodexThenExit(signal === 'SIGINT' ? 130 : 143);
+    };
+    process.on('SIGTERM', onStopSignal);
+    process.on('SIGINT', onStopSignal);
     try {
-      await runCodexProviderLoop(containerInput, mcpServerPath, prompt);
+      await runCodexProviderLoop(
+        containerInput,
+        mcpServerPath,
+        prompt,
+        pending,
+      );
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       log(`Codex provider loop error: ${errorMessage}`);

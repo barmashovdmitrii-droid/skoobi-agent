@@ -7,7 +7,6 @@ import {
   recordModelTrace,
   recordTenantEvent,
   recordToolCall,
-  recordUsageEvent,
 } from './event-store.js';
 import type { TenantRecord } from './tenant-registry.js';
 
@@ -50,7 +49,6 @@ describe('event store schema', () => {
     expect(names).toContain('tenants');
     expect(names).toContain('event_sessions');
     expect(names).toContain('events');
-    expect(names).toContain('usage_events');
     expect(names).toContain('tool_calls');
     expect(names).toContain('model_traces');
     expect(names).toContain('sessions');
@@ -260,17 +258,9 @@ describe('recordTenantEvent', () => {
   });
 });
 
-describe('usage and tool-call event tables', () => {
-  it('appends usage and tool call records without exposing them to runtime tools', () => {
+describe('tool-call event table', () => {
+  it('appends tool call records without exposing them to runtime tools', () => {
     const t = tenant();
-    const usageId = recordUsageEvent({
-      tenant: t,
-      channelUserId: '42',
-      modelRole: 'default',
-      providerModel: 'claude-opus-4-7',
-      inputTokens: 10,
-      outputTokens: 20,
-    });
     const toolCallId = recordToolCall({
       tenant: t,
       toolCallId: 'tool-1',
@@ -281,17 +271,10 @@ describe('usage and tool-call event tables', () => {
       payload: { args: { secret: 'hide-me' } },
     });
 
-    const usage = getDb()
-      .prepare(`SELECT * FROM usage_events WHERE id = ?`)
-      .get(usageId) as { tenant_id: string; input_tokens: number };
     const toolCall = getDb()
       .prepare(`SELECT * FROM tool_calls WHERE id = ?`)
       .get(toolCallId) as { tenant_id: string; payload_json: string };
 
-    expect(usage).toMatchObject({
-      tenant_id: t.tenant_id,
-      input_tokens: 10,
-    });
     expect(toolCall.tenant_id).toBe(t.tenant_id);
     expect(JSON.parse(toolCall.payload_json)).toEqual({
       args: { secret: '[REDACTED]' },
@@ -346,5 +329,82 @@ describe('usage and tool-call event tables', () => {
         .prepare(`UPDATE model_traces SET status = 'changed' WHERE id = ?`)
         .run(traceId),
     ).toThrow(/append-only/);
+  });
+});
+
+describe('WhatsApp events (finding M2)', () => {
+  const whatsappTenant = tenant({
+    tenant_id: 'wa_chat_0000000000',
+    folder: 'whatsapp_main',
+    channel: 'whatsapp',
+    chat_id: '0000000000',
+    mode: 'owner',
+    legacy_jid: '0000000000@s.whatsapp.net',
+    group: {
+      name: 'WhatsApp',
+      folder: 'whatsapp_main',
+      trigger: '@Skoobi',
+      added_at: '2026-05-15T00:00:00.000Z',
+      isMain: true,
+    },
+  });
+
+  it('lands a WhatsApp turn in the store with its own channel', () => {
+    // Until M2 the whole channel was invisible here: not one of the 27424
+    // recorded events came from WhatsApp.
+    recordTenantEvent({
+      tenant: whatsappTenant,
+      type: 'whatsapp_inbound_message',
+      actor: 'whatsapp_user:0000000000',
+      senderId: '0000000000',
+      payload: { content: 'привет' },
+    });
+
+    const rows = getDb()
+      .prepare(`SELECT channel, type, tenant_id FROM events`)
+      .all() as Array<{ channel: string; type: string; tenant_id: string }>;
+
+    // The session-open event carries the channel too, so a WhatsApp outage now
+    // shows up as an absence of these rows rather than as nothing at all.
+    expect(rows).toEqual([
+      {
+        channel: 'whatsapp',
+        type: 'session_started',
+        tenant_id: 'wa_chat_0000000000',
+      },
+      {
+        channel: 'whatsapp',
+        type: 'whatsapp_inbound_message',
+        tenant_id: 'wa_chat_0000000000',
+      },
+    ]);
+  });
+
+  it('keeps the two channels on separate sessions and tenants', () => {
+    const telegramTenant = tenant();
+    expect(eventSessionIdForTenant(whatsappTenant)).not.toBe(
+      eventSessionIdForTenant(telegramTenant),
+    );
+
+    recordTenantEvent({
+      tenant: whatsappTenant,
+      type: 'whatsapp_outbound_message',
+      actor: 'assistant',
+      payload: {},
+    });
+    recordTenantEvent({
+      tenant: telegramTenant,
+      type: 'telegram_outbound_message',
+      actor: 'assistant',
+      payload: {},
+    });
+
+    const channels = getDb()
+      .prepare(`SELECT channel, COUNT(*) AS n FROM tenants GROUP BY channel`)
+      .all() as Array<{ channel: string; n: number }>;
+    expect(channels).toEqual([
+      { channel: 'telegram', n: 1 },
+      { channel: 'whatsapp', n: 1 },
+    ]);
   });
 });

@@ -43,11 +43,17 @@ import {
   type DashboardMediaDescriptor,
 } from './media.js';
 import {
+  collectReplyLatency,
+  type ReplyLatencyReport,
+} from './reply-latency.js';
+import {
   collectWhatsAppStatus,
   type WhatsAppStatus,
 } from './whatsapp-status.js';
 
 const GOOGLE_VERIFY_COOLDOWN_MS = 30_000;
+// Cache reply-latency aggregation for one minute; the dashboard polls more often.
+const SPEED_CACHE_MS = 60_000;
 const GOOGLE_VERIFY_MAX_WAITERS = 4;
 
 class GoogleVerifyRateLimitError extends Error {
@@ -80,6 +86,10 @@ type DashboardDialogDeps = {
   ) => Promise<Map<string, DashboardMediaDescriptor[]>>;
   serveMedia: typeof serveDashboardMedia;
   collectWhatsAppStatus: () => WhatsAppStatus;
+};
+
+type DashboardSpeedDeps = {
+  collectReplyLatency: (now: number) => ReplyLatencyReport;
 };
 
 // Статика — только эти три файла, отдаются по точному имени. Никаких путей
@@ -194,7 +204,9 @@ const LOGIN_PAGE = `<!doctype html><meta charset="utf-8">
 
 export function createDashboardServer(
   config: DashboardConfig = loadDashboardConfig(),
-  overrides: Partial<DashboardGoogleDeps & DashboardDialogDeps> = {},
+  overrides: Partial<
+    DashboardGoogleDeps & DashboardDialogDeps & DashboardSpeedDeps
+  > = {},
 ): http.Server {
   const {
     collectChats: collectDashboardChats = collectChats,
@@ -203,8 +215,11 @@ export function createDashboardServer(
     listMedia = listDashboardMediaForMessages,
     serveMedia = serveDashboardMedia,
     collectWhatsAppStatus: whatsappStatus = collectWhatsAppStatus,
+    collectReplyLatency: replyLatency = (now: number) =>
+      collectReplyLatency(now),
     ...googleOverrides
   } = overrides;
+  let speedCache: { at: number; report: ReplyLatencyReport } | null = null;
   const google: DashboardGoogleDeps = {
     collectOverview: collectGoogleOverview,
     verifyWorkspace: verifyGoogleWorkspace,
@@ -539,6 +554,14 @@ export function createDashboardServer(
             case '/api/whatsapp-status':
               sendJson(res, 200, whatsappStatus());
               return;
+            case '/api/speed': {
+              const now = Date.now();
+              if (!speedCache || now - speedCache.at >= SPEED_CACHE_MS) {
+                speedCache = { at: now, report: replyLatency(now) };
+              }
+              sendJson(res, 200, speedCache.report);
+              return;
+            }
             case '/api/tasks':
               sendJson(res, 200, { tasks: collectTasks() });
               return;
@@ -605,6 +628,19 @@ export function createDashboardServer(
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/action') {
+          // та же проверка источника, что уже стоит
+          // у /api/google/verify выше. Без неё любая другая страница, открытая
+          // на этом же маке (ComfyUI на 127.0.0.1:8188 и подобные), могла
+          // отправить сюда запрос от имени владельца, пока панель залогинена, —
+          // а главный чат исполняет задачи без песочницы и с полным доступом.
+          const expectedOrigin = `http://${req.headers.host || ''}`;
+          if (req.headers.origin !== expectedOrigin) {
+            sendJson(res, 403, {
+              ok: false,
+              message: 'проверка источника не пройдена',
+            });
+            return;
+          }
           // Кривое тело — это 400 «некорректный запрос», а не 500 (ревью).
           let body: any;
           try {

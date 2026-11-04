@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import http from 'http';
 import { verifySignature, verifyWebhookRequest, startWebhookServer } from './server.js';
 import type { IngestionEnvelope, MessageIngestion } from '../orchestrator/types.js';
+import { IngestionPersistenceError } from '../orchestrator/ingestion.js';
 
 describe('verifySignature', () => {
   const secret = 'test-secret-key';
@@ -30,6 +31,14 @@ describe('verifySignature', () => {
 
   it('rejects empty signature', () => {
     expect(verifySignature(secret, payload, '')).toBe(false);
+  });
+
+  it('rejects noncanonical lengths and trailing input after a valid hex prefix', () => {
+    const valid = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+    for (const signature of [valid + 'g', valid + '00', valid + ' ', valid.slice(0, 63)]) {
+      expect(verifySignature(secret, payload, signature)).toBe(false);
+    }
+    expect(verifySignature(secret, payload, valid.toUpperCase())).toBe(true);
   });
 });
 
@@ -408,6 +417,28 @@ describe('webhook server HTTP', () => {
   it('returns 404 for non-POST non-GET requests', async () => {
     const res = await makeRequest(port, 'PUT', '/webhook/test-group');
     expect(res.status).toBe(404);
+  });
+
+  it('returns 503 for uncommitted input and allows the same signed request to retry', async () => {
+    const ingest = vi.fn()
+      .mockRejectedValueOnce(new IngestionPersistenceError(new Error('SQLITE_BUSY')))
+      .mockResolvedValue(true);
+    const retryServer = startWebhookServer(0, secret, {
+      ingestion: { addPreHook: vi.fn(), addPostHook: vi.fn(), ingest },
+      findGroupByFolder: () => ({ jid: 'test-jid@g.us', name: 'Test Group' }),
+    });
+    try {
+      await new Promise<void>((resolve) => retryServer.once('listening', resolve));
+      const addr = retryServer.address() as { port: number };
+      const body = JSON.stringify({ prompt: 'durable retry' });
+      const headers = signedHeaders(body);
+      expect((await makeRequest(addr.port, 'POST', '/webhook/test-group', body, headers)).status).toBe(503);
+      expect((await makeRequest(addr.port, 'POST', '/webhook/test-group', body, headers)).status).toBe(200);
+      expect((await makeRequest(addr.port, 'POST', '/webhook/test-group', body, headers)).status).toBe(401);
+      expect(ingest).toHaveBeenCalledTimes(2);
+    } finally {
+      retryServer.close();
+    }
   });
 
   it('returns 500 (not a hung socket) when ingest() throws', async () => {

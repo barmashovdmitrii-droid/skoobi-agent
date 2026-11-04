@@ -42,9 +42,9 @@ describe('humanizeEvent', () => {
         type: 'error',
         created_at: Date.now(),
         payload_json: JSON.stringify({ kind, message: 'secret local path' }),
-        chatName: 'Артём',
+        chatName: 'Контакт A',
       }).text;
-      expect(text).toBe('Не удалось доставить ответ: Артём');
+      expect(text).toBe('Не удалось доставить ответ: Контакт A');
       expect(text).not.toContain(kind);
       expect(text).not.toContain('secret');
     }
@@ -55,9 +55,9 @@ describe('humanizeEvent', () => {
         payload_json: JSON.stringify({
           kind: 'skoobi_live_voice_delivery_failed',
         }),
-        chatName: 'Артём',
+        chatName: 'Контакт A',
       }).text,
-    ).toBe('Не удалось доставить голосовой ответ: Артём');
+    ).toBe('Не удалось доставить голосовой ответ: Контакт A');
   });
 
   it('безопасно описывает сбои observer и локальной обработки медиа', () => {
@@ -163,6 +163,7 @@ describe('статусы и расписания', () => {
   it('статусы задач переведены', () => {
     expect(humanizeTaskStatus('active')).toBe('активна');
     expect(humanizeTaskStatus('paused')).toBe('на паузе');
+    expect(humanizeTaskStatus('cancelled')).toBe('отменена');
   });
 
   it('расписания описаны словами', () => {
@@ -190,10 +191,12 @@ describe('статусы и расписания', () => {
 });
 
 describe('parseLogLine', () => {
-  it('парсит pino-pretty строку и срезает ANSI-коды', () => {
+  it('парсит старую строку без даты и срезает ANSI-коды', () => {
+    // Keep supporting archived log lines without a date.
     const raw =
       '[18:15:49.641] \x1b[32mINFO\x1b[39m (19699): \x1b[36mTelegram message sent\x1b[39m';
     expect(parseLogLine(raw)).toEqual({
+      date: null,
       time: '18:15:49',
       level: 'INFO',
       pid: 19699,
@@ -201,8 +204,32 @@ describe('parseLogLine', () => {
     });
   });
 
+  it('парсит новую строку с датой', () => {
+    const raw = '[2026-07-27 10:19:56.746] INFO (63280): Telegram message sent';
+    expect(parseLogLine(raw)).toEqual({
+      date: '2026-07-27',
+      time: '10:19:56',
+      level: 'INFO',
+      pid: 63280,
+      text: 'Telegram message sent',
+    });
+  });
+
+  it('парсит новую строку с датой и ANSI (запуск в терминале)', () => {
+    const raw =
+      '[2026-07-27 10:19:56.746] \x1b[31mERROR\x1b[39m (63280): \x1b[36mSandbox failed\x1b[39m';
+    expect(parseLogLine(raw)).toMatchObject({
+      date: '2026-07-27',
+      level: 'ERROR',
+      pid: 63280,
+      text: 'Sandbox failed',
+    });
+  });
+
   it('возвращает null для продолжений и мусора', () => {
     expect(parseLogLine('    jid: "tg:1"')).toBeNull();
     expect(parseLogLine('')).toBeNull();
+    // Не должен принимать дату без времени.
+    expect(parseLogLine('[2026-07-27] INFO (1): x')).toBeNull();
   });
 });

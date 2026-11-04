@@ -184,6 +184,335 @@ describe('Skoobi Hermes-style skill registry', () => {
     }
   });
 
+
+  // обёрткой <message sender=… time=…> и транспортным «[Voice: …]».
+  it('does not pick voice-response for an incoming voice note alone, only for an explicit ask', () => {
+    const root = tmpSkillsDir();
+    const turn = (body: string): string =>
+      [
+        '<context timezone="Asia/Almaty" />',
+        '<messages>',
+        `<message sender="Fixture User A" time="09.10.2026 12:00">${body}</message>`,
+        '</messages>',
+      ].join('\n');
+    try {
+      writeSkill({
+        skillsDir: root,
+        frontmatter: {
+          name: 'voice-response',
+          description:
+            'When the user explicitly asks for a voice reply, send a Telegram voice note using the host TTS pipeline.',
+          status: 'active',
+          created_by: 'operator',
+          tags: ['voice', 'tts', 'telegram'],
+          triggers: ['голосом', 'озвучь', 'скажи вслух', 'ответь голосом'],
+        },
+        body: 'Answer by voice only when asked.',
+      });
+
+      const select = (text: string) =>
+        selectSkills({
+          skillsDir: root,
+          text,
+          chatJid: 'tg:1',
+          group: group('telegram_main'),
+        }).map((skill) => skill.name);
+
+      expect(select(turn('[Voice: Ну как там с роутером?]'))).toEqual([]);
+      expect(select(turn('[Audio: запись совещания]'))).toEqual([]);
+      expect(select(turn('[Voice: Ответь голосом, что по задаче]'))).toEqual([
+        'voice-response',
+      ]);
+      expect(select(turn('озвучь, пожалуйста'))).toEqual(['voice-response']);
+      expect(select('ответь голосом')).toEqual(['voice-response']);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores the sender name and timestamps of the message envelope', () => {
+    const root = tmpSkillsDir();
+    const turn = (body: string): string =>
+      [
+        '<context timezone="Asia/Almaty" />',
+        '<messages>',
+        `<message sender="Fixture User A" time="09.10.2026 12:00">${body}</message>`,
+        '</messages>',
+      ].join('\n');
+    try {
+      writeSkill({
+        skillsDir: root,
+        frontmatter: {
+          name: 'fixture-admin-handoff',
+          description: 'Procedure for approved admin chat handoffs.',
+          status: 'active',
+          created_by: 'memory_seed',
+          tags: ['User A', 'admin', 'handoff'],
+          triggers: ['передай владельцу'],
+          folders: ['telegram_main'],
+        },
+        body: 'Handoff procedure.',
+      });
+
+      const select = (text: string) =>
+        selectSkills({
+          skillsDir: root,
+          text,
+          chatJid: 'tg:1',
+          group: group('telegram_main'),
+        }).map((skill) => skill.name);
+
+      expect(select(turn('привет, какой сегодня план?'))).toEqual([]);
+      expect(select(turn('это для User A, передай владельцу'))).toEqual([
+        'fixture-admin-handoff',
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+
+  // шаблоном; слова описания лишь упорядочивают равные очки.
+  describe('selection by triggers only (C24)', () => {
+    const turn = (...bodies: string[]): string =>
+      [
+        '<context timezone="Asia/Almaty" />',
+        '<messages>',
+        ...bodies.map(
+          (body) =>
+            `<message sender="Admin" time="26.10.2026 12:00">${body}</message>`,
+        ),
+        '</messages>',
+      ].join('\n');
+
+    const withSkills = (
+      run: (select: (text: string, folder?: string) => string[]) => void,
+    ) => {
+      const root = tmpSkillsDir();
+      try {
+        const skill = (frontmatter: Parameters<typeof writeSkill>[0]['frontmatter']) =>
+          writeSkill({ skillsDir: root, frontmatter, body: `${frontmatter.name} body` });
+        skill({
+          name: 'admin-ops-safety',
+          description:
+            'Admin chat operations safety: inspect local state, avoid secrets, make backups before risky changes.',
+          status: 'active',
+          created_by: 'memory_seed',
+          tags: ['admin', 'ops', 'safety', 'github', 'service'],
+          triggers: [
+            'проверь',
+            'перепроверь',
+            'почини',
+            'коммить',
+            'закоммит',
+            'пушь',
+            'запуш',
+            'рестарт',
+            'сервис',
+            'логи',
+            'github',
+            'deploy',
+          ],
+          folders: ['telegram_main', 'telegram_admin'],
+        });
+        skill({
+          name: 'panel-chat-self-ops',
+          description:
+            'Чат из панели и самодоработка: как понимать сообщения панели, когда какой рестарт безопасен.',
+          status: 'active',
+          created_by: 'memory_seed',
+          tags: ['panel', 'dashboard', 'self-improvement'],
+          triggers: ['панель', 'панели', 'дашборд', 'самодоработ'],
+        });
+        skill({
+          name: 'grill-before-brief',
+          description:
+            'Перед составлением серьёзного брифа — вопросы по одному, затем собрать бриф.',
+          status: 'active',
+          created_by: 'agent_proposal',
+          triggers: ['бриф', 'допроси', 'уточни требования'],
+          folders: ['telegram_main'],
+        });
+        skill({
+          name: 'memory-continuity',
+          description: 'Use tenant-scoped memory carefully: search first.',
+          status: 'active',
+          created_by: 'memory_seed',
+          tags: ['memory', 'privacy'],
+          triggers: ['помнишь', 'запомни', 'память'],
+        });
+        skill({
+          name: 'web-search-workflow',
+          description: 'Use web search for current public facts and contacts.',
+          status: 'active',
+          created_by: 'memory_seed',
+          tags: ['web', 'search'],
+          triggers: ['интернет', 'найди', 'поищи'],
+        });
+        skill({
+          name: 'self-improvement-skills',
+          description: 'Rules for Skoobi procedural skills.',
+          status: 'active',
+          created_by: 'memory_seed',
+          tags: ['skills'],
+          triggers: ['скил', 'обуч'],
+        });
+        run((text, folder = 'telegram_main') =>
+          selectSkills({
+            skillsDir: root,
+            text,
+            chatJid: 'tg:100000001',
+            group: group(folder),
+          }).map((selected) => selected.name),
+        );
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    };
+
+    it('does not select a skill for description words alone', () => {
+      withSkills((select) => {
+        expect(select(turn('а когда у детей выходные?'))).toEqual([]);
+        expect(select(turn('какой сегодня курс тенге?'))).toEqual([]);
+        expect(select(turn('Передал документы, всё ок'))).toEqual([]);
+        expect(select(turn('скуби, сделай backups changes'))).toEqual([]);
+      });
+    });
+
+    it('ignores the service tail of a photo label but keeps its caption', () => {
+      withSkills((select) => {
+        const photo =
+          '[Photo. File: received/photo-1001.jpg — use Read tool to inspect visual context]';
+        expect(select(turn(photo))).toEqual([]);
+        expect(select(turn(photo), 'telegram_admin')).toEqual([]);
+        expect(select(turn(`${photo} проверь, что на экране`))).toEqual([
+          'admin-ops-safety',
+        ]);
+      });
+    });
+
+    it('ignores document previews and key-frame lists, which are not the user’s words', () => {
+      withSkills((select) => {
+        expect(
+          select(
+            turn(
+              '[Document: notes.pdf. File: received/doc-1002.pdf. Preview: deploy to github, restart [x] the service, find on the internet]',
+            ),
+          ),
+        ).toEqual([]);
+        expect(
+          select(
+            turn(
+              '[Document: notes.pdf. File: received/doc-1002.pdf. Preview: deploy [draft] to github] проверь этот файл',
+            ),
+          ),
+        ).toEqual(['admin-ops-safety']);
+        expect(
+          select(
+            turn(
+              '[Video Transcript: ну вот. Key-frame files: received/video-1003-frame-01.jpg, received/video-1003-frame-02.jpg]',
+            ),
+          ),
+        ).toEqual([]);
+        expect(
+          select(
+            turn(
+              '[Photo saved as received/wa-1004.jpg. Caption: смотри. Local analysis: a dashboard panel on a screen]',
+            ),
+          ),
+        ).toEqual([]);
+      });
+    });
+
+    it('matches triggers and built-in patterns only from the start of a word', () => {
+      withSkills((select) => {
+        // «напомни» is not «помни», «кинопоиск» is not «поиск», «автосервис»
+        // is not «сервис».
+        expect(select(turn('напомни завтра купить хлеб'))).toEqual([]);
+        expect(select(turn('что посмотреть на кинопоиске?'))).toEqual([]);
+        expect(select(turn('отвёз машину в автосервис'))).toEqual([]);
+        // Message start, after punctuation, any case — and stems keep working.
+        expect(select(turn('Почини бота'))).toEqual(['admin-ops-safety']);
+        expect(select(turn('Скуби,проверь логи'))).toEqual(['admin-ops-safety']);
+        expect(select(turn('обучи себя новому скилу'))).toEqual([
+          'self-improvement-skills',
+        ]);
+        expect(select(turn('помнишь, что я говорил?'))).toEqual([
+          'memory-continuity',
+        ]);
+        expect(select(turn('найди в интернете часы работы'))).toEqual([
+          'web-search-workflow',
+        ]);
+        expect(select(turn('доработай панель'))).toEqual(['panel-chat-self-ops']);
+        expect(select(turn('собери бриф'))).toEqual(['grill-before-brief']);
+        expect(select(turn('собери бриф'), 'telegram_admin')).toEqual([]);
+      });
+    });
+
+    // A prefix hides the stem from the word-start rule, so the prefixed forms
+    // are listed by themselves: in the memory pattern and in the ops triggers.
+    it('selects skills for prefixed verbs listed by themselves', () => {
+      withSkills((select) => {
+        expect(select(turn('Скуби, вспомни, как зовут собаку'))).toEqual([
+          'memory-continuity',
+        ]);
+        expect(select(turn('припомни, что я говорил про склад'))).toEqual([
+          'memory-continuity',
+        ]);
+        expect(select(turn('не могу вспомнить, что у меня по плану'))).toEqual([
+          'memory-continuity',
+        ]);
+        expect(select(turn('вспоминай, где лежат документы'))).toEqual([
+          'memory-continuity',
+        ]);
+        // «вспомнил» says the user remembered; «напомни» asks for a reminder.
+        expect(select(turn('всё, я вспомнил, задачу можно удалить'))).toEqual([]);
+        expect(select(turn('напомни завтра позвонить'))).toEqual([]);
+        expect(select(turn('закоммить и запушь'))).toEqual(['admin-ops-safety']);
+        expect(select(turn('надо закоммитить и запушить'))).toEqual([
+          'admin-ops-safety',
+        ]);
+        expect(select(turn('перепроверь ещё раз'))).toEqual(['admin-ops-safety']);
+      });
+    });
+
+    it('orders equal trigger scores by name, tag and description words', () => {
+      const root = tmpSkillsDir();
+      try {
+        for (const [name, description] of [
+          ['alpha-skill', 'Plain procedure.'],
+          ['zeta-skill', 'Procedure for invoices and payments.'],
+        ]) {
+          writeSkill({
+            skillsDir: root,
+            frontmatter: {
+              name,
+              description,
+              status: 'active',
+              created_by: 'operator',
+              triggers: ['счёт'],
+            },
+            body: `${name} body`,
+          });
+        }
+        const selected = buildSkillPromptContext({
+          skillsDir: root,
+          text: 'выставь счёт, invoices в папке',
+          chatJid: 'tg:100000001',
+          group: group(),
+        }).selected;
+        expect(selected.map((skill) => skill.name)).toEqual([
+          'zeta-skill',
+          'alpha-skill',
+        ]);
+        // The reported score is the trigger score; description words do not add.
+        expect(selected.map((skill) => skill.score)).toEqual([24, 24]);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
+
   it('rejects unsafe names and secret-looking skill bodies', () => {
     const root = tmpSkillsDir();
     try {

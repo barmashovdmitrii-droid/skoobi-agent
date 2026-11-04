@@ -12,9 +12,14 @@ import {
   createTask,
   getAllTasks,
   getCalendarEventLink,
+  getDb,
+  getDueTasks,
   getRegisteredGroup,
   getTaskById,
+  logTaskRun,
   setRegisteredGroup,
+  updateTask,
+  updateTaskAfterRun,
   upsertCalendarEventLink,
 } from './db.js';
 import {
@@ -675,10 +680,127 @@ describe('resume_task authorization', () => {
   });
 });
 
+// --- resume_task re-arms a task the scheduler gave up on ---
+
+describe('resume_task re-arms a recurring task paused with next_run NULL', () => {
+  const NOW = Date.parse('2026-09-28T10:00:00.000Z');
+
+  const createRecurring = (
+    id: string,
+    schedule_type: 'cron' | 'interval' | 'once',
+    schedule_value: string,
+  ) =>
+    createTask({
+      id,
+      group_folder: 'other-group',
+      chat_jid: 'other@g.us',
+      prompt: `task ${id}`,
+      schedule_type,
+      schedule_value,
+      context_mode: 'isolated',
+      next_run: new Date(NOW - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-09-01T00:00:00.000Z',
+    });
+
+  // Exactly what runTask does when it gives up on a run (an uncertain side
+  // effect, or MAX_CONSECUTIVE_TASK_FAILURES): next_run NULL, then paused.
+  const pauseLikeTheScheduler = (id: string) => {
+    updateTaskAfterRun(id, null, 'Error: codex produced no final message');
+    updateTask(id, { status: 'paused' });
+  };
+
+  const resume = (taskId: string) =>
+    processTaskIpc({ type: 'resume_task', taskId }, 'other-group', false, deps);
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('a cron task is active with a future next_run and becomes due again', async () => {
+    createRecurring('task-daily-cron', 'cron', '0 9 * * *');
+    pauseLikeTheScheduler('task-daily-cron');
+    expect(getTaskById('task-daily-cron')).toMatchObject({
+      status: 'paused',
+      next_run: null,
+    });
+
+    await resume('task-daily-cron');
+
+    const resumed = getTaskById('task-daily-cron')!;
+    expect(resumed.status).toBe('active');
+    expect(resumed.next_run).not.toBeNull();
+    const nextRun = Date.parse(resumed.next_run!);
+    expect(nextRun).toBeGreaterThan(NOW);
+    expect(nextRun).toBeLessThanOrEqual(NOW + 24 * 60 * 60 * 1000);
+    expect(getDueTasks().map((t) => t.id)).not.toContain('task-daily-cron');
+    vi.setSystemTime(nextRun + 1000);
+    expect(getDueTasks().map((t) => t.id)).toContain('task-daily-cron');
+  });
+
+  it('an interval task is re-armed one interval from now', async () => {
+    createRecurring('task-hourly', 'interval', String(60 * 60 * 1000));
+    pauseLikeTheScheduler('task-hourly');
+
+    await resume('task-hourly');
+
+    expect(getTaskById('task-hourly')).toMatchObject({
+      status: 'active',
+      next_run: new Date(NOW + 60 * 60 * 1000).toISOString(),
+    });
+  });
+
+  it('a once-task the scheduler gave up on is re-armed and due again', async () => {
+    // Its time has passed: due right away.
+    createRecurring('task-once', 'once', '2026-09-28T09:00:00.000Z');
+    pauseLikeTheScheduler('task-once');
+    // Its time is still ahead: armed at that time.
+    createRecurring('task-once-later', 'once', '2026-09-28T15:00:00.000Z');
+    pauseLikeTheScheduler('task-once-later');
+
+    await resume('task-once');
+    await resume('task-once-later');
+
+    expect(getTaskById('task-once')).toMatchObject({
+      status: 'active',
+      next_run: new Date(NOW).toISOString(),
+    });
+    expect(getDueTasks().map((t) => t.id)).toContain('task-once');
+    expect(getTaskById('task-once-later')).toMatchObject({
+      status: 'active',
+      next_run: '2026-09-28T15:00:00.000Z',
+    });
+  });
+
+  it('a task that still has next_run and a completed once-task keep what they had', async () => {
+    createRecurring('task-armed', 'cron', '0 9 * * *');
+    updateTask('task-armed', { status: 'paused' });
+    const armedNextRun = getTaskById('task-armed')!.next_run;
+    createRecurring('task-once-done', 'once', '2026-09-28T09:00:00.000Z');
+    updateTaskAfterRun('task-once-done', null, 'ok');
+
+    await resume('task-armed');
+    await resume('task-once-done');
+
+    expect(getTaskById('task-armed')).toMatchObject({
+      status: 'active',
+      next_run: armedNextRun,
+    });
+    expect(getTaskById('task-once-done')!.next_run).toBeNull();
+  });
+});
+
 // --- cancel_task authorization ---
 
+// Cancellation preserves the task row and run history; physical deletion
+// is reserved for the explicit bulk cleanup_tasks path.
 describe('cancel_task authorization', () => {
-  it('deletes a linked Google Calendar event before deleting the task', async () => {
+  it('deletes a linked Google Calendar event and marks the link, keeping the task row', async () => {
     const deleteEvent = vi.fn(async () => {});
     deps.calendarAdapter = fakeCalendarAdapter({
       createReminderEvent: vi.fn(async () => ({
@@ -719,8 +841,92 @@ describe('cancel_task authorization', () => {
       'google-event-delete',
       'owner@example.com',
     );
-    expect(getTaskById('task-with-calendar')).toBeUndefined();
-    expect(getCalendarEventLink('task-with-calendar')).toBeUndefined();
+    expect(getTaskById('task-with-calendar')).toMatchObject({
+      status: 'cancelled',
+      next_run: null,
+    });
+    expect(getCalendarEventLink('task-with-calendar')?.status).toBe('deleted');
+  });
+
+  it('keeps the run history of a cancelled task and never runs it again', async () => {
+    createTask({
+      id: 'task-ran-then-cancelled',
+      group_folder: 'other-group',
+      chat_jid: 'other@g.us',
+      prompt: 'Тестовое напоминание о доступе',
+      schedule_type: 'once',
+      schedule_value: '2026-10-01T09:00:00',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-09-30T00:00:00.000Z',
+    });
+    logTaskRun({
+      task_id: 'task-ran-then-cancelled',
+      run_at: '2026-10-01T04:01:07.000Z',
+      duration_ms: 12_000,
+      status: 'success',
+      result: 'Сегодня истёк тестовый доступ…',
+      error: null,
+    });
+    expect(getDueTasks().map((task) => task.id)).toContain(
+      'task-ran-then-cancelled',
+    );
+
+    await processTaskIpc(
+      { type: 'cancel_task', taskId: 'task-ran-then-cancelled' },
+      'other-group',
+      false,
+      deps,
+    );
+
+    expect(getTaskById('task-ran-then-cancelled')).toMatchObject({
+      status: 'cancelled',
+      next_run: null,
+      prompt: 'Тестовое напоминание о доступе',
+    });
+    const runs = getDb()
+      .prepare('SELECT status, result FROM task_run_logs WHERE task_id = ?')
+      .all('task-ran-then-cancelled');
+    expect(runs).toEqual([
+      { status: 'success', result: 'Сегодня истёк тестовый доступ…' },
+    ]);
+    expect(getDueTasks().map((task) => task.id)).not.toContain(
+      'task-ran-then-cancelled',
+    );
+
+    // Neither resume nor pause turns a cancelled task back into a schedule.
+    await processTaskIpc(
+      { type: 'resume_task', taskId: 'task-ran-then-cancelled' },
+      'other-group',
+      false,
+      deps,
+    );
+    expect(getTaskById('task-ran-then-cancelled')).toMatchObject({
+      status: 'cancelled',
+      next_run: null,
+    });
+    await processTaskIpc(
+      { type: 'pause_task', taskId: 'task-ran-then-cancelled' },
+      'other-group',
+      false,
+      deps,
+    );
+    expect(getTaskById('task-ran-then-cancelled')!.status).toBe('cancelled');
+
+    // Only the bulk cleanup physically removes it, together with its run log.
+    await processTaskIpc(
+      { type: 'cleanup_tasks', statuses: ['cancelled'] },
+      'other-group',
+      false,
+      deps,
+    );
+    expect(getTaskById('task-ran-then-cancelled')).toBeUndefined();
+    expect(
+      getDb()
+        .prepare('SELECT COUNT(*) AS c FROM task_run_logs WHERE task_id = ?')
+        .get('task-ran-then-cancelled'),
+    ).toEqual({ c: 0 });
   });
 
   it('does not let a guest delete an owner-linked calendar event through its task folder', async () => {
@@ -781,7 +987,7 @@ describe('cancel_task authorization', () => {
       true,
       deps,
     );
-    expect(getTaskById('task-to-cancel')).toBeUndefined();
+    expect(getTaskById('task-to-cancel')!.status).toBe('cancelled');
   });
 
   it('non-main group can cancel its own task', async () => {
@@ -804,7 +1010,7 @@ describe('cancel_task authorization', () => {
       false,
       deps,
     );
-    expect(getTaskById('task-own')).toBeUndefined();
+    expect(getTaskById('task-own')!.status).toBe('cancelled');
   });
 
   it('non-main group cannot cancel another groups task', async () => {
@@ -827,7 +1033,7 @@ describe('cancel_task authorization', () => {
       false,
       deps,
     );
-    expect(getTaskById('task-foreign')).toBeDefined();
+    expect(getTaskById('task-foreign')!.status).toBe('active');
   });
 });
 

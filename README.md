@@ -5,7 +5,7 @@ Linux. It keeps conversations and runtime state on your computer, uses an
 authenticated local Codex CLI by default, and runs owner tools inside an
 isolated sandbox.
 
-The `2.0.0` line is the stable release of the new workspace architecture.
+The `2.1.0` line adds structured memory and improved task continuity.
 Review the release notes before upgrading an older installation.
 
 ## Quick start
@@ -87,7 +87,7 @@ uses the absolute Codex path found during installation.
 ### 4. Download and verify the release installer
 
 ```bash
-VERSION=v2.0.0
+VERSION=v2.1.0
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh"
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh.sha256"
 ```

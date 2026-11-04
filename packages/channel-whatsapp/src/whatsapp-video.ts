@@ -45,6 +45,10 @@ export type WhatsappVideoSkipReason =
 export interface WhatsappVideoAnalysisResult {
   durationSeconds: number | null;
   transcript: string | null;
+  /**
+   * False when the local probe found no audio stream (a muted clip) and the
+   * Whisper pass was therefore skipped; also false for every skipped analysis.
+   */
   transcriptionAttempted: boolean;
   framePaths: string[];
   /** One timestamp for each same-index entry in framePaths. */
@@ -176,6 +180,54 @@ function safeFailureMetadata(error: unknown): Record<string, unknown> {
 
 function roundMetric(value: number | null, digits = 3): number | null {
   return value === null ? null : Number(value.toFixed(digits));
+}
+
+export interface WhatsappVideoProbeSummary {
+  durationSeconds: number | null;
+  /** Null when ffprobe listed no streams at all (older/partial output). */
+  hasAudioTrack: boolean | null;
+}
+
+const FFPROBE_CODEC_TYPES = new Set([
+  'audio',
+  'video',
+  'subtitle',
+  'data',
+  'attachment',
+]);
+
+/**
+ * Parse codec types and duration from flat ffprobe output. Muted videos
+ * have no audio stream, so skip extraction and transcription. Output without
+ * stream information keeps the existing audio-unknown behavior.
+ */
+export function parseWhatsappVideoProbe(
+  stdout: string,
+): WhatsappVideoProbeSummary {
+  let durationSeconds: number | null = null;
+  const codecTypes: string[] = [];
+  for (const rawLine of String(stdout ?? '').split(/\r?\n/u)) {
+    const line = rawLine.trim().toLowerCase();
+    if (!line) continue;
+    if (FFPROBE_CODEC_TYPES.has(line)) {
+      codecTypes.push(line);
+      continue;
+    }
+    if (durationSeconds === null && /^[0-9]+(?:\.[0-9]+)?$/u.test(line)) {
+      const duration = Number.parseFloat(line);
+      if (
+        Number.isFinite(duration) &&
+        duration > 0 &&
+        duration <= MAX_REASONABLE_DURATION_SECONDS
+      ) {
+        durationSeconds = duration;
+      }
+    }
+  }
+  return {
+    durationSeconds,
+    hasAudioTrack: codecTypes.length === 0 ? null : codecTypes.includes('audio'),
+  };
 }
 
 function pathIsDirectChild(child: string, parent: string): boolean {
@@ -347,10 +399,10 @@ function createAnalysisGate(input: {
   };
 }
 
-async function probeVideoDuration(
+async function probeVideo(
   context: SafeVideoContext,
   config: ResolvedProcessorOptions,
-): Promise<number | null> {
+): Promise<WhatsappVideoProbeSummary> {
   try {
     const result = await config.execLocal(
       config.ffprobeBin,
@@ -358,7 +410,7 @@ async function probeVideoDuration(
         '-v',
         'error',
         '-show_entries',
-        'format=duration',
+        'stream=codec_type:format=duration',
         '-of',
         'default=noprint_wrappers=1:nokey=1',
         context.videoPath,
@@ -370,12 +422,7 @@ async function probeVideoDuration(
         windowsHide: true,
       },
     );
-    const duration = Number.parseFloat(result.stdout.trim());
-    return Number.isFinite(duration) &&
-      duration > 0 &&
-      duration <= MAX_REASONABLE_DURATION_SECONDS
-      ? duration
-      : null;
+    return parseWhatsappVideoProbe(result.stdout);
   } catch (error) {
     logger.warn(
       {
@@ -385,7 +432,7 @@ async function probeVideoDuration(
       },
       'Local WhatsApp video duration probe failed',
     );
-    return null;
+    return { durationSeconds: null, hasAudioTrack: null };
   }
 }
 
@@ -522,7 +569,7 @@ async function analyzeVideo(
   config: ResolvedProcessorOptions,
 ): Promise<WhatsappVideoAnalysisResult> {
   const startedAt = performance.now();
-  const durationSeconds = await probeVideoDuration(context, config);
+  const { durationSeconds, hasAudioTrack } = await probeVideo(context, config);
   const requestedFrameTimes = whatsappVideoFrameTimes(durationSeconds);
 
   const framesPromise = (async () => {
@@ -538,10 +585,26 @@ async function analyzeVideo(
     }
     return frames;
   })();
+  // A clip without an audio stream has nothing to transcribe: ffmpeg would
+  // fail to extract audio (an ERROR line) and Whisper would then grind
+  // through silence up to three times. Skip the whole audio branch.
+  const transcriptionAttempted = hasAudioTrack !== false;
+  if (!transcriptionAttempted) {
+    logger.info(
+      {
+        via: 'local-whatsapp-video',
+        videoBasename: context.videoBasename,
+        reason: 'no_audio_track',
+      },
+      'Local WhatsApp video has no audio track; transcription skipped',
+    );
+  }
   // The shared transcriber serializes whisper.cpp work and bounds its own
   // ffmpeg/whisper subprocesses. It receives the local file path only.
   const [transcript, frames] = await Promise.all([
-    transcribeVideo(context, config),
+    transcriptionAttempted
+      ? transcribeVideo(context, config)
+      : Promise.resolve<string | null>(null),
     framesPromise,
   ]);
 
@@ -550,6 +613,7 @@ async function analyzeVideo(
       via: 'local-whatsapp-video',
       videoBasename: context.videoBasename,
       durationSeconds: roundMetric(durationSeconds),
+      hasAudioTrack,
       transcriptChars: transcript?.length ?? 0,
       frameCount: frames.length,
       processingDurationMs: roundMetric(performance.now() - startedAt, 1),
@@ -560,7 +624,7 @@ async function analyzeVideo(
   return {
     durationSeconds,
     transcript,
-    transcriptionAttempted: true,
+    transcriptionAttempted,
     framePaths: frames.map((frame) => frame.path),
     frameTimestampsSeconds: frames.map((frame) => frame.seconds),
   };

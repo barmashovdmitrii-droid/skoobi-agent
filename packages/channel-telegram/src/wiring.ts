@@ -20,7 +20,6 @@ import {
   type ChannelOpts,
 } from '@skoobi/core/channel-registry';
 import type { TenantRecord } from '@skoobi/core/tenant-registry';
-import { captionPhoto } from './photo-caption.js';
 import {
   TelegramChannel,
   TelegramMultiBotChannel,
@@ -116,7 +115,6 @@ const host: TelegramChannelHost = {
   privateAdminModeEnabled,
   isPrivateAdminTelegramUser,
   privateAdminClosedBotText,
-  captionPhoto,
 };
 
 registerChannel('telegram', (opts: ChannelOpts) => {

@@ -28,8 +28,17 @@ import {
   codexDesktopErrorResponse,
   codexGuiAuthorizationRequired,
   codexGuiEndpointNeedsFrontmostCheck,
+  deriveScreenshot,
+  fullScreenshotResult,
   isValidCodexControlRunId,
+  OPEN_APP_RETRY_DELAY_MS,
+  openApplicationWithRetry,
+  parseDisplayGeometryOutput,
   parseHelperRequestUrl,
+  parseScreenshotRequest,
+  planKeyPress,
+  readImageFileSize,
+  resolveScreenshotDisplay,
   safeHelperRequestLogFields,
   secureScreenshotDirectory,
   secureScreenshotFile,
@@ -69,6 +78,14 @@ const CLICLICK = '/opt/homebrew/bin/cliclick';
 const SCREENCAPTURE = '/usr/sbin/screencapture';
 const OPEN_BIN = '/usr/bin/open';
 const OSASCRIPT = '/usr/bin/osascript';
+const SIPS = '/usr/bin/sips';
+// Budget for the region capture and all sips steps of one screenshot. It
+// stays well inside the runner's 20 s helper timeout, so a stuck
+// screencapture or sips still ends in the full-size fallback instead of a
+// failed tool call.
+const SCREENSHOT_DERIVE_BUDGET_MS = 10_000;
+const DISPLAY_GEOMETRY_TIMEOUT_MS = 3_000;
+const DISPLAY_GEOMETRY_CACHE_MS = 30_000;
 
 function loadEnv() {
   const env = {};
@@ -316,108 +333,107 @@ async function readJSONBody(req) {
 }
 
 // ---------------------------------------------------------------------------
-// Key mapping for cliclick kp:
+// Key press: the key tables, aliases and the cliclick/osascript decision live
+// in skoobi-helper-policy.js (planKeyPress) so they are unit-tested.
 // ---------------------------------------------------------------------------
 
-const CLICLICK_KEYS = new Set([
-  'arrow-down', 'arrow-left', 'arrow-right', 'arrow-up',
-  'brightness-down', 'brightness-up',
-  'delete', 'end', 'enter', 'esc', 'f1', 'f2', 'f3', 'f4', 'f5', 'f6',
-  'f7', 'f8', 'f9', 'f10', 'f11', 'f12', 'f13', 'f14', 'f15', 'f16',
-  'fwd-delete', 'home', 'keys-light-down', 'keys-light-toggle', 'keys-light-up',
-  'mute', 'num-0', 'num-1', 'num-2', 'num-3', 'num-4', 'num-5', 'num-6',
-  'num-7', 'num-8', 'num-9', 'num-clear', 'num-divide', 'num-enter',
-  'num-equals', 'num-minus', 'num-multiply', 'num-plus',
-  'page-down', 'page-up', 'play-next', 'play-pause', 'play-previous',
-  'return', 'space', 'tab', 'volume-down', 'volume-up',
-]);
-
-const KEY_ALIASES = {
-  enter: 'return',
-  escape: 'esc',
-  up: 'arrow-up', down: 'arrow-down', left: 'arrow-left', right: 'arrow-right',
-  backspace: 'delete',
-  del: 'fwd-delete',
-  pgup: 'page-up', pgdn: 'page-down',
-};
-
-const MOD_TO_APPLESCRIPT = {
-  cmd: 'command down', command: 'command down',
-  ctrl: 'control down', control: 'control down',
-  alt: 'option down', option: 'option down', opt: 'option down',
-  shift: 'shift down',
-};
-
-// AppleScript key-code table for common non-character keys used in chords.
-const APPLESCRIPT_KEYCODES = {
-  space: 49, return: 36, enter: 76, tab: 48, esc: 53, escape: 53,
-  delete: 51, backspace: 51, 'fwd-delete': 117,
-  'arrow-up': 126, up: 126, 'arrow-down': 125, down: 125,
-  'arrow-left': 123, left: 123, 'arrow-right': 124, right: 124,
-  home: 115, end: 119, 'page-up': 116, 'page-down': 121,
-  f1: 122, f2: 120, f3: 99, f4: 118, f5: 96, f6: 97, f7: 98, f8: 100,
-  f9: 101, f10: 109, f11: 103, f12: 111,
-};
-
-function splitKeys(s) {
-  return String(s).toLowerCase().split('+').map((k) => k.trim()).filter(Boolean);
-}
-
 async function pressKey(keys) {
-  const parts = splitKeys(keys);
-  const mods = [];
-  const nonMods = [];
-  for (const p of parts) {
-    if (MOD_TO_APPLESCRIPT[p]) mods.push(MOD_TO_APPLESCRIPT[p]);
-    else nonMods.push(KEY_ALIASES[p] || p);
+  const plan = planKeyPress(keys);
+  if (plan.kind === 'cliclick') {
+    await execFileAsync(CLICLICK, [`kp:${plan.key}`]);
+    return;
   }
-
-  // No modifiers — use cliclick if we know the key, else fall back to osascript keystroke
-  if (mods.length === 0 && nonMods.length === 1) {
-    const k = nonMods[0];
-    if (CLICLICK_KEYS.has(k)) {
-      await execFileAsync(CLICLICK, [`kp:${k}`]);
-      return;
-    }
-    if (k.length === 1) {
-      const script = `tell application "System Events" to keystroke ${JSON.stringify(k)}`;
-      await execFileAsync(OSASCRIPT, ['-e', script]);
-      return;
-    }
-  }
-
-  // Modifiers — build an AppleScript. Prefer key code for named keys, keystroke for single chars.
-  if (nonMods.length !== 1) {
-    throw new Error(`press expects exactly one non-modifier key (got ${JSON.stringify(nonMods)})`);
-  }
-  const target = nonMods[0];
-  const modClause = mods.length ? ` using {${mods.join(', ')}}` : '';
-  let body;
-  if (APPLESCRIPT_KEYCODES[target] !== undefined) {
-    body = `key code ${APPLESCRIPT_KEYCODES[target]}${modClause}`;
-  } else if (target.length === 1) {
-    body = `keystroke ${JSON.stringify(target)}${modClause}`;
-  } else {
-    throw new Error(`unsupported key with modifiers: "${target}"`);
-  }
-  const script = `tell application "System Events" to ${body}`;
-  await execFileAsync(OSASCRIPT, ['-e', script]);
+  await execFileAsync(OSASCRIPT, ['-e', plan.script]);
 }
 
 // ---------------------------------------------------------------------------
 // Endpoint handlers
 // ---------------------------------------------------------------------------
 
-async function handleScreenshot() {
+// Primary display (the one with the menu bar, origin of the global point
+// space cliclick uses). `screencapture -x <one file>` captures exactly this
+// display. NSScreen.screens[0] is that display for any process; mainScreen
+// would follow keyboard focus instead.
+const NSSCREEN_GEOMETRY_SCRIPT =
+  'ObjC.import("AppKit"); var a=$.NSScreen.screens; var s=a.objectAtIndex(0); ' +
+  'JSON.stringify({w:s.frame.size.width,h:s.frame.size.height,scale:s.backingScaleFactor,n:Number(a.count)})';
+
+let displayGeometryCache = null; // { value, atMs }
+
+async function readMainDisplayGeometry() {
+  try {
+    const { stdout } = await execFileAsync(
+      OSASCRIPT,
+      ['-l', 'JavaScript', '-e', NSSCREEN_GEOMETRY_SCRIPT],
+      { timeout: DISPLAY_GEOMETRY_TIMEOUT_MS },
+    );
+    const geometry = parseDisplayGeometryOutput(stdout);
+    if (geometry) return { ...geometry, source: 'nsscreen' };
+  } catch (error) {
+    log('warn', 'display_geometry_probe_failed', {
+      error_type: error instanceof Error ? error.name : typeof error,
+    });
+  }
+  // Finder desktop bounds are the union of all displays — only right while a
+  // single display is attached; resolveScreenshotDisplay() guards the mapping.
+  const bounds = await finderDesktopBounds({
+    timeout: DISPLAY_GEOMETRY_TIMEOUT_MS,
+  });
+  return { ...bounds, scale: null, screens: null, source: 'finder' };
+}
+
+async function mainDisplayGeometry({ refresh = false } = {}) {
+  const now = Date.now();
+  if (
+    !refresh &&
+    displayGeometryCache &&
+    now - displayGeometryCache.atMs < DISPLAY_GEOMETRY_CACHE_MS
+  ) {
+    return displayGeometryCache.value;
+  }
+  const value = await readMainDisplayGeometry();
+  displayGeometryCache = { value, atMs: Date.now() };
+  return value;
+}
+
+async function handleScreenshot(body) {
+  // Validate before capturing so a bad request leaves no image behind.
+  const request = parseScreenshotRequest(body);
   secureScreenshotDirectory(SCREENSHOT_DIR);
-  const file = path.join(SCREENSHOT_DIR, `${Date.now()}-${randomUUID()}.png`);
+  const stamp = Date.now();
+  const file = path.join(SCREENSHOT_DIR, `${stamp}-${randomUUID()}.png`);
+  let bytes;
   try {
     await execFileAsync(SCREENCAPTURE, ['-x', file]);
-    const bytes = secureScreenshotFile(file, SCREENSHOT_DIR);
-    secureScreenshotDirectory(SCREENSHOT_DIR);
-    return { path: file, bytes };
+    bytes = secureScreenshotFile(file, SCREENSHOT_DIR);
   } catch (error) {
     fs.rmSync(file, { force: true });
+    throw error;
+  }
+  let result;
+  try {
+    const src = { path: file, bytes, stamp, size: readImageFileSize(file) };
+    result = request
+      ? await deriveScreenshot({
+          src,
+          request,
+          directory: SCREENSHOT_DIR,
+          resolveDisplay: (size) =>
+            resolveScreenshotDisplay(size, mainDisplayGeometry),
+          // A region is captured on its own (`-x -R x,y,w,h <file>`), never
+          // cropped out of the full capture by sips.
+          captureRegion: (args, options) =>
+            execFileAsync(SCREENCAPTURE, args, options),
+          runSips: (args, options) => execFileAsync(SIPS, args, options),
+          log,
+          budgetMs: SCREENSHOT_DERIVE_BUDGET_MS,
+        })
+      : fullScreenshotResult(src, null);
+    secureScreenshotDirectory(SCREENSHOT_DIR);
+    return result;
+  } catch (error) {
+    fs.rmSync(file, { force: true });
+    if (result?.path) fs.rmSync(result.path, { force: true });
     throw error;
   }
 }
@@ -480,8 +496,16 @@ async function handleKey(body) {
 async function handleOpenApp(body) {
   const name = String(body?.name ?? '').trim();
   if (!name) throw new Error('name is required');
-  await execFileAsync(OPEN_BIN, ['-a', name]);
-  return { ok: true, name };
+  // `open -a` right after cmd+q races the app's own quit: LaunchServices
+  // answers -600 for a moment (28.09 19:42:59, Telegram). One retry after
+  // OPEN_APP_RETRY_DELAY_MS; the decision lives in skoobi-helper-policy.js.
+  return openApplicationWithRetry({
+    name,
+    open: () => execFileAsync(OPEN_BIN, ['-a', name]),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    onRetry: () =>
+      log('warn', 'open_app_retry', { name, delay_ms: OPEN_APP_RETRY_DELAY_MS }),
+  });
 }
 
 async function handleMouseMove(body) {
@@ -490,16 +514,28 @@ async function handleMouseMove(body) {
   return { ok: true, x, y };
 }
 
-async function handleScreenSize() {
+async function finderDesktopBounds(options = {}) {
   // Use AppleScript "desktop" bounds — authoritative even with multiple displays.
   const script = 'tell application "Finder" to get bounds of window of desktop';
-  const { stdout } = await execFileAsync(OSASCRIPT, ['-e', script]);
+  const { stdout } = await execFileAsync(OSASCRIPT, ['-e', script], options);
   // stdout like "0, 0, 2560, 1440"
   const parts = stdout.trim().split(',').map((s) => parseInt(s.trim(), 10));
   if (parts.length >= 4 && parts.every(Number.isFinite)) {
     return { width: parts[2] - parts[0], height: parts[3] - parts[1] };
   }
   throw new Error('could not determine screen size');
+}
+
+async function handleScreenSize() {
+  const size = await finderDesktopBounds();
+  // Extra, best-effort: the backing scale of the primary display.
+  try {
+    const display = await mainDisplayGeometry();
+    if (display.scale) return { ...size, scale: display.scale };
+  } catch {
+    // width/height alone keep the old contract
+  }
+  return size;
 }
 
 async function handleCodexDesktopStatus() {
@@ -687,7 +723,9 @@ function rejectUnauthorizedCodexControlRun(req, res, endpoint) {
 const ROUTES = {
   'GET /health': { auth: true, handler: async () => ({ ok: true }) },
   'GET /screen_size': { auth: true, handler: handleScreenSize },
-  'POST /screenshot': { auth: true, handler: handleScreenshot },
+  // Optional JSON body (format/max_side/quality/region); an empty body keeps
+  // the legacy full-size PNG answer for older runners.
+  'POST /screenshot': { auth: true, handler: handleScreenshot, body: true },
   'POST /click': { auth: true, handler: handleClick, body: true },
   'POST /type': { auth: true, handler: handleType, body: true },
   'POST /key': { auth: true, handler: handleKey, body: true },

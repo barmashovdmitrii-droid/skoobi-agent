@@ -14,6 +14,119 @@ function mockChannel(name: string, jidPrefix: string): Channel {
 }
 
 describe('MessageRouter', () => {
+  it('drains only the explicitly finished progress turn before sending its final', async () => {
+    const channel = mockChannel('telegram', 'tg:');
+    const calls: string[] = [];
+    let release!: () => void;
+    channel.finishProgress = vi.fn().mockImplementation(async (_jid, key) => {
+      calls.push(`finish:${key}`);
+      await new Promise<void>((resolve) => { release = resolve; });
+    });
+    channel.sendMessage = vi.fn().mockImplementation(async () => { calls.push('final'); });
+    const router = createMessageRouter([channel]);
+    const pending = router.route({ chatJid: 'tg:123', text: 'Done', triggerType: 'agent-response',
+      meta: { progressKey: 'turn-1', progressFinal: true } });
+    await vi.waitFor(() => expect(channel.finishProgress).toHaveBeenCalledOnce());
+    expect(calls).toEqual(['finish:turn-1']);
+    release();
+    expect(await pending).toBe('Done');
+    expect(calls).toEqual(['finish:turn-1', 'final']);
+  });
+
+  it('does not close live progress for an unrelated background result', async () => {
+    const channel = mockChannel('telegram', 'tg:');
+    channel.finishProgress = vi.fn();
+    const router = createMessageRouter([channel]);
+    await router.route({ chatJid: 'tg:123', text: 'Other task completed', triggerType: 'extension' });
+    expect(channel.finishProgress).not.toHaveBeenCalled();
+    expect(channel.sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it('does not count a closed turn status as delivered', async () => {
+    const channel = mockChannel('telegram', 'tg:');
+    channel.sendProgress = vi.fn().mockResolvedValue(false);
+    const router = createMessageRouter([channel]);
+    const observer = vi.fn(); router.addPostHook(observer);
+    expect(await router.route({ chatJid: 'tg:123', text: 'Stale progress', triggerType: 'agent-response',
+      meta: { kind: 'agent_progress', progressKey: 'closed' } })).toBeNull();
+    expect(observer).not.toHaveBeenCalled();
+    expect(channel.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('updates progress in place but delivers a final answer as a separate message', async () => {
+    const channel = mockChannel('telegram', 'tg:');
+    channel.sendProgress = vi.fn().mockResolvedValue(true);
+    const router = createMessageRouter([channel]);
+    const observer = vi.fn();
+    router.addPostHook(observer);
+    await router.route({
+      chatJid: 'tg:123',
+      text: 'Starting',
+      triggerType: 'agent-response',
+      meta: { kind: 'agent_progress', progressKey: 'turn-1' },
+    });
+    await router.route({
+      chatJid: 'tg:123',
+      text: 'Checking',
+      triggerType: 'extension',
+      meta: { kind: 'host_progress', progressKey: 'turn-1' },
+    });
+    await router.route({
+      chatJid: 'tg:123',
+      text: 'Complete',
+      triggerType: 'agent-response',
+    });
+    expect(channel.sendProgress).toHaveBeenNthCalledWith(
+      1,
+      'tg:123',
+      'Starting',
+      'turn-1',
+    );
+    expect(channel.sendProgress).toHaveBeenNthCalledWith(
+      2,
+      'tg:123',
+      'Checking',
+      'turn-1',
+    );
+    expect(channel.sendMessage).toHaveBeenCalledExactlyOnceWith(
+      'tg:123',
+      'Complete',
+    );
+    expect(observer).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not report progress as delivered when its update fails', async () => {
+    const channel = mockChannel('telegram', 'tg:');
+    channel.sendProgress = vi.fn().mockRejectedValue(new Error('ENOTFOUND'));
+    const router = createMessageRouter([channel]);
+    const observer = vi.fn();
+    router.addPostHook(observer);
+    await expect(
+      router.route({
+        chatJid: 'tg:123',
+        text: 'Starting',
+        triggerType: 'agent-response',
+        meta: { kind: 'agent_progress', progressKey: 'turn-1' },
+      }),
+    ).rejects.toThrow('ENOTFOUND');
+    expect(observer).not.toHaveBeenCalled();
+    expect(channel.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('keeps ordinary delivery for channels without editable progress', async () => {
+    const channel = mockChannel('whatsapp', 'wa:');
+    const router = createMessageRouter([channel]);
+    await router.route({
+      chatJid: 'wa:123',
+      text: 'Working',
+      triggerType: 'agent-response',
+      meta: { kind: 'agent_progress', progressKey: 'turn-1' },
+    });
+    expect(channel.sendMessage).toHaveBeenCalledExactlyOnceWith(
+      'wa:123',
+      'Working',
+    );
+  });
   it('routes message to correct channel', async () => {
     const slack = mockChannel('slack', 'C');
     const router = createMessageRouter([slack]);
@@ -289,17 +402,53 @@ describe('MessageRouter', () => {
     );
   });
 
+  it('host-owned document sends can suppress the IPC cursor advance', async () => {
+    const slack = {
+      ...mockChannel('slack', 'C'),
+      sendDocument: vi.fn().mockResolvedValue(undefined),
+    };
+    const router = createMessageRouter([slack]);
+    const postHook = vi.fn();
+
+    router.addPostHook(postHook);
+
+    await router.sendDocument('C123', '/tmp/report.pdf', undefined, {
+      suppressCursorAdvance: true,
+      meta: { kind: 'local_file_document' },
+    });
+
+    expect(postHook).toHaveBeenCalledWith(
+      expect.objectContaining({
+        chatJid: 'C123',
+        triggerType: 'ipc',
+        meta: {
+          kind: 'local_file_document',
+          filePath: '/tmp/report.pdf',
+          suppressCursorAdvance: true,
+        },
+      }),
+    );
+  });
+
   it('warns when no channel owns the JID', async () => {
     const slack = mockChannel('slack', 'C');
     const router = createMessageRouter([slack]);
 
-    await expect(
-      router.route({
+    let deliveryError: unknown;
+    try {
+      await router.route({
         chatJid: 'unknown-jid',
         text: 'hello',
         triggerType: 'agent-response',
-      }),
-    ).rejects.toThrow('No connected channel for JID');
+      });
+    } catch (error) {
+      deliveryError = error;
+    }
+    expect(deliveryError).toBeInstanceOf(Error);
+    expect((deliveryError as Error).message).toContain(
+      'No connected channel for JID',
+    );
+    expect((deliveryError as Error).message).not.toContain('unknown-jid');
 
     expect(slack.sendMessage).not.toHaveBeenCalled();
   });

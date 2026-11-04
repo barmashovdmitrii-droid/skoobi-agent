@@ -23,15 +23,14 @@ import {
   readEnvFile,
   resolveBinary,
 } from '@skoobi/shared';
-import {
-  EDGE_DMITRY_VOICE,
-  synthesizeDmitryVoice,
-} from './edgeDmitryVoice.js';
+import { EDGE_DMITRY_VOICE, synthesizeDmitryVoice } from './edgeDmitryVoice.js';
 
 const execFileAsync = promisify(execFile);
 
 const ttsEnv = readEnvFile([
   'TTS_PROVIDER',
+  'EDGE_TTS_BIN',
+  'EDGE_TTS_SCRIPT',
   'TTS_VOICE',
   'TTS_VOICE_OPENAI',
   'OPENAI_API_KEY',
@@ -59,6 +58,8 @@ const PROVIDER = (
   ttsEnv.TTS_PROVIDER ||
   'edge'
 ).toLowerCase();
+const EDGE_TTS_BIN = process.env.EDGE_TTS_BIN || ttsEnv.EDGE_TTS_BIN;
+const EDGE_TTS_SCRIPT = process.env.EDGE_TTS_SCRIPT || ttsEnv.EDGE_TTS_SCRIPT;
 const LOCAL_VOICE = process.env.TTS_VOICE || ttsEnv.TTS_VOICE || 'Milena';
 const OPENAI_VOICE =
   process.env.TTS_VOICE_OPENAI || ttsEnv.TTS_VOICE_OPENAI || 'nova';
@@ -134,11 +135,7 @@ export function telegramVoiceOggFfmpegArgs(
     loudnorm?: boolean;
   } = {},
 ): string[] {
-  const args = [
-    '-y',
-    '-i',
-    inputAudio,
-  ];
+  const args = ['-y', '-i', inputAudio];
   if (options.loudnorm) {
     args.push('-af', 'loudnorm=I=-16:TP=-1.5:LRA=11');
   }
@@ -480,6 +477,8 @@ async function synthEdgeDmitry(text: string, outOgg: string): Promise<void> {
     outputDir: path.dirname(outOgg),
     basename,
     ffmpegBin: FFMPEG_BIN,
+    edgeTtsBin: EDGE_TTS_BIN,
+    edgeTtsScript: EDGE_TTS_SCRIPT,
   });
   if (result.filePath !== outOgg) {
     fs.renameSync(result.filePath, outOgg);

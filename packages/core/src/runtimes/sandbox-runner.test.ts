@@ -101,9 +101,12 @@ import {
   sandboxChildBaseEnv,
   sandboxProviderIsolationError,
   CODEX_SANDBOX_DOMAINS,
+  resolveSandboxGlobalTimeoutMs,
+  stripLinkCheckUnlessDirectNetwork,
 } from './sandbox-runner.js';
 import { CONTAINER_MAX_OUTPUT_SIZE, DATA_DIR } from '../orchestrator/config.js';
 import { restrictRuntimeInputToAuthorizedTier } from './container-runner.js';
+import { codexLoginFingerprint } from '../orchestrator/prestart-replay.js';
 import { logger } from '../orchestrator/logger.js';
 import { notifyRunIpcActivity } from '../orchestrator/run-activity.js';
 import type { RegisteredGroup } from '../orchestrator/types.js';
@@ -184,6 +187,9 @@ describe('ensureSandboxRuntimeAvailable', () => {
   it('verifies sandbox-runtime is installed', () => {
     mockExecFileSync.mockReturnValueOnce('1.0.0');
     ensureSandboxRuntimeAvailable();
+    // Runs the installed CLI through this process's own node, never `npx`:
+    // npx resolves through PATH and may fetch a package from the registry, so
+    // the probe could pass against a binary buildSandboxArgs never runs.
     expect(mockExecFileSync).toHaveBeenCalledWith(
       process.execPath,
       [
@@ -194,6 +200,21 @@ describe('ensureSandboxRuntimeAvailable', () => {
       ],
       expect.any(Object),
     );
+  });
+
+  it('rejects a sandbox-runtime CLI that is not a regular file', () => {
+    const lstat = vi.spyOn(fs, 'lstatSync').mockReturnValueOnce({
+      isFile: () => true,
+      isSymbolicLink: () => true,
+    } as unknown as fs.Stats);
+    try {
+      expect(() => ensureSandboxRuntimeAvailable()).toThrow(
+        'sandbox-runtime is required but not installed',
+      );
+      expect(mockExecFileSync).not.toHaveBeenCalled();
+    } finally {
+      lstat.mockRestore();
+    }
   });
 
   it('throws if sandbox-runtime not found', () => {
@@ -794,7 +815,7 @@ describe('deriveSandboxMountRoot (read-confinement boundary)', () => {
   it('derives a generic top-level boundary on Linux layouts (NOT keyed on /Users)', () => {
     // These are exactly the deployments where the old `.startsWith('/Users')`
     // gate silently disabled confinement.
-    expect(deriveSandboxMountRoot('/home/skoobi/claudeclaw')).toBe('/home');
+    expect(deriveSandboxMountRoot('/home/example/claudeclaw')).toBe('/home');
     expect(deriveSandboxMountRoot('/opt/claudeclaw')).toBe('/opt');
     expect(deriveSandboxMountRoot('/srv/apps/claudeclaw')).toBe('/srv');
   });
@@ -812,13 +833,13 @@ describe('deriveSandboxMountRoot (read-confinement boundary)', () => {
   it('ignores a configured boundary that does NOT contain the project (no weakening)', () => {
     // A misconfigured override must fall back to the safe derived default
     // rather than silently disabling confinement.
-    expect(deriveSandboxMountRoot('/home/skoobi/cc', '/some/other/place')).toBe(
+    expect(deriveSandboxMountRoot('/home/example/cc', '/some/other/place')).toBe(
       '/home',
     );
   });
 
   it('ignores a configured boundary of the filesystem root (would never terminate)', () => {
-    expect(deriveSandboxMountRoot('/home/skoobi/cc', '/')).toBe('/home');
+    expect(deriveSandboxMountRoot('/home/example/cc', '/')).toBe('/home');
   });
 });
 
@@ -920,7 +941,7 @@ describe('computeProjectChainSiblingDenyPaths (off-chain reads denied)', () => {
   });
 
   it('tolerates a non-existent directory in the chain (treated as empty)', () => {
-    const projectRoot = '/home/skoobi/cc';
+    const projectRoot = '/home/example/cc';
     // The project-home readdir throws; the walk must not crash and should deny
     // siblings at the levels that DO exist.
     const listDir = (dir: string): string[] => {
@@ -1501,6 +1522,63 @@ describe('guest macOS non-enumerative Seatbelt boundary', () => {
 // L13/L10: NO_OUTPUT_TIMEOUT_MS must not cap a long turn below the budget and
 // must be configurable.
 // ---------------------------------------------------------------------------
+describe('resolveSandboxGlobalTimeoutMs', () => {
+  it('outlasts the codex turn budget so codex, not the sandbox, ends the turn', () => {
+    expect(
+      resolveSandboxGlobalTimeoutMs({
+        configTimeout: 300_000,
+        idleTimeout: 1_800_000,
+        codexTurnTimeoutMs: 2_700_000,
+      }),
+    ).toBe(2_820_000);
+    // 90-minute cap of an admin turn with an idle stop (codexTurnMaxMs).
+    expect(
+      resolveSandboxGlobalTimeoutMs({
+        configTimeout: 300_000,
+        idleTimeout: 1_800_000,
+        codexTurnTimeoutMs: 5_400_000,
+      }),
+    ).toBe(5_520_000);
+  });
+
+  it('keeps the idle floor for short or absent codex budgets', () => {
+    expect(
+      resolveSandboxGlobalTimeoutMs({
+        configTimeout: 300_000,
+        idleTimeout: 1_800_000,
+        codexTurnTimeoutMs: 900_000,
+      }),
+    ).toBe(1_830_000);
+    expect(
+      resolveSandboxGlobalTimeoutMs({ configTimeout: 300_000, idleTimeout: 1_800_000 }),
+    ).toBe(1_830_000);
+  });
+});
+
+describe('stripLinkCheckUnlessDirectNetwork', () => {
+  const input = {
+    prompt: 'p',
+    groupFolder: 'telegram_main',
+    chatJid: 'tg:1',
+    isMain: true,
+    linkCheck: { mode: 'fix' as const, fixReasoningEffort: 'medium' },
+  };
+
+  it('keeps the link check on a direct-network (bypass) run', () => {
+    expect(stripLinkCheckUnlessDirectNetwork(input, true)).toBe(input);
+  });
+
+  // In the sandbox the egress is an allowlist behind srt's proxy, which
+  // Node's fetch ignores: the check would measure the sandbox, not the link.
+  it('drops it from a sandboxed run without touching the rest', () => {
+    const stripped = stripLinkCheckUnlessDirectNetwork(input, false);
+    expect(stripped.linkCheck).toBeUndefined();
+    expect('linkCheck' in stripped).toBe(false);
+    expect(stripped).toMatchObject({ prompt: 'p', groupFolder: 'telegram_main' });
+    expect(input.linkCheck).toBeDefined();
+  });
+});
+
 describe('resolveNoOutputTimeoutMs (L13 first-output deadline)', () => {
   it('defaults to the chat first-output deadline when the budget is large', () => {
     // 30-min global budget: the no-output deadline stays at the default.
@@ -3030,6 +3108,8 @@ describe('sandbox provider credential isolation', () => {
     expect(
       mounts.find(
         (mount) =>
+          // Mount restrictions use the code root, not the isolated test
+          // STATE_ROOT.
           mount.hostPath === path.join(process.cwd(), 'store') && mount.deny,
       ),
     ).toBeDefined();
@@ -3547,6 +3627,32 @@ describe('codex provider auth preparation', () => {
     writeWithMtime(groupAuth('telegram_main'), '{"tokens":"trunca', 5000); // invalid JSON
     persistTrustedCodexAuthRefresh('telegram_main', dataDir);
     expect(fs.readFileSync(centralAuth(), 'utf-8')).toBe('{"tokens":"good"}');
+  });
+
+  it("a failed main-chat run moves the central copy's mtime, not the login fingerprint", () => {
+    // The held-replay wake (prestart-replay.ts) must not read the runner's
+    // own prepare + write-back as «logged in again».
+    writeWithMtime(
+      hostAuth(),
+      '{"tokens":{"refresh_token":"rt-1"}}',
+      Date.now() - 60_000,
+    );
+    prepareCodexHomeForRun('telegram_main', { dataDir, homeDir });
+    persistTrustedCodexAuthRefresh('telegram_main', dataDir);
+    const before = codexLoginFingerprint({ homeDir, dataDir });
+    const centralBefore = fs.statSync(centralAuth()).mtimeMs;
+    fs.utimesSync(
+      centralAuth(),
+      new Date(centralBefore - 5000),
+      new Date(centralBefore - 5000),
+    );
+    // The next run (a 401 changes nothing in auth.json): same dance again.
+    prepareCodexHomeForRun('telegram_main', { dataDir, homeDir });
+    persistTrustedCodexAuthRefresh('telegram_main', dataDir);
+    expect(fs.statSync(centralAuth()).mtimeMs).toBeGreaterThan(
+      centralBefore - 5000,
+    );
+    expect(codexLoginFingerprint({ homeDir, dataDir })).toBe(before);
   });
 
   it('persistTrustedCodexAuthRefresh does nothing when the group copy is older than central', () => {

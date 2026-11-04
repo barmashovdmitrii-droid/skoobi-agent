@@ -18,8 +18,23 @@ describe('config path resolution', () => {
   });
 
   it('uses cwd as STATE_ROOT', async () => {
+    delete process.env.SKOOBI_TEST_STATE_ROOT;
     const config = await import('./config.js');
     expect(config.STATE_ROOT).toBe(process.cwd());
+  });
+
+
+  // явная тестовая переменная. Без неё прогон писал бы в боевой инстанс.
+  it('redirects STATE_ROOT to SKOOBI_TEST_STATE_ROOT when it is set', async () => {
+    const stateRoot = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'skoobi-state-root-')),
+    );
+    process.env.SKOOBI_TEST_STATE_ROOT = stateRoot;
+    const config = await import('./config.js');
+    expect(config.STATE_ROOT).toBe(stateRoot);
+    expect(config.STORE_DIR).toBe(path.join(stateRoot, 'store'));
+    expect(config.GROUPS_DIR).toBe(path.join(stateRoot, 'groups'));
+    expect(config.STATE_ROOT).not.toBe(process.cwd());
   });
 
   it('decodes spaces and Unicode when resolving CODE_ROOT', async () => {
@@ -67,7 +82,7 @@ describe('config path resolution', () => {
     const config = await import('./config.js');
     expect(config.DATA_DIR).toContain('data');
     expect(config.DATA_DIR).toBe(
-      require('path').resolve(process.cwd(), 'data'),
+      path.resolve(config.STATE_ROOT, 'data'),
     );
   });
 

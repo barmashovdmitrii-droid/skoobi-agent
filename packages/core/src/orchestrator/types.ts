@@ -67,6 +67,24 @@ export interface AgentConfig {
   curatedMemory?: boolean; // When false, suppress bounded curated MEMORY.md/USER.md summary blocks in lazy memory mode.
   skillsEnabled?: boolean; // When false, suppress Hermes-style procedural skill selection for this group.
   codexFullAgentPrimary?: boolean; // Force owner live turns through the full Codex agent runner instead of the thin live adapter.
+  codexTurnTimeoutMs?: number; // Per-group hard timeout for full Codex agent turns; invalid/non-positive values fall back to the global default.
+  /**
+   * MESSAGE turns only (scheduled tasks keep codexTurnTimeoutMs): stop a full
+   * Codex turn after this long with no sign of life — no event from codex and
+   * no growth of its thread log (3× that while a command or tool is still
+   * running). Values under 2 minutes are raised to 2 minutes. Unset keeps the
+   * old rule, where codexTurnTimeoutMs alone ends the turn.
+   */
+  codexTurnInactivityMs?: number;
+  /**
+   * MESSAGE turns only, and only together with codexTurnInactivityMs: the
+   * hard cap on one turn that keeps making progress. Defaults to
+   * codexTurnTimeoutMs.
+   */
+  codexTurnMaxMs?: number;
+
+
+  googleStandingAccess?: boolean;
   whatsappObserverAccess?: boolean; // Owner self-chat only: allow bounded, explicit-request context from the passive WhatsApp observer store.
   instructionSourceFolder?: string; // Trusted host config: copy CLAUDE.md once from this exact group folder into a separate runtime workspace.
   memoryContextFolder?: string; // Trusted same-owner config: read bounded prompt memory from this exact group folder while keeping sessions separate.
@@ -107,6 +125,13 @@ export interface ScheduledTask {
   creator_identity_id?: string | null;
   /** Stable channel sender id of the creator, never copied from guest IPC. */
   creator_sender_id?: string | null;
+  /**
+   * How much the run may do. NULL/absent (every legacy and IPC-created row) is
+   * the normal owner-task run. 'read_only' may only read: no Google, no
+   * outbound or persistent claudeclaw tools, the Codex shell in its read-only
+   * sandbox and no web search (task-scheduler.ts, taskRunsReadOnly).
+   */
+  run_profile?: 'read_only' | null;
 }
 
 export interface CalendarEventLink {
@@ -192,11 +217,19 @@ export interface MessageRouter {
       meta?: Record<string, unknown>;
     },
   ): Promise<boolean>;
-  /** Send a document by absolute file path. Returns true if delivered, false if no channel supports it. */
+  /**
+   * Send a document by absolute file path. Returns true if delivered, false if
+   * no channel supports it. A host-owned send (a file the host attaches to the
+   * final answer) sets suppressCursorAdvance, as for sendPhoto above.
+   */
   sendDocument(
     jid: string,
     filePath: string,
     caption?: string,
+    options?: {
+      suppressCursorAdvance?: boolean;
+      meta?: Record<string, unknown>;
+    },
   ): Promise<boolean>;
   /** Synthesize text → voice and send. Returns true if delivered, false if no channel supports it. */
   sendVoice(jid: string, text: string): Promise<boolean>;

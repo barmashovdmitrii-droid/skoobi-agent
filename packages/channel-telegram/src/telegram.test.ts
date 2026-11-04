@@ -78,8 +78,6 @@ const quotaMock = vi.hoisted(() => ({
   formatQuotaStatusRu: vi.fn(),
 }));
 
-const captionPhotoMock = vi.hoisted(() => vi.fn());
-
 vi.mock('./video-telegram.js', () => ({
   processTelegramVideoFile: vi.fn(),
   processTelegramVideoNote: vi.fn(),
@@ -142,6 +140,7 @@ vi.mock('grammy', () => ({
       sendDocument: vi.fn().mockResolvedValue(undefined),
       sendChatAction: vi.fn().mockResolvedValue(undefined),
       setMyCommands: vi.fn().mockResolvedValue(true),
+      setMessageReaction: vi.fn().mockResolvedValue(true),
     };
 
     constructor(token: string) {
@@ -195,11 +194,21 @@ vi.mock('grammy', () => ({
 }));
 
 import {
+  encodeMarkdownLinkParens,
+  escapeIntraWordMarkdown,
+  normalizeMarkdownForTelegram,
+  normalizeTelegramBlocks,
+  isTelegramTransientSendError,
+  plainTelegramText,
+  splitTelegramText,
+  isHandledBotCommand,
   readSkoobiEngineRuntimeStatus,
   retentionScriptPath,
   TelegramChannel,
   TelegramChannelOpts,
+  TelegramMultiBotChannel,
   telegramMessageTimestamp,
+  TYPING_MAX_DURATION_MS,
 } from './telegram.js';
 import {
   processTelegramVideoFile,
@@ -271,7 +280,6 @@ function testHost() {
         .filter(Boolean)
         .includes(String(telegramUserId ?? '')),
     privateAdminClosedBotText: () => 'Это закрытый private/admin бот.',
-    captionPhoto: captionPhotoMock,
   };
 }
 
@@ -586,6 +594,9 @@ describe('TelegramChannel', () => {
       const channel = new TelegramChannel('test-token', opts);
 
       await expect(channel.connect()).rejects.toThrow('401: Unauthorized');
+      // The half-started grammy instance must be dropped, not retained: a
+      // non-null this.bot would leave isConnected() reporting healthy while
+      // the long-poll loop never started.
       expect(channel.isConnected()).toBe(false);
       expect(loggerMock.error).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -605,8 +616,6 @@ describe('TelegramChannel', () => {
       expect(currentBot().commandHandlers.has('start')).toBe(true);
       expect(currentBot().commandHandlers.has('help')).toBe(true);
       expect(currentBot().commandHandlers.has('language')).toBe(true);
-      expect(currentBot().commandHandlers.has('limit')).toBe(true);
-      expect(currentBot().commandHandlers.has('balance')).toBe(true);
       expect(currentBot().commandHandlers.has('ping')).toBe(true);
       expect(currentBot().commandHandlers.has('engine')).toBe(true);
       expect(currentBot().commandHandlers.has('stats')).toBe(true);
@@ -614,7 +623,6 @@ describe('TelegramChannel', () => {
       expect(currentBot().commandHandlers.has('users')).toBe(true);
       expect(currentBot().commandHandlers.has('lastseen')).toBe(true);
       expect(currentBot().commandHandlers.has('health')).toBe(true);
-      expect(currentBot().commandHandlers.has('subscribe')).toBe(true);
       expect(currentBot().commandHandlers.has('roy')).toBe(false);
       expect(currentBot().callbackQueryHandlers).toHaveLength(4);
       expect(currentBot().filterHandlers.has('message:text')).toBe(true);
@@ -638,7 +646,6 @@ describe('TelegramChannel', () => {
       expect(currentBot().api.setMyCommands).toHaveBeenCalledWith(
         expect.arrayContaining([
           expect.objectContaining({ command: 'start' }),
-          expect.objectContaining({ command: 'limit' }),
           expect.objectContaining({ command: 'chatid' }),
         ]),
       );
@@ -648,13 +655,7 @@ describe('TelegramChannel', () => {
       ).mock.calls
         .flatMap((call) => call[0] as Array<{ command: string }>)
         .map((entry) => entry.command);
-      for (const hidden of [
-        'help',
-        'balance',
-        'language',
-        'ping',
-        'subscribe',
-      ]) {
+      for (const hidden of ['help', 'language', 'ping']) {
         expect(publishedCommands).not.toContain(hidden);
       }
     });
@@ -677,6 +678,42 @@ describe('TelegramChannel', () => {
           scope: { type: 'chat', chat_id: 100200300 },
         }),
       );
+    });
+
+// The menu must not advertise commands without an installed scheduler.
+    it('publishes the owner menu without the dead morning-brief commands', async () => {
+      const opts = createAdminOpts();
+      const channel = new TelegramChannel('test-token', opts);
+
+      await channel.connect();
+
+      const ownerCall = (
+        currentBot().api.setMyCommands as ReturnType<typeof vi.fn>
+      ).mock.calls.find((call) => call[1]?.scope?.chat_id === 100200300);
+      expect(
+        (ownerCall?.[0] as Array<{ command: string }>).map((e) => e.command),
+      ).toEqual([
+        'start',
+        'limit',
+        'chatid',
+        'engine',
+        'stats',
+        'pending',
+        'users',
+        'lastseen',
+        'health',
+        'status',
+        'storage',
+        'cleanup',
+        'keep',
+        'limits',
+        'pause',
+        'resume',
+        'ban',
+      ]);
+      for (const removed of ['morningstatus', 'morningon', 'morningoff']) {
+        expect(currentBot().commandHandlers.has(removed)).toBe(false);
+      }
     });
 
     it('publishes limited command-admin menus for configured admin ids', async () => {
@@ -859,9 +896,54 @@ describe('TelegramChannel', () => {
         'quoted',
       ],
       [
-        'code entity',
+        'code entity (own formatting, not a quote)',
         { entities: [{ type: 'code', offset: 0, length: 5 }] },
-        'quoted',
+        'direct',
+      ],
+      [
+        'pre entity (own formatting, not a quote)',
+        { entities: [{ type: 'pre', offset: 0, length: 5 }] },
+        'direct',
+      ],
+      [
+        'forward of this bot\'s own message (a watchdog alert)',
+        {
+          forwardOrigin: {
+            type: 'user',
+            sender_user: { id: 12345, is_bot: true, username: 'fixture_bot' },
+          },
+        },
+        'direct',
+      ],
+      [
+        'forward of the sender\'s own earlier message',
+        { forwardOrigin: { type: 'user', sender_user: { id: 99001 } } },
+        'direct',
+      ],
+      [
+        'forward from a different bot',
+        {
+          forwardOrigin: {
+            type: 'user',
+            sender_user: { id: 54321, is_bot: true, username: 'other_bot' },
+          },
+        },
+        'forwarded',
+      ],
+      [
+        'forward that only claims this bot\'s id without being a bot',
+        { forwardOrigin: { type: 'user', sender_user: { id: 12345 } } },
+        'forwarded',
+      ],
+      [
+        'forward from a hidden user',
+        { forwardOrigin: { type: 'hidden_user', sender_user_name: 'Someone' } },
+        'forwarded',
+      ],
+      [
+        'forward from a channel',
+        { forwardOrigin: { type: 'channel', chat: { id: -100777 } } },
+        'forwarded',
       ],
     ])('records %s authority provenance', async (_name, overrides, origin) => {
       const opts = createTestOpts();
@@ -944,16 +1026,34 @@ describe('TelegramChannel', () => {
       expect(opts.onMessage).not.toHaveBeenCalled();
     });
 
-    it('skips command messages (starting with /)', async () => {
+    it('skips a real registered bot command', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
 
       const ctx = createTextCtx({ text: '/start' });
+      (ctx.message as any).entities = [
+        { type: 'bot_command', offset: 0, length: 6 },
+      ];
       await triggerTextMessage(ctx);
 
       expect(opts.onMessage).not.toHaveBeenCalled();
       expect(opts.onChatMetadata).not.toHaveBeenCalled();
+    });
+
+    // the old guard was `text.startsWith('/')`, so a
+    // pasted path or any unknown slash word was discarded with no reply.
+    it('delivers a pasted path that merely starts with a slash', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createTextCtx({
+        text: '/Users/example/skoobi/logs',
+      });
+      await triggerTextMessage(ctx);
+
+      expect(opts.onMessage).toHaveBeenCalled();
     });
 
     it('blocks registered Telegram bot accounts before storing messages', async () => {
@@ -2136,8 +2236,13 @@ describe('TelegramChannel', () => {
       ],
       [
         'quoted caption',
-        { caption_entities: [{ type: 'pre', offset: 0, length: 12 }] },
+        { caption_entities: [{ type: 'blockquote', offset: 0, length: 12 }] },
         'quoted',
+      ],
+      [
+        'caption with own code formatting',
+        { caption_entities: [{ type: 'pre', offset: 0, length: 12 }] },
+        'direct',
       ],
     ])('records %s authority provenance', async (_name, extra, origin) => {
       const opts = createTestOpts();
@@ -2163,7 +2268,6 @@ describe('TelegramChannel', () => {
       vi.mocked(downloadTelegramPhoto).mockResolvedValueOnce(
         '/tmp/test-group/received/photo.jpg',
       );
-      captionPhotoMock.mockResolvedValueOnce(null);
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
@@ -2202,7 +2306,6 @@ describe('TelegramChannel', () => {
       vi.mocked(downloadTelegramPhoto).mockResolvedValueOnce(
         '/tmp/test-group/received/photo.jpg',
       );
-      captionPhotoMock.mockResolvedValueOnce(null);
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
@@ -2246,6 +2349,35 @@ describe('TelegramChannel', () => {
       expect(opts.onMessage).toHaveBeenCalledWith(
         'tg:100200300',
         expect.objectContaining({ content: '[Video]' }),
+      );
+    });
+
+    it('не пытается скачать видео больше 20 МБ и сразу называет причину', async () => {
+      // Oversized files must carry the known limit rather than a generic failure.
+      vi.mocked(processTelegramVideoFile).mockClear();
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createMediaCtx({
+        extra: {
+          video: {
+            file_id: 'big-video',
+            file_unique_id: 'big-u',
+            file_size: 57 * 1024 * 1024,
+          },
+        },
+      });
+      await triggerMediaMessage('message:video', ctx);
+
+      expect(processTelegramVideoFile).not.toHaveBeenCalled();
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          content: expect.stringContaining(
+            '[Video — 57 MB, not downloaded: the Telegram Bot API refuses files over 20 MB',
+          ),
+        }),
       );
     });
 
@@ -2319,7 +2451,7 @@ describe('TelegramChannel', () => {
       expect(byBasename['video-frame-02.jpg']).toBe('photo');
     });
 
-    it('stores video frame captions for guest live without requiring old history frames', async () => {
+    it('references video key frames by relative path when there is no transcript', async () => {
       vi.mocked(processTelegramVideoFile).mockResolvedValueOnce({
         videoPath: '/tmp/test-group/received/video.mp4',
         transcript: null,
@@ -2328,9 +2460,6 @@ describe('TelegramChannel', () => {
           '/tmp/test-group/received/video-frame-02.jpg',
         ],
       });
-      captionPhotoMock
-        .mockResolvedValueOnce('На кадре человек на улице.')
-        .mockResolvedValueOnce('Виден навес и красная футболка.');
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
@@ -2340,15 +2469,11 @@ describe('TelegramChannel', () => {
       });
       await triggerMediaMessage('message:video', ctx);
 
-      expect(captionPhotoMock).toHaveBeenCalledWith(
-        '/tmp/test-group/received/video-frame-01.jpg',
-        { groupFolder: 'test-group', chatJid: 'tg:100200300' },
-      );
       expect(opts.onMessage).toHaveBeenCalledWith(
         'tg:100200300',
         expect.objectContaining({
           content:
-            '[Video transcription failed or no speech detected. Visual summary: На кадре человек на улице. Виден навес и красная футболка. Key-frame files: received/video-frame-01.jpg, received/video-frame-02.jpg]',
+            '[Video transcription failed or no speech detected. Key-frame files: received/video-frame-01.jpg, received/video-frame-02.jpg]',
         }),
       );
     });
@@ -2402,7 +2527,7 @@ describe('TelegramChannel', () => {
       );
     });
 
-    it('stores video note frame captions for guest live without requiring file tools', async () => {
+    it('keeps video note placeholders free of absolute paths', async () => {
       vi.mocked(processTelegramVideoNote).mockResolvedValueOnce({
         videoPath: '/tmp/test-group/received/note.mp4',
         transcript: 'Я на пляже',
@@ -2411,9 +2536,6 @@ describe('TelegramChannel', () => {
           '/tmp/test-group/received/note-frame-02.jpg',
         ],
       });
-      captionPhotoMock
-        .mockResolvedValueOnce('Человек стоит у воды на улице.')
-        .mockResolvedValueOnce('В кадре виден пляж и светлое небо.');
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
@@ -2423,21 +2545,11 @@ describe('TelegramChannel', () => {
       });
       await triggerMediaMessage('message:video_note', ctx);
 
-      expect(captionPhotoMock).toHaveBeenCalledWith(
-        '/tmp/test-group/received/note-frame-01.jpg',
-        { groupFolder: 'test-group', chatJid: 'tg:100200300' },
+      const content = vi.mocked(opts.onMessage).mock.calls[0][1].content;
+      expect(content).toBe(
+        '[Video note Transcript: Я на пляже. Key-frame files: received/note-frame-01.jpg, received/note-frame-02.jpg]',
       );
-      expect(captionPhotoMock).toHaveBeenCalledWith(
-        '/tmp/test-group/received/note-frame-02.jpg',
-        { groupFolder: 'test-group', chatJid: 'tg:100200300' },
-      );
-      expect(opts.onMessage).toHaveBeenCalledWith(
-        'tg:100200300',
-        expect.objectContaining({
-          content:
-            '[Video note Transcript: Я на пляже. Visual summary: Человек стоит у воды на улице. В кадре виден пляж и светлое небо. Key-frame files: received/note-frame-01.jpg, received/note-frame-02.jpg]',
-        }),
-      );
+      expect(content).not.toContain('/tmp/');
     });
 
     it('stores voice message with placeholder', async () => {
@@ -2651,6 +2763,22 @@ describe('TelegramChannel', () => {
   // --- sendMessage ---
 
   describe('sendMessage', () => {
+    it('sends one quiet progress message and edits it; final reply remains separate', async () => {
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+      const api = currentBot().api as any;
+      api.sendMessage.mockResolvedValueOnce({ message_id: 52 });
+      api.editMessageText = vi.fn().mockResolvedValue(true);
+      await channel.sendProgress('tg:100200300', '⏳ Starting', 'turn-1');
+      await channel.sendProgress('tg:100200300', '⏳ Checking', 'turn-1');
+      await channel.finishProgress('tg:100200300', 'turn-1');
+      await channel.sendMessage('tg:100200300', 'Finished');
+      expect(await channel.sendProgress('tg:100200300', '⏳ Stale', 'turn-1')).toBe(false);
+      expect(api.sendMessage).toHaveBeenNthCalledWith(1, '100200300', '⏳ Starting', { disable_notification: true }, expect.any(AbortSignal));
+      expect(api.editMessageText).toHaveBeenCalledWith('100200300', 52, '⏳ Checking', {}, expect.any(AbortSignal));
+      expect(api.sendMessage).toHaveBeenNthCalledWith(2, '100200300', 'Finished', { parse_mode: 'Markdown' });
+    });
+
     it('sends message via bot API', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
@@ -2708,13 +2836,13 @@ describe('TelegramChannel', () => {
       expect(currentBot().api.sendMessage).toHaveBeenNthCalledWith(
         1,
         '100200300',
-        'x'.repeat(4096),
+        'x'.repeat(3900),
         { parse_mode: 'Markdown' },
       );
       expect(currentBot().api.sendMessage).toHaveBeenNthCalledWith(
         2,
         '100200300',
-        'x'.repeat(904),
+        'x'.repeat(1100),
         { parse_mode: 'Markdown' },
       );
     });
@@ -2807,6 +2935,61 @@ describe('TelegramChannel', () => {
         '*broken',
         {},
       );
+    });
+
+    it('falls back to plain text when Markdown renders the message empty', async () => {
+    // A one-character Markdown answer can render as empty. Telegram rejects
+    // it with a non-parse error, so delivery must retry the original text.
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot()
+        .api.sendMessage.mockRejectedValueOnce(
+          new Error(
+            "Call to 'sendMessage' failed! (400: Bad Request: text must be non-empty)",
+          ),
+        )
+        .mockResolvedValueOnce(undefined);
+
+      await expect(
+        channel.sendMessage('tg:100200300', '*'),
+      ).resolves.toBeUndefined();
+
+      expect(currentBot().api.sendMessage).toHaveBeenNthCalledWith(
+        2,
+        '100200300',
+        '*',
+        {},
+      );
+    });
+
+    it('never calls Telegram for a blank message', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      for (const blank of ['', '   ', '\n\n', '\t ']) {
+        await expect(
+          channel.sendMessage('tg:100200300', blank),
+        ).resolves.toBeUndefined();
+      }
+
+      expect(currentBot().api.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('still rethrows unrelated Telegram errors', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.sendMessage.mockRejectedValue(
+        new Error('Bad Request: chat not found'),
+      );
+
+      await expect(
+        channel.sendMessage('tg:100200300', 'Привет'),
+      ).rejects.toThrow('chat not found');
     });
 
     it('retries once when Telegram returns retry_after', async () => {
@@ -2981,6 +3164,37 @@ describe('TelegramChannel', () => {
       // No error, no API call
     });
 
+    it('«печатает» держится весь ход до 90-минутного потолка, а не гаснет на 30-й минуте', async () => {
+      vi.useFakeTimers();
+      try {
+        const channel = new TelegramChannel('test-token', createTestOpts());
+        await channel.connect();
+        await channel.setTyping('tg:100200300', true);
+        const sendChatAction = currentBot().api.sendChatAction;
+
+    // Typing remains active during a long-running turn.
+        await vi.advanceTimersByTimeAsync(49 * 60_000);
+        sendChatAction.mockClear();
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(sendChatAction).toHaveBeenCalled();
+
+        // Потолок хода админа 90 мин + 2 мин песочницы — ещё живой.
+        await vi.advanceTimersByTimeAsync(43 * 60_000 - 10_000);
+        sendChatAction.mockClear();
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(sendChatAction).toHaveBeenCalled();
+
+        // Предохранитель от утечки всё же есть.
+        expect(TYPING_MAX_DURATION_MS).toBe(95 * 60_000);
+        await vi.advanceTimersByTimeAsync(4 * 60_000);
+        sendChatAction.mockClear();
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(sendChatAction).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('handles typing indicator failure gracefully', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
@@ -2993,6 +3207,78 @@ describe('TelegramChannel', () => {
       await expect(
         channel.setTyping('tg:100200300', true),
       ).resolves.toBeUndefined();
+    });
+  });
+
+  // --- reactToMessage ---
+
+  describe('reactToMessage', () => {
+    it('ставит 👀 на сообщение через setMessageReaction', async () => {
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+
+      await expect(
+        channel.reactToMessage('tg:100200300', '42', '👀'),
+      ).resolves.toBe(true);
+
+      expect(currentBot().api.setMessageReaction).toHaveBeenCalledWith(
+        '100200300',
+        42,
+        [{ type: 'emoji', emoji: '👀' }],
+      );
+    });
+
+    it.each(['panel-1727000000-abc', '', '0', '-5', '1.5', ' 42'])(
+      'не зовёт API для не-телеграмного id: %j',
+      async (messageId) => {
+        const channel = new TelegramChannel('test-token', createTestOpts());
+        await channel.connect();
+
+        await expect(
+          channel.reactToMessage('tg:100200300', messageId, '👀'),
+        ).resolves.toBe(false);
+        expect(currentBot().api.setMessageReaction).not.toHaveBeenCalled();
+      },
+    );
+
+    it('ошибка Telegram — просто false, без ретраев', async () => {
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+      currentBot().api.setMessageReaction.mockRejectedValueOnce(
+        Object.assign(new Error('Bad Request: REACTION_INVALID'), {
+          error_code: 400,
+        }),
+      );
+
+      await expect(
+        channel.reactToMessage('tg:100200300', '42', '👀'),
+      ).resolves.toBe(false);
+      expect(currentBot().api.setMessageReaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('без подключения — false', async () => {
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await expect(
+        channel.reactToMessage('tg:100200300', '42', '👀'),
+      ).resolves.toBe(false);
+    });
+
+    it('обёртка нескольких ботов отдаёт вызов владельцу чата', async () => {
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+      const multi = new TelegramMultiBotChannel([channel]);
+
+      await expect(
+        multi.reactToMessage('tg:100200300', '7', '👀'),
+      ).resolves.toBe(true);
+      expect(currentBot().api.setMessageReaction).toHaveBeenCalledWith(
+        '100200300',
+        7,
+        [{ type: 'emoji', emoji: '👀' }],
+      );
+      await expect(
+        multi.reactToMessage('12345@s.whatsapp.net', '7', '👀'),
+      ).resolves.toBe(false);
     });
   });
 
@@ -3078,89 +3364,6 @@ describe('TelegramChannel', () => {
         {},
       );
       expect(opts.onMessage).not.toHaveBeenCalled();
-    });
-
-    it('/limit shows the current Telegram sender quota in private chat', async () => {
-      const tenant = {
-        tenant_id: 'tenant-100200300',
-        channel: 'telegram',
-        chat_id: '100200300',
-      };
-      const opts = createTestOpts({
-        tenantRegistry: vi.fn(() => ({
-          resolveTelegramChat: vi.fn(() => tenant),
-        })) as any,
-      });
-      const channel = new TelegramChannel('test-token', opts);
-      await channel.connect();
-
-      const handler = currentBot().commandHandlers.get('limit')!;
-      const ctx = createTextCtx({
-        chatId: 100200300,
-        chatType: 'private',
-        text: '/limit',
-        fromId: 42,
-      });
-      (ctx as any).answerCallbackQuery = vi
-        .fn()
-        .mockRejectedValue(new Error('commands are not callback queries'));
-
-      await handler(ctx);
-
-      expect(quotaMock.getQuotaStatus).toHaveBeenCalledWith({
-        tenantId: 'tenant-100200300',
-        channel: 'telegram',
-        channelUserId: '42',
-      });
-      expect(ctx.reply).toHaveBeenCalledWith('quota status text', {});
-      expect((ctx as any).answerCallbackQuery).not.toHaveBeenCalled();
-      expect(eventStoreMock.recordTenantEvent).toHaveBeenCalledWith(
-        expect.objectContaining({
-          tenant,
-          type: 'quota_balance_viewed',
-          actor: 'telegram_user:42',
-          senderId: '42',
-        }),
-      );
-    });
-
-    it('/balance sends quota details privately when used in a group', async () => {
-      const tenant = {
-        tenant_id: 'tenant-group',
-        channel: 'telegram',
-        chat_id: '-1001',
-      };
-      const opts = createTestOpts({
-        tenantRegistry: vi.fn(() => ({
-          resolveTelegramChat: vi.fn(() => tenant),
-        })) as any,
-      });
-      const channel = new TelegramChannel('test-token', opts);
-      await channel.connect();
-
-      const handler = currentBot().commandHandlers.get('balance')!;
-      const ctx = createTextCtx({
-        chatId: -1001,
-        chatType: 'group',
-        text: '/balance',
-        fromId: 42,
-      });
-
-      await handler(ctx);
-
-      expect(currentBot().api.sendMessage).toHaveBeenCalledWith(
-        42,
-        'quota status text',
-      );
-      expect(ctx.reply).toHaveBeenCalledWith(
-        'Отправил статус доступа в личку.',
-        {},
-      );
-      expect(quotaMock.getQuotaStatus).toHaveBeenCalledWith({
-        tenantId: 'tenant-group',
-        channel: 'telegram',
-        channelUserId: '42',
-      });
     });
 
     it('/start from an unregistered private chat shows language choice and creates the approval request immediately', async () => {
@@ -4496,38 +4699,6 @@ describe('TelegramChannel', () => {
     });
   });
 
-  describe('quota callback error handler swallows expired-query errors', () => {
-    it('does not rethrow when answering an expired callback in the catch path', async () => {
-      const channel = new TelegramChannel('test-token', createTestOpts());
-      await channel.connect();
-
-      // Force the QUOTA_CALLBACK_RE handler into its catch block.
-      vi.spyOn(channel as any, 'sendQuotaStatus').mockRejectedValue(
-        new Error('boom'),
-      );
-
-      // The error-path answerCallbackQuery itself fails because the underlying
-      // callback query already expired. The fixed handler routes this through
-      // answerCallbackQueryIfPresent, which swallows expired-query errors; the
-      // buggy direct ctx.answerCallbackQuery call would rethrow it.
-      const answerCallbackQuery = vi
-        .fn()
-        .mockRejectedValue(
-          new Error(
-            "Call to 'answerCallbackQuery' failed! (400: Bad Request: query is too old and response timeout expired)",
-          ),
-        );
-
-      await expect(
-        triggerCallbackQuery('quota:my_limit', { answerCallbackQuery }),
-      ).resolves.toBeDefined();
-
-      expect(answerCallbackQuery).toHaveBeenCalledWith(
-        'Не смог показать статус доступа. См. логи.',
-      );
-    });
-  });
-
   // --- Channel properties ---
 
   describe('channel properties', () => {
@@ -4535,5 +4706,342 @@ describe('TelegramChannel', () => {
       const channel = new TelegramChannel('test-token', createTestOpts());
       expect(channel.name).toBe('telegram');
     });
+  });
+});
+
+describe('escapeIntraWordMarkdown (ultrareview 2026-07-27 M3)', () => {
+  it('escapes intra-word markers that Telegram would silently eat', () => {
+    expect(escapeIntraWordMarkdown('open some_file_name.py now')).toBe(
+      'open some\\_file\\_name.py now',
+    );
+    expect(escapeIntraWordMarkdown('column user_id in agent_runs')).toBe(
+      'column user\\_id in agent\\_runs',
+    );
+  });
+
+  it('leaves deliberate formatting alone', () => {
+    expect(escapeIntraWordMarkdown('this is *bold* and _italic_ text')).toBe(
+      'this is *bold* and _italic_ text',
+    );
+    expect(escapeIntraWordMarkdown('a *multi word bold* b')).toBe(
+      'a *multi word bold* b',
+    );
+  });
+
+  it('never touches code spans or fences', () => {
+    expect(escapeIntraWordMarkdown('run `db_retention --dry` please')).toBe(
+      'run `db_retention --dry` please',
+    );
+    expect(
+      escapeIntraWordMarkdown('```\nSELECT max_age FROM my_table\n```'),
+    ).toBe('```\nSELECT max_age FROM my_table\n```');
+  });
+
+  it('is a no-op for text with no markers', () => {
+    expect(escapeIntraWordMarkdown('обычный ответ без разметки')).toBe(
+      'обычный ответ без разметки',
+    );
+  });
+
+  // How the Bot API reads legacy `parse_mode: Markdown` (tdlib
+  // do_parse_markdown): a backslash escapes _ * ` [ only OUTSIDE an entity;
+  // inside one — including a link's [text] and (url) — everything is copied
+  // raw up to the closing character.
+  function parseLegacyMarkdown(input: string): {
+    text: string;
+    links: Array<{ text: string; url: string }>;
+  } {
+    let text = '';
+    const links: Array<{ text: string; url: string }> = [];
+    for (let i = 0; i < input.length; i += 1) {
+      const c = input[i];
+      if (c === '\\' && '_*`['.includes(input[i + 1] ?? '')) {
+        text += input[i + 1];
+        i += 1;
+        continue;
+      }
+      if (!'_*`['.includes(c)) {
+        text += c;
+        continue;
+      }
+      const end = c === '[' ? ']' : c;
+      const close = input.indexOf(end, i + 1);
+      if (close < 0) throw new Error(`Can't find end of the entity at ${i}`);
+      const inner = input.slice(i + 1, close);
+      text += inner;
+      i = close;
+      if (c === '[' && input[i + 1] === '(') {
+        const urlEnd = input.indexOf(')', i + 2);
+        links.push({ text: inner, url: input.slice(i + 2, urlEnd) });
+        i = urlEnd;
+      }
+    }
+    return { text, links };
+  }
+
+  it('leaves markdown links verbatim so Telegram gets the real URL', () => {
+    const link =
+      '[Пункт A → Пункт B](https://example.invalid/routes/City_A/City_B/)';
+    expect(escapeIntraWordMarkdown(link)).toBe(link);
+    const text = `Вот ссылка: ${link}, файл some_file_name.py и [мой_файл](https://docs.google.com/a_b*c)`;
+    const escaped = escapeIntraWordMarkdown(text);
+    expect(escaped).toBe(
+      `Вот ссылка: ${link}, файл some\\_file\\_name.py и [мой_файл](https://docs.google.com/a_b*c)`,
+    );
+    const parsed = parseLegacyMarkdown(escaped);
+    expect(parsed.links).toEqual([
+      {
+        text: 'Пункт A → Пункт B',
+        url: 'https://example.invalid/routes/City_A/City_B/',
+      },
+      { text: 'мой_файл', url: 'https://docs.google.com/a_b*c' },
+    ]);
+    expect(parsed.text).toContain('some_file_name.py');
+  });
+
+  it('keeps bare URLs working: the escape is removed by Telegram outside entities', () => {
+    const text = 'Канал: https://t.me/fixture_bot и https://adilet.zan.kz/rus/docs/Z98_0000220';
+    const parsed = parseLegacyMarkdown(escapeIntraWordMarkdown(text));
+    expect(parsed.text).toBe(text);
+    // Unescaped, the underscore would open an italic entity instead.
+    expect(() => parseLegacyMarkdown('https://t.me/fixture_bot')).toThrow();
+  });
+
+  it('still treats code inside and around links as code', () => {
+    expect(
+      escapeIntraWordMarkdown('`[a_b](https://x.kz/c_d)` и [e](https://x.kz/f_g) h_i'),
+    ).toBe('`[a_b](https://x.kz/c_d)` и [e](https://x.kz/f_g) h\\_i');
+  });
+
+  it('delivers a link with parentheses in its URL whole: they go as %28/%29', () => {
+    // Legacy Markdown stops URLs at the first closing parenthesis. Encoding
+    // balanced parentheses keeps the delivered URL equal to the checked URL.
+    const text =
+      'см. [Меркурий](https://ru.wikipedia.org/wiki/Меркурий_(планета)) и [Foo](https://en.wikipedia.org/wiki/Foo_(bar)_(baz)).';
+    const escaped = escapeIntraWordMarkdown(text);
+    expect(escaped).toBe(
+      'см. [Меркурий](https://ru.wikipedia.org/wiki/Меркурий_%28планета%29) и [Foo](https://en.wikipedia.org/wiki/Foo_%28bar%29_%28baz%29).',
+    );
+    const parsed = parseLegacyMarkdown(escaped);
+    expect(parsed.links).toEqual([
+      {
+        text: 'Меркурий',
+        url: 'https://ru.wikipedia.org/wiki/Меркурий_%28планета%29',
+      },
+      {
+        text: 'Foo',
+        url: 'https://en.wikipedia.org/wiki/Foo_%28bar%29_%28baz%29',
+      },
+    ]);
+    expect(parsed.text).toBe('см. Меркурий и Foo.');
+  });
+
+  it('leaves links without parentheses in the URL, and code, as they were', () => {
+    for (const text of [
+      '[a](https://a.kz/x) (примечание)',
+      '[a](https://a.kz/x_(y) без закрывающей',
+      'голая https://en.wikipedia.org/wiki/Foo_(bar)',
+    ]) {
+      expect(encodeMarkdownLinkParens(text)).toBe(text);
+    }
+    for (const code of [
+      '`[a](https://x.kz/Foo_(bar))`',
+      '```\n[a](https://x.kz/Foo_(bar))\n```',
+    ]) {
+      expect(escapeIntraWordMarkdown(code)).toBe(code);
+    }
+  });
+});
+
+describe('isHandledBotCommand (ultrareview 2026-07-27 M4)', () => {
+  const cmd = (text: string) => ({
+    text,
+    entities: [{ type: 'bot_command', offset: 0, length: text.split(' ')[0].length }],
+  });
+
+  it('recognises a registered command', () => {
+    expect(isHandledBotCommand(cmd('/status'))).toBe(true);
+    expect(isHandledBotCommand(cmd('/ping now'))).toBe(true);
+    expect(isHandledBotCommand(cmd('/status@SkoobiBot'))).toBe(true);
+  });
+
+  it('does NOT swallow a pasted path or an unknown slash word', () => {
+    expect(isHandledBotCommand({ text: '/Users/example/skoobi' })).toBe(false);
+    expect(isHandledBotCommand(cmd('/remote'))).toBe(false);
+    // Removed with the dead morning brief: a typed /morningon reaches the model
+    // as ordinary text instead of a false «включён».
+    expect(isHandledBotCommand(cmd('/morningon'))).toBe(false);
+    expect(isHandledBotCommand({ text: '/такое тоже должно доходить' })).toBe(false);
+  });
+
+  it('ignores a command entity that is not at the start', () => {
+    expect(
+      isHandledBotCommand({ text: 'see /status', entities: [{ type: 'bot_command', offset: 4, length: 7 }] }),
+    ).toBe(false);
+  });
+
+  it('is false for ordinary text', () => {
+    expect(isHandledBotCommand({ text: 'привет' })).toBe(false);
+  });
+});
+
+describe('normalizeTelegramBlocks', () => {
+  // Legacy Markdown has no tables, headings or quotes; convert these blocks.
+  it('превращает таблицу из двух колонок в строки «• название — значение»', () => {
+    const table = [
+      'Итог:',
+      '| Магазин | Цена |',
+      '|---|---:|',
+      '| Kaspi | 58 000 ₸ |',
+      '| **Technodom** | 61 000 ₸ |',
+      '',
+      'Дальше текст.',
+    ].join('\n');
+    expect(normalizeTelegramBlocks(table)).toBe(
+      [
+        'Итог:',
+        '• Kaspi — 58 000 ₸',
+        '• **Technodom** — 61 000 ₸',
+        '',
+        'Дальше текст.',
+      ].join('\n'),
+    );
+  });
+
+  it('в широкой таблице подписывает значения названиями колонок', () => {
+    const table = [
+      '| Рейс | Вылет | Посадка |',
+      '| --- | --- | --- |',
+      '| SU 1234 | 18:10 | 20:33 |',
+      '| DV 55 |  | 21:05 |',
+    ].join('\n');
+    expect(normalizeTelegramBlocks(table)).toBe(
+      [
+        '• SU 1234 — Вылет: 18:10 · Посадка: 20:33',
+        '• DV 55 — Посадка: 21:05',
+      ].join('\n'),
+    );
+  });
+
+  it('заголовки делает жирной строкой, цитаты — «»', () => {
+    expect(normalizeTelegramBlocks('### **Итог** ###\nтекст')).toBe(
+      '**Итог**\nтекст',
+    );
+    expect(normalizeTelegramBlocks('> цитата\n&gt; ещё\n>\nконец')).toBe(
+      '» цитата\n» ещё\n\nконец',
+    );
+    expect(normalizeMarkdownForTelegram('## План на день')).toBe(
+      '*План на день*',
+    );
+  });
+
+  it('не трогает код, хэштеги, обычные вертикальные черты и сам себя', () => {
+    const fenced = '```\n| a | b |\n|---|---|\n# not a heading\n> x\n```';
+    expect(normalizeTelegramBlocks(fenced)).toBe(fenced);
+    expect(normalizeTelegramBlocks('#скуби и a | b')).toBe('#скуби и a | b');
+    // «больше чем», а не цитата
+    expect(normalizeTelegramBlocks('> 100 000 ₸ — дорого')).toBe(
+      '> 100 000 ₸ — дорого',
+    );
+    const once = normalizeTelegramBlocks(
+      '| a | b |\n|---|---|\n| 1 | 2 |\n## h\n> q',
+    );
+    expect(normalizeTelegramBlocks(once)).toBe(once);
+  });
+
+  it('запасной простой текст без звёздочек и таблиц', () => {
+    expect(
+      plainTelegramText('**Итог**: `a**b`\n| x | y |\n|---|---|\n| 1 | 2 |'),
+    ).toBe('Итог: `a**b`\n• 1 — 2');
+  });
+});
+
+describe('isTelegramTransientSendError', () => {
+  it('recognises failures on the way, not Telegram verdicts', () => {
+    expect(
+      isTelegramTransientSendError(
+        Object.assign(new Error("Network request for 'sendMessage' failed!"), {
+          name: 'HttpError',
+        }),
+      ),
+    ).toBe(true);
+    expect(isTelegramTransientSendError({ error_code: 502, message: 'Bad Gateway' })).toBe(true);
+    expect(isTelegramTransientSendError(new Error('getaddrinfo ENOTFOUND api.telegram.org'))).toBe(true);
+    expect(
+      isTelegramTransientSendError({ error_code: 400, message: "Bad Request: can't parse entities" }),
+    ).toBe(false);
+    expect(
+      isTelegramTransientSendError({ error_code: 403, message: 'Forbidden: bot was blocked by the user' }),
+    ).toBe(false);
+  });
+});
+
+describe('splitTelegramText', () => {
+  it('короткое сообщение не режет', () => {
+    expect(splitTelegramText('привет')).toEqual(['привет']);
+    expect(splitTelegramText('y'.repeat(4096))).toEqual(['y'.repeat(4096)]);
+    expect(splitTelegramText('  \n')).toEqual([]);
+  });
+
+  it('длинное режет по абзацам, а не посреди слова', () => {
+    const para = 'слово '.repeat(400).trim(); // 2399 символов
+    const parts = splitTelegramText(`${para}\n\n${para}\n\n${para}`);
+    expect(parts).toEqual([`${para}`, `${para}`, `${para}`]);
+    for (const part of parts) expect(part.length).toBeLessThanOrEqual(3900);
+  });
+
+  it('без абзацев режет по пробелу', () => {
+    const text = 'абв '.repeat(1500).trim();
+    const parts = splitTelegramText(text);
+    expect(parts.length).toBe(2);
+    expect(parts.join(' ')).toBe(text);
+    expect(parts.every((p) => !p.startsWith(' ') && !p.endsWith(' '))).toBe(
+      true,
+    );
+  });
+});
+
+describe('normalizeMarkdownForTelegram', () => {
+  // Telegram's legacy `Markdown` parse mode marks bold with ONE asterisk. The
+  // model writes CommonMark `**жирный**`, so the delimiters reached the chat as
+  // visible characters without normalization.
+  it('переводит двойные звёздочки в формат, который Телеграм понимает', () => {
+    expect(
+      normalizeMarkdownForTelegram(
+        'Да, **второй вариант подходит**. Дальше.',
+      ),
+    ).toBe('Да, *второй вариант подходит*. Дальше.');
+    expect(
+      normalizeMarkdownForTelegram('цена **до 58 тыс. ₸**, гарантия **свежая**'),
+    ).toBe('цена *до 58 тыс. ₸*, гарантия *свежая*');
+  });
+
+  it('разбирает жирный курсив и подчёркивания', () => {
+    expect(normalizeMarkdownForTelegram('***очень важно*** дальше')).toBe(
+      '*_очень важно_* дальше',
+    );
+    expect(normalizeMarkdownForTelegram('__тоже жирный__')).toBe('_тоже жирный_');
+  });
+
+  it('не трогает то, что уже верно', () => {
+    expect(normalizeMarkdownForTelegram('уже *правильный* формат')).toBe(
+      'уже *правильный* формат',
+    );
+    expect(normalizeMarkdownForTelegram('обычный текст')).toBe('обычный текст');
+  });
+
+  it('оставляет содержимое кода байт в байт', () => {
+    const inline = 'код: `a ** b` дальше';
+    expect(normalizeMarkdownForTelegram(inline)).toBe(inline);
+    const fenced = '```\nx ** y\n```';
+    expect(normalizeMarkdownForTelegram(fenced)).toBe(fenced);
+  });
+
+  it('не создаёт пустых сущностей и не ломает арифметику', () => {
+    // Пустое выделение Телеграм отвергает целиком, поэтому его не трогаем.
+    expect(normalizeMarkdownForTelegram('пустое **** ничего')).toBe(
+      'пустое **** ничего',
+    );
+    expect(normalizeMarkdownForTelegram('формула 2**3')).toBe('формула 2**3');
   });
 });

@@ -10,6 +10,13 @@ through the already-open ``received`` descriptor.
 The command prints one small JSON object with status ``deleted``, ``missing``
 or ``unsafe``.  Only the first two statuses are safe for the caller to
 tombstone in the media manifest.
+
+Usage: ``safe-unlink-received.py <group folder> <basename> [<size>:<mtime_ns>[:<ino>]]``.
+The optional third argument compares the entry's observed size, nanosecond
+mtime and optional inode with the caller's verified copy. A mismatch refuses
+deletion with status ``unsafe`` and reason ``entry-changed``. This check does
+not make a concurrent replacement of the final directory entry atomic.
+Without it the behaviour is unchanged (retention).
 """
 
 import json
@@ -62,12 +69,27 @@ def _same_group_path(folder_abs, opened_stat):
     )
 
 
-def safe_unlink_received(folder_abs, basename, after_received_open=None):
+def parse_expectation(value):
+    """Parse ``<size>:<mtime_ns>[:<ino>]`` into a tuple, or None if malformed."""
+    if not isinstance(value, str):
+        return None
+    parts = value.split(":")
+    if len(parts) not in (2, 3) or not all(p.isascii() and p.isdigit() for p in parts):
+        return None
+    size, mtime_ns = int(parts[0]), int(parts[1])
+    ino = int(parts[2]) if len(parts) == 3 else None
+    return (size, mtime_ns, ino)
+
+
+def safe_unlink_received(folder_abs, basename, after_received_open=None, expect=None):
     """Safely unlink ``basename`` from the real ``folder_abs/received`` inode.
 
     ``after_received_open`` is an import-only test seam.  The CLI never passes
     it; adversarial tests use it to replace ``received`` at the exact TOCTOU
     boundary and prove that the replacement is neither followed nor modified.
+
+    ``expect`` is an optional ``(size, mtime_ns, ino_or_None)`` tuple: deletion
+    is refused when the observed metadata differs from the caller's copy.
     """
     if (
         not isinstance(folder_abs, str)
@@ -124,6 +146,15 @@ def safe_unlink_received(folder_abs, basename, after_received_open=None):
         if not stat.S_ISREG(entry_stat.st_mode) or entry_stat.st_nlink != 1:
             return {"status": "unsafe", "reason": "entry-not-private-file"}
 
+        if expect is not None:
+            size, mtime_ns, ino = expect
+            if (
+                entry_stat.st_size != size
+                or entry_stat.st_mtime_ns != mtime_ns
+                or (ino is not None and entry_stat.st_ino != ino)
+            ):
+                return {"status": "unsafe", "reason": "entry-changed"}
+
         if not _same_group_path(folder_abs, group_stat) or not _same_open_directory(
             group_fd, "received", received_stat
         ):
@@ -146,10 +177,12 @@ def safe_unlink_received(folder_abs, basename, after_received_open=None):
 
 
 def main(argv):
-    if len(argv) != 3:
-        result = {"status": "unsafe", "reason": "invalid-arguments"}
-    else:
+    if len(argv) == 3:
         result = safe_unlink_received(argv[1], argv[2])
+    elif len(argv) == 4 and parse_expectation(argv[3]) is not None:
+        result = safe_unlink_received(argv[1], argv[2], expect=parse_expectation(argv[3]))
+    else:
+        result = {"status": "unsafe", "reason": "invalid-arguments"}
     sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
     return 0
 

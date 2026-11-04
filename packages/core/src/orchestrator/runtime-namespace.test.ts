@@ -51,6 +51,25 @@ describe('downgraded-main runtime persistence policy', () => {
     expect(persist).toHaveBeenCalledWith('owner-session');
   });
 
+  it('hides cancelled tasks from the agent snapshot but keeps every other status', () => {
+    const policy = runtimePersistencePolicy({
+      groupIsMain: true,
+      credentialProxyTier: 'owner',
+      chatJid: 'tg:100000001',
+    });
+    const tasks = [
+      { id: 'a', status: 'active' },
+      { id: 'c', status: 'cancelled' },
+      { id: 'p', status: 'paused' },
+      { id: 'd', status: 'completed' },
+    ];
+
+    // schedule, so the agent never sees them.
+    expect(runtimeVisibleTasks(policy, tasks).map((task) => task.id)).toEqual(
+      ['a', 'p', 'd'],
+    );
+  });
+
   it('does not change a private main DM or an ordinary non-main guest', () => {
     for (const input of [
       {

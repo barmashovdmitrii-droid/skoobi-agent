@@ -1,5 +1,6 @@
 import { Channel, NewMessage } from './types.js';
 import { formatLocalTime } from './timezone.js';
+import { isScheduledHistoryMessage } from './continuation-context.js';
 
 import { escapeXml } from '@skoobi/shared';
 export { escapeXml };
@@ -16,7 +17,10 @@ export function formatMessages(
         ? 'Assistant'
         : 'User'
       : m.sender_name;
-    return `<message sender="${escapeXml(senderName)}" time="${escapeXml(displayTime)}">${escapeXml(m.content)}</message>`;
+    const origin = isScheduledHistoryMessage(m) ? ' origin="scheduled-task"' : '';
+    // Source ids are supplied by the host, so memory can cite real messages
+    // without inventing references or re-reading unrelated chat history.
+    return `<message sender="${escapeXml(senderName)}" time="${escapeXml(displayTime)}" id="${escapeXml(m.id)}"${origin}>${escapeXml(m.content)}</message>`;
   });
 
   const header = `<context timezone="${escapeXml(timezone)}" />\n`;

@@ -9,39 +9,31 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import pino from 'pino';
 
-import {
-  PINO_REDACT_PATHS,
-  redactLogObject,
-  redactString,
-} from '../lib/log-sanitize.js';
-import {
-  DATA_DIR,
-  GROUPS_DIR,
-  MOUNT_ALLOWLIST_PATH,
-  STORE_DIR,
-} from './config.js';
+import { DATA_DIR, GROUPS_DIR, MOUNT_ALLOWLIST_PATH, STORE_DIR } from './config.js';
+import { logger } from './logger.js';
 import { AdditionalMount, AllowedRoot, MountAllowlist } from './types.js';
 
-const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  formatters: {
-    log: (obj) => redactLogObject(obj as Record<string, unknown>),
-  },
-  hooks: {
-    logMethod(args, method) {
-      if (args.length >= 2 && typeof args[1] === 'string') {
-        args[1] = redactString(args[1]);
-      } else if (args.length >= 1 && typeof args[0] === 'string') {
-        args[0] = redactString(args[0]);
-      }
-      return method.apply(this, args as Parameters<typeof method>);
-    },
-  },
-  redact: { paths: PINO_REDACT_PATHS, censor: '<redacted>' },
-  transport: { target: 'pino-pretty', options: { colorize: true } },
-});
+// The shared logger: dated lines, no colour escapes, the same redaction. This
+// module used to build its own pino-pretty logger with colorize:true and no
+// date, and its 2 177 lines were the undated, ANSI-coloured 13 % of
+
+
+/**
+ * Deduplicate repeated mount verdicts within a process. A changed verdict or
+ * mount configuration still produces a new log entry; identical repetitions
+ * go to debug level.
+ */
+const loggedMountVerdicts = new Set<string>();
+const MOUNT_VERDICTS_MAX = 1000;
+
+function firstMountVerdict(...parts: Array<string | undefined>): boolean {
+  const key = parts.map((part) => part ?? '').join('\0');
+  if (loggedMountVerdicts.has(key)) return false;
+  if (loggedMountVerdicts.size >= MOUNT_VERDICTS_MAX) loggedMountVerdicts.clear();
+  loggedMountVerdicts.add(key);
+  return true;
+}
 
 // Cache the allowlist in memory - only reloads on process restart
 let cachedAllowlist: MountAllowlist | null = null;
@@ -180,9 +172,21 @@ function expandPath(p: string): string {
  */
 function getRealPath(p: string): string | null {
   try {
-    return fs.realpathSync(p);
+
+    // NOT canonicalise CASE. On this Mac the volume is APFS case-INSENSITIVE,
+    // so `realpathSync('/…/claudeclaw/SECRETS')` returns the caller's spelling
+    // while opening the real `secrets/`. Every downstream check here compares
+    // strings case-sensitively (`includes`, `path.relative`), so flipping one
+    // letter defeated the whole allowlist: blocked patterns, the non-main
+    // project guard and the allowed-root containment test all missed.
+    // `realpathSync.native` asks the OS and returns the true on-disk casing.
+    return fs.realpathSync.native(p);
   } catch {
-    return null;
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return null;
+    }
   }
 }
 
@@ -389,7 +393,10 @@ export function validateMount(
       // is honored and `nonMainReadOnly:false` cannot weaken guest isolation.
       const forcedByGuestGuard = true; // guests are never granted write
       effectiveReadonly = forcedByGuestGuard || allowlist.nonMainReadOnly;
-      logger.info(
+      const level = firstMountVerdict('forced-ro-guest', mount.hostPath)
+        ? 'info'
+        : 'debug';
+      logger[level](
         {
           mount: mount.hostPath,
         },
@@ -398,7 +405,10 @@ export function validateMount(
     } else if (!allowedRoot.allowReadWrite) {
       // Root doesn't allow read-write
       effectiveReadonly = true;
-      logger.info(
+      const level = firstMountVerdict('forced-ro-root', mount.hostPath, allowedRoot.path)
+        ? 'info'
+        : 'debug';
+      logger[level](
         {
           mount: mount.hostPath,
           root: allowedRoot.path,
@@ -461,7 +471,10 @@ export function validateAdditionalMounts(
         'Mount validated successfully',
       );
     } else {
-      logger.warn(
+      const level = firstMountVerdict('rejected', groupName, mount.hostPath, result.reason)
+        ? 'warn'
+        : 'debug';
+      logger[level](
         {
           group: groupName,
           requestedPath: mount.hostPath,

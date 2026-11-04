@@ -24,6 +24,8 @@ export interface NewMessage {
   sender_name: string;
   content: string;
   timestamp: string;
+  /** Host DB ingestion order. Never accepted from a channel as authority. */
+  ingestion_cursor?: string;
   is_from_me?: boolean;
   is_bot_message?: boolean;
   tenant_id?: string;
@@ -54,6 +56,10 @@ export interface Channel {
   name: string;
   connect(): Promise<void>;
   sendMessage(jid: string, text: string): Promise<void>;
+  /** Optional quiet progress surface, updated in place within one host-owned turn. */
+  sendProgress?(jid: string, text: string, turnKey: string): Promise<boolean>;
+  /** Close this exact turn's progress and drain its transport before a final reply. */
+  finishProgress?(jid: string, turnKey: string): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
@@ -67,6 +73,15 @@ export interface Channel {
   sendDocument?(jid: string, filePath: string, caption?: string): Promise<void>;
   // Optional: synthesize text → voice and send. Channels that don't support audio can omit.
   sendVoice?(jid: string, text: string): Promise<void>;
+  // Optional: best-effort emoji reaction on an inbound message (e.g. 👀 while
+  // the agent is busy). Resolves false instead of throwing; no retries.
+  // WhatsApp deliberately omits it: its own reaction in the self-chat would
+  // come back as a new inbound message.
+  reactToMessage?(
+    jid: string,
+    messageId: string,
+    emoji: string,
+  ): Promise<boolean>;
 }
 
 // Callback type that channels use to deliver inbound messages

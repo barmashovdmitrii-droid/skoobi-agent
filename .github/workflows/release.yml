@@ -74,17 +74,18 @@ jobs:
       - name: Install agent runner dependencies
         run: npm ci --prefix agent/runner
 
-      - name: Test
-        run: npm test
+      # Integration subprocesses need the compiled workspace exports.
+      - name: Build
+        run: npm run build
 
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Build
-        run: npm run build
+      - name: Test
+        run: npm test
 
       - name: Check shell scripts
-        run: bash -n scripts/*.sh
+        run: for script in scripts/*.sh; do bash -n "$script"; done
 
   publish:
     needs: verify

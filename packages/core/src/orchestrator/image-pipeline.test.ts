@@ -13,11 +13,17 @@ import {
 } from './db.js';
 import {
   beginCodexImageJob,
+  createLateImageTracker,
+  deliverLateCodexImages,
+  deliverLateImagesAfterRun,
   finalizeCodexImageJob,
   formatRecentImageJobStatus,
+  LATE_IMAGE_NO_MEDIA_REASON,
+  lateImageFailureNotice,
   officialImagegenJobMarker,
   recordCodexImageArtifacts,
   recoverPendingImageJobs,
+  withLateImageNotice,
 } from './image-pipeline.js';
 import type { MessageRouter } from './types.js';
 
@@ -722,6 +728,88 @@ describe('official Codex image pipeline', () => {
     expect(getImageJobById(context.job.id)?.generation_attempts).toBe(1);
   });
 
+  it('recovers the Codex 0.156 Extension image record across the checkpoint crash gap', async () => {
+    const now = new Date();
+    const context = beginCodexImageJob({
+      chatJid: 'tg:1',
+      replyJid: 'tg:1',
+      groupFolder: 'telegram_test',
+      requestCursor: now.toISOString(),
+      prompt: 'кот',
+      codexHome,
+      workspaceRoot,
+      now: now.toISOString(),
+    });
+    const callId = 'exec-00000000-0000-4000-8000-0000000000a1';
+    const generated = path.join(
+      codexHome,
+      'generated_images',
+      'crash-gap-ext',
+      `${callId}.png`,
+    );
+    writeTestPng(generated, 28);
+    const rollout = path.join(
+      codexHome,
+      'sessions',
+      '2026',
+      '10',
+      '23',
+      'rollout-ext.jsonl',
+    );
+    fs.mkdirSync(path.dirname(rollout), { recursive: true });
+    const jobMarker = officialImagegenJobMarker(
+      context.job.id,
+      context.generationAttempt,
+    );
+    const extensionRecord = (item: Record<string, unknown>) =>
+      JSON.stringify({
+        timestamp: new Date(now.getTime() + 1_000).toISOString(),
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          thread_id: 'th-synthetic',
+          turn_id: 'turn-synthetic',
+          item: {
+            type: 'Extension',
+            kind: 'image_gen.generation',
+            status: 'completed',
+            revisedPrompt: 'a cat',
+            result: '<base64 omitted>',
+            failure: null,
+            ...item,
+          },
+        },
+      });
+    fs.writeFileSync(
+      rollout,
+      `${JSON.stringify({
+        timestamp: now.toISOString(),
+        type: 'event_msg',
+        payload: { type: 'user_message', message: jobMarker },
+      })}\n${extensionRecord({
+        // A failed generation next to the real one is not taken.
+        id: 'exec-failed',
+        failure: { message: 'blocked' },
+        savedPath: generated,
+      })}\n${extensionRecord({ id: callId, savedPath: generated })}\n`,
+    );
+    const sentPhotos: string[] = [];
+
+    const recovery = await recoverPendingImageJobs({
+      router: fakeRouter(sentPhotos),
+      includeFreshGenerating: true,
+      codexHomeForJob: () => codexHome,
+      workspaceRootForJob: () => workspaceRoot,
+    });
+
+    expect(recovery.delivered).toBe(1);
+    expect(sentPhotos).toHaveLength(1);
+    expect(getImageJobArtifacts(context.job.id).map((a) => a.call_id)).toEqual(
+      [callId],
+    );
+    expect(getImageJobById(context.job.id)?.generation_attempts).toBe(1);
+  });
+
   it('recovers a completed pathless call id without starting a new generation', async () => {
     const now = new Date();
     const context = beginCodexImageJob({
@@ -1096,5 +1184,398 @@ describe('official Codex image pipeline', () => {
     expect(formatRecentImageJobStatus(retryable)).not.toContain(
       'no new image artifact',
     );
+  });
+});
+
+describe('late delivery of an image the model did not send (C06)', () => {
+  let root: string;
+  let codexHome: string;
+  let workspaceRoot: string;
+
+  interface SentFile {
+    kind: 'photo' | 'document';
+    filePath: string;
+    options?: {
+      suppressCursorAdvance?: boolean;
+      meta?: Record<string, unknown>;
+    };
+  }
+
+  function recordingRouter(
+    sent: SentFile[],
+    opts: { photoOk?: boolean } = {},
+  ): MessageRouter {
+    return {
+      addPreHook: () => undefined,
+      addPostHook: () => undefined,
+      route: async (envelope) => envelope.text,
+      send: async () => undefined,
+      sendPhoto: async (_jid, filePath, _caption, options) => {
+        if (opts.photoOk === false) return false;
+        sent.push({ kind: 'photo', filePath, options });
+        return true;
+      },
+      sendDocument: async (_jid, filePath, _caption, options) => {
+        sent.push({ kind: 'document', filePath, options });
+        return true;
+      },
+      sendVoice: async () => false,
+    };
+  }
+
+  function generated(name: string, marker: number): string {
+    const filePath = path.join(codexHome, 'generated_images', 'thread-a', name);
+    writeTestPng(filePath, marker);
+    return filePath;
+  }
+
+  beforeEach(() => {
+    root = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'skoobi-late-image-')),
+    );
+    codexHome = path.join(root, 'codex-home');
+    workspaceRoot = path.join(root, 'workspace');
+    fs.mkdirSync(workspaceRoot, { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('returns the images of a turn in which the model sent no file', () => {
+    const tracker = createLateImageTracker();
+    tracker.noteGenerationCallIds(['ig_1']);
+    tracker.noteArtifacts([{ callId: 'ig_1', savedPath: '/x/a.png' }]);
+    tracker.noteTools(['image_generation']);
+    expect(tracker.takeTurn()).toEqual({
+      images: [{ callId: 'ig_1', savedPath: '/x/a.png' }],
+      unsavedCallIds: [],
+    });
+    // The turn is closed: nothing is returned twice.
+    expect(tracker.takeTurn()).toEqual({ images: [], unsavedCallIds: [] });
+  });
+
+  it('trusts the model when it sent a photo or a document in the turn', () => {
+    for (const tool of ['send_photo', 'send_document']) {
+      const tracker = createLateImageTracker();
+      tracker.noteGenerationCallIds(['ig_1', 'ig_2']);
+      tracker.noteArtifacts([{ callId: 'ig_1', savedPath: '/x/a.png' }]);
+      tracker.noteTools(['image_generation', tool]);
+      expect(tracker.takeTurn()).toEqual({ images: [], unsavedCallIds: [] });
+    }
+  });
+
+  it('reports a finished image_gen call that left no file', () => {
+    const tracker = createLateImageTracker();
+    tracker.noteGenerationCallIds(['ig_1', 'ig_2']);
+    tracker.noteArtifacts([{ callId: 'ig_1', savedPath: '/x/a.png' }]);
+    expect(tracker.takeTurn().unsavedCallIds).toEqual(['ig_2']);
+    // Repeated at the end of the run: already reported, not again.
+    tracker.noteGenerationCallIds(['ig_1', 'ig_2']);
+    expect(tracker.takeTurn()).toEqual({ images: [], unsavedCallIds: [] });
+  });
+
+  it('judges each turn of a run on its own (a request piped into a running run)', () => {
+
+    // A later turn must deliver its own image even if an earlier turn sent a file.
+    const tracker = createLateImageTracker();
+    tracker.noteTools(['send_document']);
+    expect(tracker.takeTurn().images).toEqual([]);
+
+    tracker.noteArtifacts([{ callId: 'ig_2', savedPath: '/x/b.png' }]);
+    tracker.noteTools(['image_generation']);
+    expect(tracker.takeTurn().images.map((item) => item.callId)).toEqual([
+      'ig_2',
+    ]);
+  });
+
+  it('never returns the same call id twice, even when a frame repeats it', () => {
+    const tracker = createLateImageTracker();
+    tracker.noteArtifacts([{ callId: 'ig_1', savedPath: '/x/a.png' }]);
+    // The terminal frame repeats every artifact of the turn.
+    tracker.noteArtifacts([
+      { callId: 'ig_1', savedPath: '/x/a.png' },
+      { callId: ' ', savedPath: '/x/blank.png' },
+      { callId: 'ig_3', savedPath: '' },
+    ]);
+    expect(tracker.takeTurn().images).toHaveLength(1);
+    tracker.noteArtifacts([{ callId: 'ig_1', savedPath: '/x/a.png' }]);
+    expect(tracker.takeTurn().images).toEqual([]);
+  });
+
+  it('stages the image in the chat workspace and sends it as a photo', async () => {
+    const source = generated('exec-1.png', 7);
+    const sent: SentFile[] = [];
+    const outcome = await deliverLateCodexImages({
+      artifacts: [{ callId: 'ig_1', savedPath: source }],
+      codexHome,
+      groupFolder: 'telegram_test',
+      workspaceRoot,
+      replyJid: 'tg:1',
+      router: recordingRouter(sent),
+    });
+
+    expect(outcome.failed).toEqual([]);
+    expect(outcome.sent).toHaveLength(1);
+    expect(outcome.sent[0].as).toBe('photo');
+    const staged = outcome.sent[0].filePath;
+    expect(path.dirname(staged)).toBe(
+      path.join(workspaceRoot, 'output', 'imagegen'),
+    );
+    expect(fs.readFileSync(staged)).toEqual(fs.readFileSync(source));
+    expect(sent).toEqual([
+      {
+        kind: 'photo',
+        filePath: staged,
+        options: {
+          meta: { kind: 'late_image_photo', imageCallId: 'ig_1' },
+        },
+      },
+    ]);
+  });
+
+  it('leaves the cursor to the post-run path after the run has ended', async () => {
+    const sent: SentFile[] = [];
+    await deliverLateCodexImages({
+      artifacts: [{ callId: 'ig_1', savedPath: generated('a.png', 1) }],
+      codexHome,
+      groupFolder: 'telegram_test',
+      workspaceRoot,
+      replyJid: 'tg:1',
+      router: recordingRouter(sent),
+      suppressCursorAdvance: true,
+    });
+    expect(sent[0].options?.suppressCursorAdvance).toBe(true);
+  });
+
+  it('sends an image too big for sendPhoto as a document', async () => {
+    const source = path.join(codexHome, 'generated_images', 'big', 'big.png');
+    writeTestPng(source, 2);
+    fs.appendFileSync(source, Buffer.alloc(10 * 1024 * 1024 + 1, 3));
+    const sent: SentFile[] = [];
+    const outcome = await deliverLateCodexImages({
+      artifacts: [{ callId: 'ig_big', savedPath: source }],
+      codexHome,
+      groupFolder: 'telegram_test',
+      workspaceRoot,
+      replyJid: 'tg:1',
+      router: recordingRouter(sent),
+    });
+    expect(outcome.sent[0].as).toBe('document');
+    expect(sent[0].kind).toBe('document');
+    expect(sent[0].options?.meta?.kind).toBe('late_image_document');
+  });
+
+  it('refuses a path outside generated_images, a symlink out of it and a non-image', async () => {
+    const outside = path.join(workspaceRoot, 'private.png');
+    writeTestPng(outside, 4);
+    const linkDir = path.join(codexHome, 'generated_images', 'links');
+    fs.mkdirSync(linkDir, { recursive: true });
+    const link = path.join(linkDir, 'escape.png');
+    fs.symlinkSync(outside, link);
+    const text = path.join(codexHome, 'generated_images', 'notes.png');
+    fs.writeFileSync(text, 'not an image at all, just text '.repeat(10));
+
+    const sent: SentFile[] = [];
+    const outcome = await deliverLateCodexImages({
+      artifacts: [
+        { callId: 'ig_out', savedPath: outside },
+        { callId: 'ig_link', savedPath: link },
+        { callId: 'ig_text', savedPath: text },
+        { callId: 'ig_gone', savedPath: path.join(linkDir, 'missing.png') },
+      ],
+      codexHome,
+      groupFolder: 'telegram_test',
+      workspaceRoot,
+      replyJid: 'tg:1',
+      router: recordingRouter(sent),
+    });
+    expect(sent).toEqual([]);
+    expect(outcome.sent).toEqual([]);
+    expect(outcome.failed.map((item) => item.callId)).toEqual([
+      'ig_out',
+      'ig_link',
+      'ig_text',
+      'ig_gone',
+    ]);
+  });
+
+  it('sends at most four images of a turn and reports the rest', async () => {
+    const artifacts = [1, 2, 3, 4, 5].map((n) => ({
+      callId: `ig_${n}`,
+      savedPath: generated(`img-${n}.png`, n),
+    }));
+    const sent: SentFile[] = [];
+    const outcome = await deliverLateCodexImages({
+      artifacts,
+      codexHome,
+      groupFolder: 'telegram_test',
+      workspaceRoot,
+      replyJid: 'tg:1',
+      router: recordingRouter(sent),
+    });
+    expect(sent).toHaveLength(4);
+    expect(outcome.failed).toEqual([{ callId: 'ig_5', reason: 'limit' }]);
+  });
+
+  it('reports a send the channel did not confirm, and says so honestly', async () => {
+    const outcome = await deliverLateCodexImages({
+      artifacts: [{ callId: 'ig_1', savedPath: generated('a.png', 1) }],
+      codexHome,
+      groupFolder: 'telegram_test',
+      workspaceRoot,
+      replyJid: 'tg:1',
+      router: recordingRouter([], { photoOk: false }),
+    });
+    expect(outcome.sent).toEqual([]);
+    expect(outcome.failed).toHaveLength(1);
+
+    const notice = lateImageFailureNotice(outcome);
+    expect(notice).toContain('Картинка не дошла');
+    // «Готово» without the picture must not stand alone.
+    expect(withLateImageNotice('Готово 😸', notice)).toBe(
+      `Готово 😸\n\n${notice}`,
+    );
+    // An image-only turn: the notice is the whole answer.
+    expect(withLateImageNotice('', notice)).toBe(notice);
+    expect(withLateImageNotice(null, notice)).toBe(notice);
+  });
+
+  it('a chat that cannot send files gets no resend promise and no send attempt', async () => {
+    const sent: SentFile[] = [];
+    const outcome = await deliverLateCodexImages({
+      artifacts: [
+        { callId: 'ig_1', savedPath: generated('a.png', 1) },
+        { callId: 'ig_2', savedPath: generated('b.png', 2) },
+      ],
+      codexHome,
+      groupFolder: 'whatsapp_test',
+      workspaceRoot,
+      replyJid: '1111111@s.whatsapp.net',
+      router: recordingRouter(sent),
+      canSendMedia: false,
+    });
+    expect(sent).toEqual([]);
+    expect(outcome.sent).toEqual([]);
+    expect(outcome.failed).toEqual([
+      { callId: 'ig_1', reason: LATE_IMAGE_NO_MEDIA_REASON },
+      { callId: 'ig_2', reason: LATE_IMAGE_NO_MEDIA_REASON },
+    ]);
+    // Nothing staged either.
+    expect(fs.existsSync(path.join(workspaceRoot, 'output', 'imagegen'))).toBe(
+      false,
+    );
+
+    const many = lateImageFailureNotice(outcome, { canSendMedia: false });
+    expect(many).toBe(
+      '⚠️ Картинки нарисовал, но отправить их в этот чат не могу.',
+    );
+    expect(many).not.toMatch(/пришли|ещё раз/);
+    // A drawn call that left no file is just as unsendable here.
+    const one = lateImageFailureNotice(
+      { sent: [], failed: [{ callId: 'ig_9', reason: 'image_gen gave no saved_path' }] },
+      { canSendMedia: false },
+    );
+    expect(one).toBe('⚠️ Картинку нарисовал, но отправить её в этот чат не могу.');
+    expect(
+      lateImageFailureNotice({ sent: [], failed: [] }, { canSendMedia: false }),
+    ).toBe('');
+  });
+
+  it('words partial and multiple failures and stays silent when all went out', () => {
+    const sent = (callId: string) => ({
+      callId,
+      filePath: `/x/${callId}.png`,
+      as: 'photo' as const,
+    });
+    const failed = (callId: string, reason = 'channel did not confirm') => ({
+      callId,
+      reason,
+    });
+    expect(
+      lateImageFailureNotice({ sent: [sent('a'), sent('b')], failed: [] }),
+    ).toBe('');
+    expect(
+      lateImageFailureNotice({
+        sent: [sent('a'), sent('b')],
+        failed: [failed('c')],
+      }),
+    ).toContain('1 из 3');
+    expect(
+      lateImageFailureNotice({ sent: [], failed: [failed('a'), failed('b')] }),
+    ).toContain('Картинки не дошли');
+    // Over the cap: offered on request, not reported as a failure.
+    const capped = lateImageFailureNotice({
+      sent: [sent('a'), sent('b'), sent('c'), sent('d')],
+      failed: [failed('e', 'limit'), failed('f', 'limit')],
+    });
+    expect(capped).not.toContain('⚠️');
+    expect(capped).toContain('Ещё 2 картинки не отправил');
+    expect(
+      lateImageFailureNotice({
+        sent: [sent('a')],
+        failed: [failed('e', 'limit')],
+      }),
+    ).toContain('Ещё 1 картинку');
+    expect(withLateImageNotice('Готово', '')).toBe('Готово');
+  });
+
+  it('after a run the user stopped («стоп») sends neither the images nor a notice', async () => {
+    const tracker = createLateImageTracker();
+    // image_gen finished before «стоп»: one file, and one call whose artifact
+    // frame never came before the kill.
+    tracker.noteArtifacts([{ callId: 'ig_1', savedPath: '/x/a.png' }]);
+    tracker.noteGenerationCallIds(['ig_1', 'ig_2']);
+    const deliver = vi.fn(async () => '⚠️ Картинка не дошла');
+    const sendNotice = vi.fn(async () => {});
+    const stopped = await deliverLateImagesAfterRun({
+      tracker,
+      artifacts: [{ callId: 'ig_1', savedPath: '/x/a.png' }],
+      generationCallIds: ['ig_1', 'ig_2'],
+      stoppedByUser: true,
+      deliver,
+      sendNotice,
+    });
+    expect(stopped).toEqual({ stopped: true, dropped: 2, notice: '' });
+    expect(deliver).not.toHaveBeenCalled();
+    expect(sendNotice).not.toHaveBeenCalled();
+    // The turn is closed: nothing of it goes out later in the run either.
+    expect(tracker.takeTurn()).toEqual({ images: [], unsavedCallIds: [] });
+  });
+
+  it('after a failed run that nobody stopped sends the images and says what failed', async () => {
+    const tracker = createLateImageTracker();
+    const deliver = vi.fn(async () => {
+      expect(tracker.takeTurn().images.map((item) => item.callId)).toEqual([
+        'ig_1',
+      ]);
+      return '⚠️ Картинка не дошла';
+    });
+    const sendNotice = vi.fn(async () => {});
+    const out = await deliverLateImagesAfterRun({
+      tracker,
+      artifacts: [{ callId: 'ig_1', savedPath: '/x/a.png' }],
+      generationCallIds: ['ig_1'],
+      stoppedByUser: false,
+      deliver,
+      sendNotice,
+    });
+    expect(out).toEqual({
+      stopped: false,
+      dropped: 0,
+      notice: '⚠️ Картинка не дошла',
+    });
+    expect(sendNotice).toHaveBeenCalledWith('⚠️ Картинка не дошла');
+
+    const quiet = vi.fn(async () => {});
+    await deliverLateImagesAfterRun({
+      tracker: createLateImageTracker(),
+      artifacts: undefined,
+      generationCallIds: undefined,
+      stoppedByUser: false,
+      deliver: async () => '',
+      sendNotice: quiet,
+    });
+    expect(quiet).not.toHaveBeenCalled();
   });
 });

@@ -16,6 +16,7 @@ import {
   getDb,
   getAllRegisteredGroups,
   getCalendarEventLink,
+  getDueTasks,
   getMessagesSince,
   getNewMessages,
   getRecentConversationMessages,
@@ -25,6 +26,7 @@ import {
   logTaskRun,
   setRegisteredGroup,
   storeBotReply,
+  isStoredDuplicateMessage,
   storeChatMetadata,
   storeMessage,
   updateTask,
@@ -170,6 +172,41 @@ describe('storeMessage', () => {
       'skoobi_bot',
     );
     expect(messages).toHaveLength(1);
+  });
+
+  it('keeps the first-seen timestamp when a channel redelivers the same id later', () => {
+    storeChatMetadata('self@s.whatsapp.net', '2026-09-01T03:54:24.000Z');
+    const first = {
+      id: '3BFF75CE0000',
+      chat_jid: 'self@s.whatsapp.net',
+      sender: 'self@s.whatsapp.net',
+      sender_name: 'Owner',
+      content: 'Как создать сайт',
+      timestamp: '2026-09-01T03:54:24.000Z',
+    };
+    store(first);
+    // WhatsApp re-sent this message ~10 times a day with a fresh server time.
+    store({ ...first, timestamp: '2026-09-27T06:16:13.000Z' });
+
+    const recent = getRecentConversationMessages('self@s.whatsapp.net', '', 10);
+    expect(recent).toHaveLength(1);
+    expect(recent[0].timestamp).toBe('2026-09-01T03:54:24.000Z');
+  });
+
+  it('recognises a verbatim redelivery but not a changed or unknown message', () => {
+    storeChatMetadata('self@s.whatsapp.net', '2026-09-01T00:00:00.000Z');
+    store({
+      id: 'dup-1',
+      chat_jid: 'self@s.whatsapp.net',
+      sender: 'self@s.whatsapp.net',
+      sender_name: 'Owner',
+      content: 'текст',
+      timestamp: '2026-09-01T00:00:01.000Z',
+    });
+    expect(isStoredDuplicateMessage('dup-1', 'self@s.whatsapp.net', 'текст')).toBe(true);
+    expect(isStoredDuplicateMessage('dup-1', 'self@s.whatsapp.net', 'текст + расшифровка')).toBe(false);
+    expect(isStoredDuplicateMessage('dup-2', 'self@s.whatsapp.net', 'текст')).toBe(false);
+    expect(isStoredDuplicateMessage('dup-1', 'self@s.whatsapp.net', '')).toBe(false);
   });
 
   it('upserts on duplicate id+chat_jid', () => {
@@ -543,6 +580,28 @@ describe('task CRUD', () => {
 
     updateTask('task-2', { status: 'paused' });
     expect(getTaskById('task-2')!.status).toBe('paused');
+  });
+
+  it('getDueTasks runs only active tasks: cancelled/paused/completed never fire', () => {
+    const due = new Date(Date.now() - 60_000).toISOString();
+    for (const status of ['active', 'cancelled', 'paused', 'completed'] as const) {
+      createTask({
+        id: `task-due-${status}`,
+        group_folder: 'main',
+        chat_jid: 'group@g.us',
+        prompt: status,
+        schedule_type: 'once',
+        schedule_value: due,
+        context_mode: 'isolated',
+        next_run: due,
+        status,
+        created_at: '2024-01-01T00:00:00.000Z',
+      });
+    }
+    expect(getDueTasks().map((task) => task.id)).toEqual(['task-due-active']);
+    // A soft cancel also clears next_run; the status filter alone is enough.
+    updateTask('task-due-active', { status: 'cancelled', next_run: null });
+    expect(getDueTasks()).toEqual([]);
   });
 
   it('deletes a task and its run logs', () => {
@@ -1200,6 +1259,75 @@ describe('legacy scheduled-task owner provenance migration', () => {
     } finally {
       legacy.close();
       fs.rmSync(groupsDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('scheduled_tasks.run_profile', () => {
+  it('createTask stores read_only; a row without a profile reads NULL', () => {
+    const base = {
+      group_folder: 'telegram_main',
+      chat_jid: 'tg:100000001',
+      prompt: 'разбор',
+      schedule_type: 'cron' as const,
+      schedule_value: '0 7 * * *',
+      context_mode: 'isolated' as const,
+      next_run: '2026-09-29T02:00:00.000Z',
+      status: 'active' as const,
+      created_at: '2026-09-28T00:00:00.000Z',
+    };
+    createTask({ ...base, id: 'task-ro', run_profile: 'read_only' });
+    createTask({ ...base, id: 'task-plain' });
+
+    expect(getTaskById('task-ro')!.run_profile).toBe('read_only');
+    expect(getTaskById('task-plain')!.run_profile).toBeNull();
+  });
+
+  it('adds the column to a legacy table once; old rows read NULL', () => {
+    const legacy = new Database(':memory:');
+    try {
+      legacy.exec(`
+        CREATE TABLE scheduled_tasks (
+          id TEXT PRIMARY KEY,
+          group_folder TEXT NOT NULL,
+          chat_jid TEXT NOT NULL,
+          prompt TEXT NOT NULL,
+          schedule_type TEXT NOT NULL,
+          schedule_value TEXT NOT NULL,
+          next_run TEXT,
+          last_run TEXT,
+          last_result TEXT,
+          status TEXT DEFAULT 'active',
+          created_at TEXT NOT NULL
+        );
+        INSERT INTO scheduled_tasks
+          (id, group_folder, chat_jid, prompt, schedule_type,
+           schedule_value, status, created_at)
+        VALUES ('legacy-cron', 'telegram_main', 'tg:100000001', 'legacy',
+                'cron', '0 9 1 * *', 'active', '2026-01-01T00:00:00.000Z');
+      `);
+      const noOwners = {
+        telegram_user_ids: new Set<string>(),
+        telegram_chat_ids: new Set<string>(),
+      };
+
+      createSchema(legacy, [], noOwners);
+      // Idempotent: the second pass hits "duplicate column" and moves on.
+      expect(() => createSchema(legacy, [], noOwners)).not.toThrow();
+
+      const columns = legacy
+        .prepare(`PRAGMA table_info(scheduled_tasks)`)
+        .all() as Array<{ name: string; dflt_value: unknown }>;
+      const runProfile = columns.filter((c) => c.name === 'run_profile');
+      expect(runProfile).toHaveLength(1);
+      expect(runProfile[0].dflt_value).toBeNull();
+      expect(
+        legacy
+          .prepare(`SELECT run_profile FROM scheduled_tasks WHERE id = ?`)
+          .get('legacy-cron'),
+      ).toEqual({ run_profile: null });
+    } finally {
+      legacy.close();
     }
   });
 });

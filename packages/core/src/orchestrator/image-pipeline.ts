@@ -30,6 +30,7 @@ import {
 } from './db.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
+import { readBoundedRegularFileNoFollowSync } from './safe-file-read.js';
 import type { MessageRouter } from './types.js';
 
 const GENERATED_IMAGES_DIR = 'generated_images';
@@ -186,6 +187,68 @@ function readBoundedRolloutTail(filePath: string): string {
   }
 }
 
+interface RolloutImageCompletion {
+  callId: string | null;
+  savedPath: string | null;
+  timestamp: string | null;
+}
+
+/**
+ * A completed image generation in one rollout line, or null. Two shapes:
+ * Codex 0.144 wrote `{type:"event_msg",payload:{type:"image_generation_end",
+ * call_id,status,saved_path}}`; 0.156 writes only
+ * `{type:"event_msg",payload:{type:"item_completed",item:{type:"Extension",
+ * kind:"image_gen.generation",id:"exec-…",status,failure,savedPath}}}` — the
+ * runner's parseCodexImageGenerationEvent reads the same two. The old shape is
+ * matched by regex (the multi-megabyte base64 `result` is never decoded); the
+ * new one is rare and parsed whole.
+ */
+function rolloutImageCompletionOfLine(
+  line: string,
+): RolloutImageCompletion | null {
+  if (!line.includes('"status":"completed"')) return null;
+  if (line.includes('image_generation_end')) {
+    const field = (pattern: RegExp): string | null => {
+      const raw = pattern.exec(line)?.[1];
+      return raw ? decodeJsonStringFragment(raw) : null;
+    };
+    return {
+      callId: field(/"call_id":"((?:\\.|[^"\\])*)"/),
+      savedPath: field(/"saved_path":"((?:\\.|[^"\\])*)"/),
+      timestamp: field(/"timestamp":"((?:\\.|[^"\\])*)"/),
+    };
+  }
+  if (!line.includes('"image_gen.generation"')) return null;
+  let record: unknown;
+  try {
+    record = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  const outer = record as { timestamp?: unknown; payload?: unknown } | null;
+  const payload = outer?.payload as
+    | { type?: unknown; item?: unknown }
+    | undefined;
+  const item = payload?.item as Record<string, unknown> | undefined;
+  if (
+    payload?.type !== 'item_completed' ||
+    !item ||
+    item.type !== 'Extension' ||
+    item.kind !== 'image_gen.generation' ||
+    item.status !== 'completed' ||
+    (item.failure !== undefined && item.failure !== null && item.failure !== '')
+  ) {
+    return null;
+  }
+  const text = (value: unknown): string | null =>
+    typeof value === 'string' && value.trim() ? value.trim() : null;
+  return {
+    callId: text(item.id),
+    savedPath: text(item.savedPath) ?? text(item.saved_path),
+    timestamp: text(outer?.timestamp),
+  };
+}
+
 function exactImageEvidenceFromRollouts(input: {
   codexHome: string;
   jobId: string;
@@ -219,21 +282,10 @@ function exactImageEvidenceFromRollouts(input: {
       nextMarkerOffset < 0 ? undefined : nextMarkerOffset,
     );
     for (const line of ownedTurn.split('\n')) {
-      if (
-        !line.includes('image_generation_end') ||
-        !line.includes('"status":"completed"')
-      ) {
-        continue;
-      }
-      const timestampRaw = /"timestamp":"((?:\\.|[^"\\])*)"/.exec(line)?.[1];
-      const callIdRaw = /"call_id":"((?:\\.|[^"\\])*)"/.exec(line)?.[1];
-      const savedPathRaw = /"saved_path":"((?:\\.|[^"\\])*)"/.exec(line)?.[1];
-      const decodedCallId = callIdRaw
-        ? decodeJsonStringFragment(callIdRaw)
-        : null;
-      const timestamp = timestampRaw
-        ? decodeJsonStringFragment(timestampRaw)
-        : null;
+      const completion = rolloutImageCompletionOfLine(line);
+      if (!completion) continue;
+      const decodedCallId = completion.callId;
+      const timestamp = completion.timestamp;
       let timestampMs = timestamp ? new Date(timestamp).getTime() : NaN;
       if (
         Number.isFinite(timestampMs) &&
@@ -242,8 +294,7 @@ function exactImageEvidenceFromRollouts(input: {
         continue;
       }
       if (decodedCallId) completedCallIds.add(decodedCallId);
-      if (!savedPathRaw) continue;
-      const savedPath = decodeJsonStringFragment(savedPathRaw);
+      const savedPath = completion.savedPath;
       if (!savedPath) continue;
       try {
         const imageStat = fs.statSync(savedPath);
@@ -395,6 +446,12 @@ function detectImageExtension(
       }
     }
   }
+  return imageExtensionOfHeader(header);
+}
+
+function imageExtensionOfHeader(
+  header: Buffer,
+): '.png' | '.jpg' | '.webp' | null {
   if (
     header.length >= 8 &&
     header
@@ -1108,6 +1165,351 @@ export async function finalizeCodexImageJob(input: {
     deliveryAlreadyHandled: sentThisPass === 0,
     error: recordingError,
   };
+}
+
+
+/** Telegram's sendPhoto upload limit; a bigger image goes as a document. */
+const MAX_TELEGRAM_UPLOAD_PHOTO_BYTES = 10 * 1024 * 1024;
+const MAX_LATE_IMAGES_PER_TURN = 4;
+/** A turn in which the model sent any file counts as delivered by the model. */
+const MODEL_FILE_DELIVERY_TOOLS = new Set(['send_photo', 'send_document']);
+
+export interface LateImageTurn {
+  /** Images of the turn the model did not send itself. */
+  images: CodexGeneratedImageArtifact[];
+  /** Finished image_gen calls of the turn that never exposed a saved_path. */
+  unsavedCallIds: string[];
+}
+
+export interface LateImageTracker {
+  /** Images reported by the runner (heartbeat and terminal frames alike). */
+  noteArtifacts(
+    artifacts: readonly CodexGeneratedImageArtifact[] | undefined,
+  ): void;
+  /** Finished image_gen call ids, reported even when no file came with them. */
+  noteGenerationCallIds(callIds: readonly string[] | undefined): void;
+  /** Side-effect tools the runner reported for the current turn. */
+  noteTools(tools: readonly string[] | undefined): void;
+  /**
+   * Close the current turn and return what of it the model did not deliver —
+   * nothing when it called send_photo / send_document in this turn (a second
+   * copy is worse than trusting it). Each call id is returned at most once a
+   * run, so a repeated terminal frame never sends an image twice.
+   */
+  takeTurn(): LateImageTurn;
+}
+
+export function createLateImageTracker(): LateImageTracker {
+  const seenCallIds = new Set<string>();
+  const seenGenerationCallIds = new Set<string>();
+  let turnImages: CodexGeneratedImageArtifact[] = [];
+  let turnCallIds: string[] = [];
+  let modelSentFile = false;
+  return {
+    noteArtifacts(artifacts) {
+      for (const artifact of artifacts ?? []) {
+        const callId =
+          typeof artifact?.callId === 'string' ? artifact.callId.trim() : '';
+        const savedPath =
+          typeof artifact?.savedPath === 'string' ? artifact.savedPath : '';
+        if (!callId || !savedPath || seenCallIds.has(callId)) continue;
+        seenCallIds.add(callId);
+        turnImages.push({ callId, savedPath });
+      }
+    },
+    noteGenerationCallIds(callIds) {
+      for (const raw of callIds ?? []) {
+        const callId = typeof raw === 'string' ? raw.trim() : '';
+        if (!callId || seenGenerationCallIds.has(callId)) continue;
+        seenGenerationCallIds.add(callId);
+        turnCallIds.push(callId);
+      }
+    },
+    noteTools(tools) {
+      if (tools?.some((tool) => MODEL_FILE_DELIVERY_TOOLS.has(tool))) {
+        modelSentFile = true;
+      }
+    },
+    takeTurn() {
+      const turn: LateImageTurn = modelSentFile
+        ? { images: [], unsavedCallIds: [] }
+        : {
+            images: turnImages,
+            // The completion frame comes just before its artifact frame, so
+            // by the end of the turn every call with a file has one.
+            unsavedCallIds: turnCallIds.filter(
+              (callId) => !seenCallIds.has(callId),
+            ),
+          };
+      turnImages = [];
+      turnCallIds = [];
+      modelSentFile = false;
+      return turn;
+    },
+  };
+}
+
+export interface LateImageDeliveryOutcome {
+  sent: Array<{ callId: string; filePath: string; as: 'photo' | 'document' }>;
+  failed: Array<{ callId: string; reason: string }>;
+}
+
+
+export const LATE_IMAGE_NO_MEDIA_REASON = 'channel cannot send images';
+
+/**
+ * Copy one generated image into the chat workspace (output/imagegen), the same
+ * place the image-job pipeline stages its files. The source must be a real
+ * image inside this chat's CODEX_HOME/generated_images: the path comes from the
+ * runner, and CODEX_HOME is writable by the run. The bytes are read once
+ * through a no-follow descriptor and validated from that buffer, so a swap
+ * after the check cannot send another file.
+ */
+function stageLateCodexImage(input: {
+  sourcePath: string;
+  callId: string;
+  codexHome: string;
+  groupFolder: string;
+  workspaceRoot?: string;
+}): string {
+  const rootReal = fs.realpathSync(generatedRoot(input.codexHome));
+  const sourceReal = fs.realpathSync(path.resolve(input.sourcePath));
+  if (!isWithin(rootReal, sourceReal) || sourceReal === rootReal) {
+    throw new Error('image is outside generated_images');
+  }
+  const { buffer, size } = readBoundedRegularFileNoFollowSync(sourceReal, {
+    maxBytes: MAX_TELEGRAM_PHOTO_BYTES,
+    oversize: 'reject',
+  });
+  if (size < MIN_IMAGE_BYTES) throw new Error('image file is too small');
+  const extension = imageExtensionOfHeader(buffer.subarray(0, 12));
+  if (!extension) throw new Error('file is not a supported image');
+
+  const groupRoot = fs.realpathSync(
+    input.workspaceRoot || resolveGroupFolderPath(input.groupFolder),
+  );
+  const outputDir = path.join(groupRoot, 'output', 'imagegen');
+  fs.mkdirSync(outputDir, { recursive: true, mode: 0o700 });
+  const outputReal = fs.realpathSync(outputDir);
+  if (!isWithin(groupRoot, outputReal)) {
+    throw new Error('Image output directory escaped the chat workspace');
+  }
+  const destination = path.join(
+    outputReal,
+    `late-${createHash('sha256').update(input.callId).digest('hex').slice(0, 16)}${extension}`,
+  );
+  if (fs.existsSync(destination)) {
+    const stat = fs.lstatSync(destination);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error('Existing staged image is unsafe');
+    }
+    if (stat.size === size && detectImageExtension(destination)) {
+      return destination;
+    }
+    fs.rmSync(destination, { force: true });
+  }
+  // wx: never follow or overwrite whatever appeared at the destination.
+  fs.writeFileSync(destination, buffer, { flag: 'wx', mode: 0o600 });
+  return destination;
+}
+
+/**
+ * Send the turn's forgotten images (at most four) to the chat. Never throws:
+ * every image ends up in `sent` or `failed`. Inside a turn the photo answers
+ * the turn like the model's own send_photo would (the IPC cursor rule); after
+ * the run has ended the post-run path owns the cursor, so the caller passes
+ * suppressCursorAdvance.
+ */
+export async function deliverLateCodexImages(input: {
+  artifacts: readonly CodexGeneratedImageArtifact[];
+  codexHome: string;
+  groupFolder: string;
+  workspaceRoot?: string;
+  replyJid: string;
+  router: MessageRouter;
+  suppressCursorAdvance?: boolean;
+  maxImages?: number;
+  /**
+   * The reply channel can send a photo or a document. Without either nothing
+   * is staged or tried: every image is reported as not sendable here.
+   */
+  canSendMedia?: boolean;
+}): Promise<LateImageDeliveryOutcome> {
+  const outcome: LateImageDeliveryOutcome = { sent: [], failed: [] };
+  if (input.canSendMedia === false) {
+    for (const artifact of input.artifacts) {
+      outcome.failed.push({
+        callId: artifact.callId,
+        reason: LATE_IMAGE_NO_MEDIA_REASON,
+      });
+    }
+    return outcome;
+  }
+  const limit = input.maxImages ?? MAX_LATE_IMAGES_PER_TURN;
+  for (const [index, artifact] of input.artifacts.entries()) {
+    if (index >= limit) {
+      outcome.failed.push({ callId: artifact.callId, reason: 'limit' });
+      continue;
+    }
+    let staged: string;
+    let size: number;
+    try {
+      staged = stageLateCodexImage({
+        sourcePath: artifact.savedPath,
+        callId: artifact.callId,
+        codexHome: input.codexHome,
+        groupFolder: input.groupFolder,
+        workspaceRoot: input.workspaceRoot,
+      });
+      size = fs.statSync(staged).size;
+    } catch (err) {
+      outcome.failed.push({
+        callId: artifact.callId,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      continue;
+    }
+    const asPhoto = size <= MAX_TELEGRAM_UPLOAD_PHOTO_BYTES;
+    const options = {
+      ...(input.suppressCursorAdvance ? { suppressCursorAdvance: true } : {}),
+      meta: {
+        kind: asPhoto ? 'late_image_photo' : 'late_image_document',
+        imageCallId: artifact.callId,
+      },
+    };
+    let delivered = false;
+    try {
+      delivered = asPhoto
+        ? await input.router.sendPhoto(
+            input.replyJid,
+            staged,
+            undefined,
+            options,
+          )
+        : await input.router.sendDocument(
+            input.replyJid,
+            staged,
+            undefined,
+            options,
+          );
+    } catch {
+      delivered = false;
+    }
+    if (delivered) {
+      outcome.sent.push({
+        callId: artifact.callId,
+        filePath: staged,
+        as: asPhoto ? 'photo' : 'document',
+      });
+    } else {
+      outcome.failed.push({
+        callId: artifact.callId,
+        reason: 'channel did not confirm the send',
+      });
+    }
+  }
+  return outcome;
+}
+
+function picturesWord(count: number): string {
+  const lastTwo = count % 100;
+  const last = count % 10;
+  if (lastTwo >= 11 && lastTwo <= 14) return 'картинок';
+  if (last === 1) return 'картинку';
+  if (last >= 2 && last <= 4) return 'картинки';
+  return 'картинок';
+}
+
+/**
+ * The honest line the user gets instead of a silent «Готово» without a file.
+ * Images over the per-turn cap were not tried at all (a turn that drew many
+ * pictures was likely making assets, not answering with them), so they are
+ * offered on request rather than reported as failed.
+ *
+ * A chat whose channel cannot send files (canSendMedia false) gets no
+ * «пришли картинку — отправлю ещё раз»: a resend fails the same way, so the
+ * promise could never be kept.
+ */
+export function lateImageFailureNotice(
+  outcome: LateImageDeliveryOutcome,
+  options: { canSendMedia?: boolean } = {},
+): string {
+  if (options.canSendMedia === false) {
+    const drawn = outcome.failed.length;
+    if (drawn === 0) return '';
+    return drawn === 1
+      ? '⚠️ Картинку нарисовал, но отправить её в этот чат не могу.'
+      : '⚠️ Картинки нарисовал, но отправить их в этот чат не могу.';
+  }
+  const overLimit = outcome.failed.filter(
+    (item) => item.reason === 'limit',
+  ).length;
+  const failed = outcome.failed.length - overLimit;
+  const tried = outcome.sent.length + failed;
+  const lines: string[] = [];
+  if (failed > 0 && failed < tried) {
+    lines.push(
+      `⚠️ Дошли не все картинки: ${failed} из ${tried} отправить не получилось. Напишите «пришли картинки» — отправлю ещё раз.`,
+    );
+  } else if (failed === 1) {
+    lines.push(
+      '⚠️ Картинка не дошла: отправить её не получилось. Напишите «пришли картинку» — отправлю ещё раз.',
+    );
+  } else if (failed > 1) {
+    lines.push(
+      '⚠️ Картинки не дошли: отправить их не получилось. Напишите «пришли картинки» — отправлю ещё раз.',
+    );
+  }
+  if (overLimit > 0) {
+    lines.push(
+      `Ещё ${overLimit} ${picturesWord(overLimit)} не отправил, чтобы не засыпать чат: напишите «пришли остальные картинки».`,
+    );
+  }
+  return lines.join('\n');
+}
+
+/**
+ * After the run: what its last turn drew and nobody sent goes out now (a turn
+ * that ended without a success frame — error, timeout, killed run — never
+ * reached the check in onOutput), and a failed send is said rather than left
+ * silent. A run the user stopped («стоп») sends neither the images nor a
+ * notice: the person asked to stop, and the stop reply is already out. The
+ * images stay in CODEX_HOME/generated_images for a later «пришли картинку».
+ */
+export async function deliverLateImagesAfterRun(input: {
+  tracker: Pick<
+    LateImageTracker,
+    'noteArtifacts' | 'noteGenerationCallIds' | 'takeTurn'
+  >;
+  artifacts: readonly CodexGeneratedImageArtifact[] | undefined;
+  generationCallIds: readonly string[] | undefined;
+  stoppedByUser: boolean;
+  /** Sends the turn's images; returns the failure notice, '' when none. */
+  deliver: () => Promise<string>;
+  sendNotice: (notice: string) => Promise<void>;
+}): Promise<{ stopped: boolean; dropped: number; notice: string }> {
+  input.tracker.noteArtifacts(input.artifacts);
+  input.tracker.noteGenerationCallIds(input.generationCallIds);
+  if (input.stoppedByUser) {
+    const turn = input.tracker.takeTurn();
+    return {
+      stopped: true,
+      dropped: turn.images.length + turn.unsavedCallIds.length,
+      notice: '',
+    };
+  }
+  const notice = await input.deliver();
+  if (notice) await input.sendNotice(notice);
+  return { stopped: false, dropped: 0, notice };
+}
+
+/** The turn's text with the failure notice under it; the notice alone for an image-only turn. */
+export function withLateImageNotice(
+  text: string | null,
+  notice: string,
+): string {
+  if (!notice) return text ?? '';
+  return text?.trim() ? `${text}\n\n${notice}` : notice;
 }
 
 export function formatRecentImageJobStatus(job: ImageJobRecord): string {

@@ -87,7 +87,9 @@
       <div class="metric"><div class="label">Задач на сегодня</div>
         <div class="value">${n.tasksToday}</div></div>
       <div class="metric"><div class="label">Ошибок за сутки</div>
-        <div class="value ${n.errors24h ? 'bad' : 'good'}">${n.errors24h}</div></div>`;
+        <div class="value ${n.errors24h ? 'bad' : 'good'}">${n.errors24h}</div></div>
+      <div class="metric"><div class="label">Сбоев инструментов за сутки</div>
+        <div class="value ${n.toolErrors24h ? 'bad' : 'good'}">${n.toolErrors24h ?? 0}</div></div>`;
     // Бейдж «ошибок за сутки» считается по журналу событий и может пережить
     // ротацию лога — поэтому сами ошибки показываем тут же, а не отсылаем
     // пользователя искать их в «Журнале».
@@ -124,6 +126,125 @@
       pill.textContent = warn ? 'почти всё спокойно' : 'всё спокойно';
       pill.className = 'pill ok';
     }
+    if (activeTab === 'pult') renderSpeed();
+  }
+
+  /* ── Сколько ждут ответа (считается из журнала событий) ── */
+  // Сервер пересчитывает раз в минуту; Обзор опрашивается каждые 5 с, так
+  // что чаще и спрашивать незачем. Старый сервер без /api/speed (панель ещё
+  // не перезапущена после выкатки) просто прячет блок.
+  const SPEED_REFRESH_MS = 60_000;
+  let speedDays = 7;
+  let speedData = null;
+  let speedFetchedAt = 0;
+  let speedLoading = false;
+
+  function plural(n, one, few, many) {
+    const m10 = n % 10;
+    const m100 = n % 100;
+    if (m10 === 1 && m100 !== 11) return one;
+    if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+    return many;
+  }
+
+  function sharePct(share) {
+    return share === null || share === undefined
+      ? '—'
+      : `${Math.round(share * 100)} %`;
+  }
+
+  function speedRow(title, s) {
+    const notes = [
+      `${s.series} ${plural(s.series, 'вопрос', 'вопроса', 'вопросов')}`,
+    ];
+    if (s.unanswered) notes.push(`без ответа ${s.unanswered}`);
+    if (s.waiting) notes.push(`ждут сейчас ${s.waiting}`);
+    const slow = s.final.over5mShare !== null && s.final.over5mShare > 0.2;
+    return `
+      <div class="row speed-row">
+        <span class="grow"><span class="speed-name">${esc(title)}</span>
+          <span class="sub">${esc(notes.join(' · '))}</span></span>
+        <span class="speed-cell"><span class="sub">Первый признак жизни</span>
+          <b>${esc(s.first.median)}</b>
+          <span class="sub">медиана · у 90 % — до ${esc(s.first.p90)}</span></span>
+        <span class="speed-cell"><span class="sub">Окончательный ответ</span>
+          <b class="${slow ? 'warn' : ''}">${esc(s.final.median)}</b>
+          <span class="sub">медиана · у 90 % — до ${esc(s.final.p90)}</span>
+          <span class="sub">дольше 5 минут: ${sharePct(s.final.over5mShare)}
+            (${s.final.over5m} из ${s.final.count})</span></span>
+      </div>`;
+  }
+
+  function speedGroup(title, rows) {
+    if (!rows.length) return '';
+    return `
+      <div class="speed-group"><h3>${esc(title)}</h3>
+        ${rows
+          .map(
+            (r) => `
+          <div class="speed-line"><span>${esc(r.label)}</span>
+            <span class="sub">медиана ${esc(r.final.median)} · у 90 % — до
+              ${esc(r.final.p90)} · ${r.final.count}
+              ${plural(r.final.count, 'ответ', 'ответа', 'ответов')}</span></div>`,
+          )
+          .join('')}
+      </div>`;
+  }
+
+  function drawSpeed() {
+    const wrap = $('#speed-wrap');
+    const win = speedData?.windows?.find((w) => w.days === speedDays);
+    if (!win) {
+      wrap.hidden = true;
+      return;
+    }
+    wrap.hidden = false;
+    $('#speed-range')
+      .querySelectorAll('.filter-chip')
+      .forEach((b) => {
+        const active = Number(b.dataset.days) === speedDays;
+        b.classList.toggle('active', active);
+        b.setAttribute('aria-pressed', String(active));
+      });
+    const rows = [];
+    if (win.chats.length > 1) rows.push(speedRow('Все чаты', win.all));
+    for (const chat of win.chats) rows.push(speedRow(chat.name, chat));
+    $('#speed').innerHTML =
+      rows.join('') ||
+      `<div class="row"><span class="grow sub">За ${speedDays} ${plural(speedDays, 'день', 'дня', 'дней')} вопросов не было.</span></div>`;
+    $('#speed-split').innerHTML =
+      win.all.answered > 0
+        ? speedGroup('Окончательный ответ по тарифу', win.byTier) +
+          speedGroup('Окончательный ответ по усилию модели', win.byEffort)
+        : '';
+    const m = win.all.machine;
+    $('#speed-note').textContent =
+      'Ожидание считается от отправки первого сообщения до окончательного ответа; ' +
+      'несколько сообщений подряд — один вопрос, «⏳» и промежуточные сообщения — признак жизни. ' +
+      (m
+        ? `Время работы машины по учёту запусков: медиана ${m.median}, у 90 % — до ${m.p90} ` +
+          `(${m.runs} ${plural(m.runs, 'запуск', 'запуска', 'запусков')}). ` +
+          'Это не время ответа: туда входят ~15 с ожидания после ответа, а несколько вопросов подряд считаются одним запуском.'
+        : '');
+  }
+
+  async function renderSpeed(force = false) {
+    if (speedLoading) return;
+    if (!force && Date.now() - speedFetchedAt < SPEED_REFRESH_MS) {
+      drawSpeed();
+      return;
+    }
+    speedLoading = true;
+    try {
+      speedData = await api('/api/speed');
+    } catch {
+      speedData = null;
+    } finally {
+      // Неудача тоже откладывает повтор на минуту: не долбим старый сервер.
+      speedFetchedAt = Date.now();
+      speedLoading = false;
+    }
+    drawSpeed();
   }
 
   /* ── Диалоги: Telegram + локальный WhatsApp observer ── */
@@ -1200,14 +1321,18 @@
           (t) => `
       <div class="row">
         <span class="grow">
-          <div>${esc(t.prompt)} ${t.hasCalendar ? '📅' : ''}</div>
+          <div>${esc(t.prompt)} ${t.hasCalendar ? '📅' : ''} ${
+            t.resultHidden
+              ? '<span class="pill warn" title="Последний результат целиком служебный (<internal>): в чат ничего не ушло">результат скрыт</span>'
+              : ''
+          }</div>
           <div class="sub">${esc(t.chatName)} · ${esc(t.schedule)} · ${esc(t.status)} · следующий: ${esc(t.nextRun)}</div>
         </span>
         <span class="actions">
-          <button data-act="pause" data-id="${esc(t.id)}" ${t.statusRaw === 'completed' ? 'disabled' : ''}>
+          <button data-act="pause" data-id="${esc(t.id)}" ${t.statusRaw === 'completed' || t.statusRaw === 'cancelled' ? 'disabled' : ''}>
             ${t.statusRaw === 'paused' ? '▶' : '⏸'}
           </button>
-          <button data-act="run" data-id="${esc(t.id)}" title="запустить сейчас">▶️ сейчас</button>
+          <button data-act="run" data-id="${esc(t.id)}" title="запустить сейчас" ${t.statusRaw === 'completed' || t.statusRaw === 'cancelled' ? 'disabled' : ''}>▶️ сейчас</button>
           <button data-act="del" data-id="${esc(t.id)}" class="danger">🗑</button>
         </span>
       </div>`,
@@ -1475,6 +1600,14 @@
       }
     }
   });
+  $('#speed-range')
+    .querySelectorAll('.filter-chip')
+    .forEach((b) =>
+      b.addEventListener('click', () => {
+        speedDays = Number(b.dataset.days) || 7;
+        drawSpeed();
+      }),
+    );
   $('#log-errors').addEventListener('change', renderLog);
   $('#log-q').addEventListener('input', () => {
     clearTimeout(window._logT);

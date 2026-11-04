@@ -2,6 +2,7 @@ import { createServer, IncomingMessage, ServerResponse } from 'http';
 import crypto from 'crypto';
 import { logger } from '../orchestrator/logger.js';
 import type { MessageIngestion } from '../orchestrator/types.js';
+import { IngestionPersistenceError } from '../orchestrator/ingestion.js';
 
 export interface WebhookDeps {
   ingestion: MessageIngestion;
@@ -35,6 +36,9 @@ const HEADERS_TIMEOUT_MS = 10_000;
 class BodyTooLargeError extends Error {}
 
 export function verifySignature(secret: string, payload: string, signature: string): boolean {
+  // Node's hex decoder accepts a valid prefix before malformed trailing input.
+  // Accept exactly one representation length before comparing decoded bytes.
+  if (typeof signature !== 'string' || !/^[a-fA-F0-9]{64}$/.test(signature)) return false;
   const expected = crypto
     .createHmac('sha256', secret)
     .update(payload)
@@ -88,7 +92,7 @@ export function verifyWebhookRequest(
   // canonicalizing here closes that case-variation replay bypass.
   // Also surface the parsed timestamp so the replay cache can anchor its
   // expiry to the signature's validity horizon rather than first-seen time.
-  return { ok: true, signature: signature.toLowerCase(), timestamp: ts };
+  return { ok: true, signature: Buffer.from(signature, 'hex').toString('hex'), timestamp: ts };
 }
 
 function readBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<string> {
@@ -156,6 +160,7 @@ export function startWebhookServer(
         for (const [key, e] of requestCounts) {
           if (now > e.resetAt) requestCounts.delete(key);
         }
+        if (requestCounts.size >= MAX_RATE_ENTRIES) return false;
       }
       requestCounts.set(groupFolder, { count: 1, resetAt: now + RATE_WINDOW });
       return true;
@@ -186,6 +191,7 @@ export function startWebhookServer(
       for (const [sig, exp] of seenSignatures) {
         if (now > exp) seenSignatures.delete(sig);
       }
+      if (seenSignatures.size >= MAX_SEEN_SIGNATURES) return false;
     }
     seenSignatures.set(signature, tsSeconds * 1000 + MAX_TIMESTAMP_SKEW_SECONDS * 1000);
     return true;
@@ -319,6 +325,14 @@ export function startWebhookServer(
       });
     } catch (err) {
       logger.error({ err, groupFolder }, 'Webhook ingest failed');
+      if (err instanceof IngestionPersistenceError) {
+        // This typed failure guarantees no message was committed. Allow a
+        // retry of the same signed request; unknown failures remain consumed
+        // because acceptance/side effects may already have occurred.
+        seenSignatures.delete(auth.signature);
+        sendJson(res, 503, { error: 'ingest unavailable' });
+        return;
+      }
       sendJson(res, 500, { error: 'ingest failed' });
       return;
     }

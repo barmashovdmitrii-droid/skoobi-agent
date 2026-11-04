@@ -4,6 +4,7 @@
  * routes through here. Supports pre/post hooks for extensions.
  */
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 import {
   Channel,
@@ -20,6 +21,10 @@ function findChannel(channels: Channel[], jid: string): Channel | undefined {
 
 function fileLogFields(filePath: string): { fileBasename: string } {
   return { fileBasename: path.basename(filePath) };
+}
+
+function jidLogRef(jid: string): string {
+  return createHash('sha256').update(jid, 'utf8').digest('hex').slice(0, 12);
 }
 
 export function createMessageRouter(channels: Channel[]): MessageRouter {
@@ -54,7 +59,7 @@ export function createMessageRouter(channels: Channel[]): MessageRouter {
           const result = await hook(current);
           if (result.action === 'drop') {
             logger.debug(
-              { jid: current.chatJid, reason: result.reason },
+              { jidHash: jidLogRef(current.chatJid), reason: result.reason },
               'Outbound message dropped by pre-hook',
             );
             return null;
@@ -90,13 +95,31 @@ export function createMessageRouter(channels: Channel[]): MessageRouter {
       );
       if (!channel) {
         logger.warn(
-          { jid: current.chatJid },
+          { jidHash: jidLogRef(current.chatJid) },
           'No connected channel for JID — message not delivered',
         );
-        throw new Error(`No connected channel for JID: ${current.chatJid}`);
+        throw new Error('No connected channel for JID');
       }
 
-      await channel.sendMessage(current.chatJid, formatted);
+      const progressKey = current.meta?.progressKey;
+      if (
+        channel.sendProgress &&
+        typeof progressKey === 'string' &&
+        progressKey.length > 0 &&
+        (current.meta?.kind === 'agent_progress' ||
+          current.meta?.kind === 'host_progress')
+      ) {
+        const delivered = await channel.sendProgress(current.chatJid, formatted, progressKey);
+        if (!delivered) return null;
+      } else {
+        if (
+          current.meta?.progressFinal === true &&
+          typeof progressKey === 'string' && progressKey.length > 0
+        ) {
+          await channel.finishProgress?.(current.chatJid, progressKey);
+        }
+        await channel.sendMessage(current.chatJid, formatted);
+      }
 
       // Fire post-hooks (observe only, errors don't affect delivery). Record the
       // text actually delivered (internal tags stripped), not the raw envelope
@@ -168,6 +191,10 @@ export function createMessageRouter(channels: Channel[]): MessageRouter {
       jid: string,
       filePath: string,
       caption?: string,
+      options?: {
+        suppressCursorAdvance?: boolean;
+        meta?: Record<string, unknown>;
+      },
     ): Promise<boolean> {
       const channel = channels.find(
         (c) =>
@@ -192,7 +219,14 @@ export function createMessageRouter(channels: Channel[]): MessageRouter {
           chatJid: jid,
           text: caption || '',
           triggerType: 'ipc',
-          meta: { kind: 'document', filePath },
+          meta: {
+            kind: 'document',
+            filePath,
+            ...(options?.meta || {}),
+            ...(options?.suppressCursorAdvance
+              ? { suppressCursorAdvance: true }
+              : {}),
+          },
         });
         return true;
       } catch (err) {

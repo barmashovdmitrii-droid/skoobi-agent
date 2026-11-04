@@ -46,6 +46,31 @@
         </div>
         <div id="services" class="cards"></div>
         <div id="numbers" class="metrics"></div>
+        <div id="speed-wrap" hidden>
+          <div class="speed-head">
+            <h2>Сколько ждут ответа</h2>
+            <div
+              id="speed-range"
+              class="filter-chips"
+              role="group"
+              aria-label="Период"
+            >
+              <button
+                class="filter-chip active"
+                data-days="7"
+                aria-pressed="true"
+              >
+                7 дней
+              </button>
+              <button class="filter-chip" data-days="30" aria-pressed="false">
+                30 дней
+              </button>
+            </div>
+          </div>
+          <div id="speed" class="list"></div>
+          <div id="speed-split" class="speed-split"></div>
+          <p id="speed-note" class="sub speed-note"></p>
+        </div>
         <div id="errors-wrap" hidden>
           <h2>Что за ошибки</h2>
           <div id="errors" class="list"></div>

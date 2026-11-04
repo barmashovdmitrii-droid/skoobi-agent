@@ -5,9 +5,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { _initTestDatabase, getDb } from './db.js';
 import { eventSessionIdForTenant, getEventsForTenant } from './event-store.js';
+import { STATE_ROOT } from './config.js';
 import {
   buildLiveModelRequest,
-  chargeLiveUsage,
+  linkCheckConfigForGroup,
+  linkCheckEventPayload,
   liveModeSelectionReason,
   loadLiveCanaryConfig,
   resolveCurrentTurnImageAttachments,
@@ -16,11 +18,6 @@ import {
   shouldStartLiveMode,
 } from './live-mode.js';
 import type { ModelGateway } from './model-gateway.js';
-import {
-  chargeQuotaUsage,
-  loadBillingConfig,
-  quotaIdempotencyKey,
-} from './quota.js';
 import type { TenantRecord } from './tenant-registry.js';
 
 function tenant(overrides: Partial<TenantRecord> = {}): TenantRecord {
@@ -575,6 +572,28 @@ describe('resolvePromptImageAttachments', () => {
     ]);
   });
 
+  it('does not drag a days-old history image into a turn that merely mentions pictures', () => {
+
+    const groupsDir = tempRoot();
+    const receivedDir = path.join(groupsDir, 'telegram_guest', 'received');
+    fs.mkdirSync(receivedDir, { recursive: true });
+    const stale = path.join(receivedDir, 'stale-shot.jpg');
+    writeRasterFixture(stale);
+    const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(stale, twoDaysAgo, twoDaysAgo);
+
+    const images = resolveCurrentTurnImageAttachments(
+      {
+        currentPrompt: 'Что на этом фото?',
+        fullPrompt: '[Recent: received/stale-shot.jpg]\n\nЧто на этом фото?',
+        groupFolder: 'telegram_guest',
+      },
+      { groupsDir },
+    );
+
+    expect(images).toEqual([]);
+  });
+
   it('does not attach old history frames to a current video placeholder without frames', () => {
     const groupsDir = tempRoot();
     const receivedDir = path.join(groupsDir, 'telegram_guest', 'received');
@@ -634,9 +653,6 @@ describe('live model turn', () => {
       output_tokens: number;
       payload_json: string;
     };
-    const usage = getDb()
-      .prepare(`SELECT * FROM usage_events WHERE tenant_id = ?`)
-      .get(t.tenant_id) as { input_tokens: number; cost_usd: number };
     const events = getEventsForTenant(t.tenant_id).map((event) => event.type);
 
     expect(trace).toMatchObject({
@@ -651,7 +667,6 @@ describe('live model turn', () => {
       visible_tools: ['echo_diagnostic'],
       owner_tools_visible: false,
     });
-    expect(usage).toMatchObject({ input_tokens: 11, cost_usd: 0.002 });
     expect(events).toContain('model_gateway_live_response');
   });
 
@@ -732,7 +747,7 @@ describe('live model turn', () => {
     ]);
   });
 
-  it('records provider errors without charging quota', async () => {
+  it('records provider errors without a successful run', async () => {
     const t = tenant();
     const gateway: ModelGateway = {
       complete: async () => {
@@ -751,233 +766,156 @@ describe('live model turn', () => {
       status: 'error',
       error: { message: 'provider unavailable' },
     });
-    expect(
-      (
-        getDb().prepare(`SELECT COUNT(*) AS c FROM usage_ledger`).get() as {
-          c: number;
-        }
-      ).c,
-    ).toBe(0);
   });
 });
 
-describe('live quota charging', () => {
-  const billingEnabledConfig = loadBillingConfig({ enabled: true });
+describe('гейт проверки ссылок (SKOOBI_LINK_CHECK_*)', () => {
+  const KEYS = [
+    'SKOOBI_LINK_CHECK_GROUPS',
+    'SKOOBI_LINK_CHECK_MODE',
+    'SKOOBI_LINK_FIX_REASONING_EFFORT',
+    'CLAUDECLAW_ENV_FILE',
+  ] as const;
+  const saved: Record<string, string | undefined> = {};
+  const storeFile = (name: string) => path.join(STATE_ROOT, 'store', name);
+  let envDir = '';
 
-  it('charges live usage once by idempotency key', async () => {
-    const t = tenant();
-    const gateway: ModelGateway = {
-      complete: async () => ({
-        text: 'Skoobi live answer',
-        tool_calls: [],
-        usage: {
-          input_tokens: 100,
-          output_tokens: 25,
-          cost_usd: 0.001,
-          provider_model: 'provider-model',
-        },
-      }),
-    };
-    const run = await runLiveModelTurn({
-      tenant: t,
-      prompt: 'Prompt',
-      senderId: '42',
-      gateway,
-    });
-
-    const first = chargeLiveUsage({
-      tenant: t,
-      run,
-      senderId: '42',
-      targetCursor: '2026-05-16T01:00:00.000Z',
-      createdAt: 10,
-      config: billingEnabledConfig,
-    });
-    const second = chargeLiveUsage({
-      tenant: t,
-      run,
-      senderId: '42',
-      targetCursor: '2026-05-16T01:00:00.000Z',
-      createdAt: 11,
-      config: billingEnabledConfig,
-    });
-
-    expect(first?.charged).toBe(true);
-    expect(second?.duplicate).toBe(true);
-    expect(
-      (
-        getDb().prepare(`SELECT COUNT(*) AS c FROM usage_ledger`).get() as {
-          c: number;
-        }
-      ).c,
-    ).toBe(1);
-    expect(
-      getEventsForTenant(t.tenant_id).filter(
-        (event) => event.type === 'quota_charged',
-      ),
-    ).toHaveLength(1);
+  beforeEach(() => {
+    for (const key of KEYS) saved[key] = process.env[key];
+    for (const key of KEYS) delete process.env[key];
+    // Tests do not read the runtime environment file.
+    envDir = fs.mkdtempSync(path.join(STATE_ROOT, 'link-env-'));
+    process.env.CLAUDECLAW_ENV_FILE = path.join(envDir, 'missing.env');
+  });
+  afterEach(() => {
+    for (const key of KEYS) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    for (const name of ['link-check.disabled', 'link-fix.disabled']) {
+      fs.rmSync(storeFile(name), { force: true });
+    }
+    fs.rmSync(envDir, { recursive: true, force: true });
   });
 
-  it('does not bill shadow-mode tenants via the Codex reserve-fallback path', async () => {
-    const t = tenant({ runtime: 'skoobi_shadow' });
-    const gateway: ModelGateway = {
-      complete: async () => ({
-        text: 'Skoobi shadow answer',
-        tool_calls: [],
-        usage: {
-          input_tokens: 100,
-          output_tokens: 25,
-          cost_usd: 0.001,
-          provider_model: 'provider-model',
-        },
-      }),
-    };
-    const run = await runLiveModelTurn({
-      tenant: t,
-      prompt: 'Prompt',
-      senderId: '42',
-      gateway,
-    });
-
-    const charge = chargeLiveUsage({
-      tenant: t,
-      run,
-      senderId: '42',
-      targetCursor: '2026-05-16T01:00:00.000Z',
-      createdAt: 10,
-      config: billingEnabledConfig,
-    });
-
-    expect(charge?.charged).toBe(false);
-    expect(charge?.skippedReason).toBe('shadow');
-    expect(
-      (
-        getDb().prepare(`SELECT COUNT(*) AS c FROM usage_ledger`).get() as {
-          c: number;
-        }
-      ).c,
-    ).toBe(0);
-    expect(
-      getEventsForTenant(t.tenant_id).filter(
-        (event) => event.type === 'quota_charged',
-      ),
-    ).toHaveLength(0);
+  it('по умолчанию выключено везде', () => {
+    expect(linkCheckConfigForGroup('telegram_main')).toBeNull();
   });
 
-  it('still bills live-mode tenants normally', async () => {
-    const t = tenant({ runtime: 'skoobi_live' });
-    const gateway: ModelGateway = {
-      complete: async () => ({
-        text: 'Skoobi live answer',
-        tool_calls: [],
-        usage: {
-          input_tokens: 100,
-          output_tokens: 25,
-          cost_usd: 0.001,
-          provider_model: 'provider-model',
-        },
-      }),
-    };
-    const run = await runLiveModelTurn({
-      tenant: t,
-      prompt: 'Prompt',
-      senderId: '42',
-      gateway,
+  it('включается поимённо, по умолчанию в тени', () => {
+    process.env.SKOOBI_LINK_CHECK_GROUPS = 'telegram_main, telegram_main';
+    expect(linkCheckConfigForGroup('telegram_main')).toEqual({ mode: 'shadow' });
+    expect(linkCheckConfigForGroup('telegram_main')).toEqual({
+      mode: 'shadow',
     });
-
-    const charge = chargeLiveUsage({
-      tenant: t,
-      run,
-      senderId: '42',
-      targetCursor: '2026-05-16T02:00:00.000Z',
-      createdAt: 10,
-      config: billingEnabledConfig,
-    });
-
-    expect(charge?.charged).toBe(true);
-    expect(charge?.skippedReason).toBeUndefined();
-    expect(
-      (
-        getDb().prepare(`SELECT COUNT(*) AS c FROM usage_ledger`).get() as {
-          c: number;
-        }
-      ).c,
-    ).toBe(1);
+    expect(linkCheckConfigForGroup('whatsapp_main')).toBeNull();
+    expect(linkCheckConfigForGroup('')).toBeNull();
   });
 
-  it('does not double-charge when Codex fails and Claude fallback succeeds for the same logical request', async () => {
-    const t = tenant();
-    const failingGateway: ModelGateway = {
-      complete: async () => {
-        throw new Error('Codex CLI rate limited');
-      },
-    };
-    const targetCursor = 'same-logical-failover-request';
-    const failedCodexRun = await runLiveModelTurn({
-      tenant: t,
-      prompt: 'Prompt',
-      senderId: '42',
-      gateway: failingGateway,
+  it('режим: mark, fix; непонятное — shadow', () => {
+    process.env.SKOOBI_LINK_CHECK_GROUPS = 'telegram_main';
+    process.env.SKOOBI_LINK_CHECK_MODE = 'mark';
+    expect(linkCheckConfigForGroup('telegram_main')).toEqual({ mode: 'mark' });
+    process.env.SKOOBI_LINK_CHECK_MODE = 'FIX';
+    expect(linkCheckConfigForGroup('telegram_main')).toEqual({
+      mode: 'fix',
+      fixReasoningEffort: 'medium',
     });
+    process.env.SKOOBI_LINK_CHECK_MODE = 'rewrite-everything';
+    expect(linkCheckConfigForGroup('telegram_main')).toEqual({ mode: 'shadow' });
+  });
 
-    const codexCharge = chargeLiveUsage({
-      tenant: t,
-      run: failedCodexRun,
-      senderId: '42',
-      targetCursor,
-      config: billingEnabledConfig,
+  it('усилие исправления: medium по умолчанию, своё, inherit', () => {
+    process.env.SKOOBI_LINK_CHECK_GROUPS = 'telegram_main';
+    process.env.SKOOBI_LINK_CHECK_MODE = 'fix';
+    process.env.SKOOBI_LINK_FIX_REASONING_EFFORT = 'low';
+    expect(linkCheckConfigForGroup('telegram_main')).toEqual({
+      mode: 'fix',
+      fixReasoningEffort: 'low',
     });
-    const sessionId = eventSessionIdForTenant(t);
-    const idempotencyKey = quotaIdempotencyKey({
-      tenantId: t.tenant_id,
-      sessionId,
-      channel: t.channel,
-      chatId: t.chat_id,
-      channelUserId: '42',
-      targetCursor,
-    });
-    const fallbackCharge = chargeQuotaUsage({
-      tenantId: t.tenant_id,
-      sessionId,
-      channel: t.channel,
-      chatId: t.chat_id,
-      channelUserId: '42',
-      modelRole: 'default',
-      providerModel: 'claude-opus-4-7',
-      inputTokens: 10,
-      outputTokens: 5,
-      providerCostUsd: null,
-      idempotencyKey,
-      runStatus: 'success',
-      isShadow: false,
-      config: billingEnabledConfig,
-    });
-    const duplicateFallbackCharge = chargeQuotaUsage({
-      tenantId: t.tenant_id,
-      sessionId,
-      channel: t.channel,
-      chatId: t.chat_id,
-      channelUserId: '42',
-      modelRole: 'default',
-      providerModel: 'claude-opus-4-7',
-      inputTokens: 10,
-      outputTokens: 5,
-      providerCostUsd: null,
-      idempotencyKey,
-      runStatus: 'success',
-      isShadow: false,
-      config: billingEnabledConfig,
-    });
+    process.env.SKOOBI_LINK_FIX_REASONING_EFFORT = 'ultra';
+    expect(linkCheckConfigForGroup('telegram_main')?.fixReasoningEffort).toBe(
+      'medium',
+    );
+    process.env.SKOOBI_LINK_FIX_REASONING_EFFORT = 'inherit';
+    expect(linkCheckConfigForGroup('telegram_main')).toEqual({ mode: 'fix' });
+  });
 
-    expect(codexCharge).toBeUndefined();
-    expect(fallbackCharge.charged).toBe(true);
-    expect(duplicateFallbackCharge.duplicate).toBe(true);
+  it('читает .env, когда в окружении ключей нет', () => {
+    const envFile = path.join(envDir, '.env');
+    fs.writeFileSync(
+      envFile,
+      'SKOOBI_LINK_CHECK_GROUPS=telegram_main\nSKOOBI_LINK_CHECK_MODE=fix\n',
+    );
+    process.env.CLAUDECLAW_ENV_FILE = envFile;
+    expect(linkCheckConfigForGroup('telegram_main')).toEqual({
+      mode: 'fix',
+      fixReasoningEffort: 'medium',
+    });
+  });
+
+  // Аварийное выключение без рестарта: файлы проверяются на каждом ходе.
+  it('link-check.disabled выключает всё, link-fix.disabled превращает fix в mark', () => {
+    process.env.SKOOBI_LINK_CHECK_GROUPS = 'telegram_main';
+    process.env.SKOOBI_LINK_CHECK_MODE = 'fix';
+    fs.mkdirSync(path.join(STATE_ROOT, 'store'), { recursive: true });
+    fs.writeFileSync(storeFile('link-fix.disabled'), '');
+    expect(linkCheckConfigForGroup('telegram_main')).toEqual({ mode: 'mark' });
+    fs.writeFileSync(storeFile('link-check.disabled'), '');
+    expect(linkCheckConfigForGroup('telegram_main')).toBeNull();
+    fs.rmSync(storeFile('link-check.disabled'));
+    fs.rmSync(storeFile('link-fix.disabled'));
+    expect(linkCheckConfigForGroup('telegram_main')?.mode).toBe('fix');
+  });
+});
+
+describe('linkCheckEventPayload', () => {
+  it('keeps counts, codes and host names only', () => {
     expect(
-      (
-        getDb().prepare(`SELECT COUNT(*) AS c FROM usage_ledger`).get() as {
-          c: number;
-        }
-      ).c,
-    ).toBe(1);
+      linkCheckEventPayload({
+        mode: 'fix',
+        found: 3,
+        checked: 2,
+        ok: 1,
+        dead: 1,
+        unknown: 0,
+        skipped: 1,
+        truncated: 0,
+        correction: 'applied',
+        check_ms: 812.4,
+        fix_ms: 40210,
+        dead_hosts: ['www.tutu.ru', 'https://evil.kz/secret?token=1', 42],
+        reasons: {
+          'dead:http-404': 1,
+          'skip:in-prompt': 1,
+          'bad key with spaces': 3,
+          'unknown:tls': -1,
+        },
+        url: 'https://www.tutu.ru/private/path',
+      }),
+    ).toEqual({
+      mode: 'fix',
+      found: 3,
+      checked: 2,
+      ok: 1,
+      dead: 1,
+      unknown: 0,
+      skipped: 1,
+      truncated: 0,
+      correction: 'applied',
+      check_ms: 812,
+      fix_ms: 40210,
+      dead_hosts: ['www.tutu.ru'],
+      reasons: { 'dead:http-404': 1, 'skip:in-prompt': 1 },
+    });
+  });
+
+  it('ignores anything that is not a summary object', () => {
+    expect(linkCheckEventPayload(null)).toBeNull();
+    expect(linkCheckEventPayload('dead')).toBeNull();
+    expect(linkCheckEventPayload([1, 2])).toBeNull();
+    expect(linkCheckEventPayload({ mode: 'evil', correction: 'Applied!' })).toEqual(
+      {},
+    );
   });
 });

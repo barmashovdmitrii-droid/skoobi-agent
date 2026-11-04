@@ -1017,6 +1017,161 @@ describe('Google operation authorization', () => {
     }
   });
 
+  it('standing owner access allows cell updates and appends on any sheet', () => {
+    const spreadsheetId = 'public-fixture-resource-0003';
+    const digest = 'd'.repeat(64);
+    const standingPolicy = {
+      ...basePolicy,
+      allowedDocumentIds: [],
+      standing: true,
+      allowedTools: [
+        'google_sheets_get_values',
+        'google_sheets_update_values',
+        'google_sheets_append_values',
+      ],
+    };
+    const update = {
+      type: 'google_api',
+      request_id: 'google_standing_update_1',
+      tool: 'google_sheets_update_values',
+      args: {
+        spreadsheetId,
+        range: 'Sheet1!F12',
+        values: [['вернул']],
+        inputMode: 'raw',
+        expectedDigest: digest,
+      },
+    };
+    expect(
+      authorizeTaskOperationRequest(
+        signedRequest(
+          googleCapability(standingPolicy as any),
+          update,
+          'authorize_standing_update_1',
+        ),
+        'telegram_main',
+      ),
+    ).toMatchObject({ ok: true });
+
+    // Read-only standing access (foreign text in the turn) never writes.
+    const readOnly = {
+      ...standingPolicy,
+      allowedTools: ['google_sheets_get_values'],
+    };
+    expect(
+      authorizeTaskOperationRequest(
+        signedRequest(
+          googleCapability(readOnly as any),
+          { ...update, request_id: 'google_standing_update_2' },
+          'authorize_standing_update_2',
+        ),
+        'telegram_main',
+      ),
+    ).toMatchObject({ ok: false, error: 'google_tool_not_allowed_for_turn' });
+  });
+
+  it('standing appends of a scheduled occurrence are keyed without the read digest; chat turns and overwrites keep the exact operation', () => {
+    const spreadsheetId = 'public-fixture-resource-0003';
+    const standingPolicy = {
+      ...basePolicy,
+      allowedDocumentIds: [],
+      standing: true,
+      allowedTools: [
+        'google_sheets_append_values',
+        'google_sheets_update_values',
+      ],
+    };
+    const append = (
+      requestId: string,
+      expectedDigest: string,
+      values: unknown[][] = [['28.09', 'вернул']],
+    ) => ({
+      type: 'google_api',
+      request_id: requestId,
+      tool: 'google_sheets_append_values',
+      args: {
+        spreadsheetId,
+        range: "'Sheet1'!A1:B1000",
+        values,
+        expectedDigest,
+      },
+    });
+    const consumed = (policy: unknown, envelope: Record<string, unknown>) => {
+      const response = authorizeTaskOperationRequest(
+        signedRequest(
+          googleCapability(policy as any),
+          envelope,
+          `authorize_${String(envelope.request_id)}`,
+        ),
+        'telegram_main',
+      );
+      expect(response.ok).toBe(true);
+      return consumeTaskOperationGrant(
+        { ...envelope, ownerAuthorizationGrant: response.grant },
+        'telegram_main',
+      )!;
+    };
+
+    const turnA = consumed(
+      standingPolicy,
+      append('google_turn_a', 'a'.repeat(64)),
+    );
+    const turnB = consumed(
+      standingPolicy,
+      append('google_turn_b', 'b'.repeat(64)),
+    );
+    expect(turnA.googleOperationKey).not.toBe(turnB.googleOperationKey);
+    expect(turnA).not.toHaveProperty('googleJournalFingerprint');
+
+    const occurrencePolicy = { ...standingPolicy, scheduledOccurrence: true };
+    const occA = consumed(
+      occurrencePolicy,
+      append('google_occ_a', 'a'.repeat(64)),
+    );
+    const occB = consumed(
+      occurrencePolicy,
+      append('google_occ_b', 'b'.repeat(64)),
+    );
+    expect(occA.googleOperationKey).toBe(occB.googleOperationKey);
+    expect(occA.googleJournalFingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(occA.googleJournalFingerprint).toBe(occB.googleJournalFingerprint);
+    expect(occA.googleOperationKey).not.toBe(turnA.googleOperationKey);
+    // A different row, or the same row written as a cell update, is another
+    // write.
+    const occOtherRow = consumed(
+      occurrencePolicy,
+      append('google_occ_c', 'a'.repeat(64), [['28.09', 'выдал']]),
+    );
+    expect(occOtherRow.googleOperationKey).not.toBe(occA.googleOperationKey);
+    const update = (requestId: string, expectedDigest: string) => ({
+      type: 'google_api',
+      request_id: requestId,
+      tool: 'google_sheets_update_values',
+      args: {
+        spreadsheetId,
+        range: "'Sheet1'!A1:B1000",
+        values: [['28.09', 'вернул']],
+        inputMode: 'raw',
+        expectedDigest,
+      },
+    });
+    const occUpdateA = consumed(
+      occurrencePolicy,
+      update('google_occ_update_a', 'a'.repeat(64)),
+    );
+    expect(occUpdateA.googleOperationKey).not.toBe(occA.googleOperationKey);
+    // Overwrites keep the exact key even in an occurrence: re-writing the
+    // same cells duplicates nothing, and A → B → A must land on A.
+    const occUpdateB = consumed(
+      occurrencePolicy,
+      update('google_occ_update_b', 'b'.repeat(64)),
+    );
+    expect(occUpdateB.googleOperationKey).not.toBe(
+      occUpdateA.googleOperationKey,
+    );
+    expect(occUpdateA).not.toHaveProperty('googleJournalFingerprint');
+  });
+
   it('allows only append-only Sheet writes bound to the exact target and formula policy', () => {
     const spreadsheetId = 'public-fixture-spreadsheet-id-0001';
     const range = "'Sheet1'!A1:G1000";

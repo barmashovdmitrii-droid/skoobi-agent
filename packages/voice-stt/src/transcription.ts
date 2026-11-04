@@ -74,7 +74,15 @@ export interface WhisperCandidate {
   meanTokenLogProbability: number | null;
   transcript: string | null;
   valid: boolean;
-  invalidReason: 'empty' | 'repetition' | 'corruption' | 'invalid_json' | null;
+  invalidReason:
+    | 'empty'
+    /** Whisper reported silence ([BLANK_AUDIO], [silence], [no speech]). */
+    | 'no_speech'
+    | 'repetition'
+    | 'corruption'
+    | 'artifact'
+    | 'invalid_json'
+    | null;
 }
 
 interface ExecOptions {
@@ -317,20 +325,67 @@ function hasRepetition(text: string): boolean {
   return false;
 }
 
+/**
+ * Captions Whisper learnt from subtitled video and "hears" in music or
+ * silence. Reject caption-only hallucinations instead of treating them as
+ * recognized speech. Match only when the WHOLE transcript is made of these
+ * phrases, so a real sentence that happens to contain one survives.
+ */
+const WHISPER_CAPTION_ARTIFACTS: readonly RegExp[] = [
+  /^субтитры (?:сделал|делал|создавал|подготовил[аи]?|подогнал|подготовлены|создан[ыо]?)(?:\s.*)?$/u,
+  /^редактор субтитров(?:\s.*)?$/u,
+  /^продолжение следует$/u,
+  /^спасибо за просмотр$/u,
+  /^подписывайтесь на (?:наш )?канал$/u,
+  /^подпишись на канал$/u,
+  /^ставьте лайки$/u,
+  /^(?:thanks|thank you) for watching$/u,
+  /^subtitles by(?:\s.*)?$/u,
+];
+
+/** «[Музыка]», «(аплодисменты)», «♪♪» — only as bracketed markers or notes. */
+const WHISPER_SOUND_MARKERS_ONLY =
+  /^(?:\s*(?:[[(]\s*(?:музыка|music|аплодисменты|applause|смех|laughter)\s*[\])]|♪+|♫+))+\s*$/iu;
+
+function isWhisperCaptionArtifact(text: string): boolean {
+  if (WHISPER_SOUND_MARKERS_ONLY.test(text)) return true;
+  const fragments = text
+    .toLocaleLowerCase()
+    .replace(/[♪♫*[\]()«»"“”]/gu, ' ')
+    // Initials («А.Тестовый») are not sentence ends.
+    .replace(/(^|\s)(\p{L})\./gu, '$1$2 ')
+    .split(/[.!?…\n]+/u)
+    .map((fragment) => fragment.replace(/[\s,;:—-]+/gu, ' ').trim())
+    .filter(Boolean);
+  return (
+    fragments.length > 0 &&
+    fragments.every((fragment) =>
+      WHISPER_CAPTION_ARTIFACTS.some((pattern) => pattern.test(fragment)),
+    )
+  );
+}
+
 export function validateTranscript(
   transcript: string | null,
 ): Pick<WhisperCandidate, 'valid' | 'invalidReason'> {
   if (!transcript?.trim()) return { valid: false, invalidReason: 'empty' };
+  // Silence markers are a property of the audio, not of the decoded
+  // language, so they get their own reason: a forced ru/kk pass cannot find
+  // speech the auto pass already reported absent (muted clips).
+  if (/^\s*[[(](?:blank_audio|silence|no speech)[\])].*$/iu.test(transcript)) {
+    return { valid: false, invalidReason: 'no_speech' };
+  }
   if (
     /[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffd]/u.test(transcript) ||
-    /^\s*[[(](?:blank_audio|silence|no speech|speaking in foreign language)[\])].*$/iu.test(
-      transcript,
-    )
+    /^\s*[[(]speaking in foreign language[\])].*$/iu.test(transcript)
   ) {
     return { valid: false, invalidReason: 'corruption' };
   }
   if (hasRepetition(transcript)) {
     return { valid: false, invalidReason: 'repetition' };
+  }
+  if (isWhisperCaptionArtifact(transcript)) {
+    return { valid: false, invalidReason: 'artifact' };
   }
   return { valid: true, invalidReason: null };
 }
@@ -384,7 +439,16 @@ export function retryReasonForAutoCandidate(
     'retryLanguageProbability' | 'retryMeanTokenLogProbability'
   >,
 ): RetryReason | null {
-  if (!candidate.valid) return 'invalid_transcript';
+  if (!candidate.valid) {
+  // Language retries cannot recover speech from an empty or silent recording.
+    if (
+      candidate.invalidReason === 'empty' ||
+      candidate.invalidReason === 'no_speech'
+    ) {
+      return null;
+    }
+    return 'invalid_transcript';
+  }
   if (candidate.languageProbability === null) {
     // Some compatible builds omit the language p diagnostic. Do not damage a
     // healthy, clearly decoded third language merely because that optional
@@ -519,7 +583,7 @@ function parseWavDuration(header: Buffer): number | null {
   }
   let byteRate: number | null = null;
   let dataBytes: number | null = null;
-  for (let offset = 12; offset + 8 <= header.length;) {
+  for (let offset = 12; offset + 8 <= header.length; ) {
     const id = header.toString('ascii', offset, offset + 4);
     const size = header.readUInt32LE(offset + 4);
     const payloadOffset = offset + 8;
@@ -549,6 +613,30 @@ async function wavDurationSeconds(wavPath: string): Promise<number | null> {
   } finally {
     await handle?.close().catch(() => undefined);
   }
+}
+
+const CHILD_STDERR_SNIPPET_CHARS = 160;
+
+/**
+ * A short, path-free excerpt of a failed child's stderr. ffmpeg names the
+ * reason in its last lines ("Output file #0 does not contain any stream" for
+ * a muted clip); without it the ERROR line only says `process_error`. Every
+ * absolute path is reduced to its basename so chat folders and temporary
+ * directories never reach the log.
+ */
+function childStderrSnippet(err: unknown): string | undefined {
+  const raw = isRecord(err) ? err.stderr : undefined;
+  if (typeof raw !== 'string') return undefined;
+  const collapsed = raw
+    .replace(/(?:^|[\s'"(])\/(?:[^\s'"/]+\/)*([^\s'"/]*)/gu, (match, base) =>
+      match.startsWith('/') ? `…/${base}` : `${match[0]}…/${base}`,
+    )
+    .replace(/\s+/gu, ' ')
+    .trim();
+  if (!collapsed) return undefined;
+  return collapsed.length > CHILD_STDERR_SNIPPET_CHARS
+    ? collapsed.slice(-CHILD_STDERR_SNIPPET_CHARS)
+    : collapsed;
 }
 
 function safeProcessFailure(err: unknown): {
@@ -701,6 +789,9 @@ async function transcribeUnserialized(
     }
 
     const selected = selectBestCandidate(candidates);
+    const invalidReason = selected
+      ? null
+      : (candidates[0]?.invalidReason ?? null);
     const processingDurationMs = performance.now() - startedAt;
     const realtimeFactor =
       audioDuration && audioDuration > 0
@@ -713,6 +804,7 @@ async function transcribeUnserialized(
           selected?.detectedLanguage || selected?.requestedLanguage || null,
         passCount,
         retryReason,
+        invalidReason,
         model: basename(config.whisperModel),
         audioDurationSeconds: roundMetric(audioDuration, 3),
         processingDurationMs: roundMetric(processingDurationMs, 1),
@@ -740,11 +832,14 @@ async function transcribeUnserialized(
     return transcript;
   } catch (err) {
     const processingDurationMs = performance.now() - startedAt;
+    const stderrSnippet =
+      stage === 'ffmpeg' ? childStderrSnippet(err) : undefined;
     logger.error(
       {
         via: 'local-whisper',
         stage,
         ...safeProcessFailure(err),
+        ...(stderrSnippet ? { stderrSnippet } : {}),
         passCount,
         model: basename(config.whisperModel),
         audioDurationSeconds: roundMetric(audioDuration, 3),

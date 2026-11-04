@@ -21,11 +21,15 @@ const envConfig = readEnvFile([
   'CONTAINER_TIMEOUT',
   'CONTAINER_MAX_OUTPUT_SIZE',
   'CLAUDECLAW_MAX_TRANSCRIPT_BYTES',
+  'CLAUDECLAW_CODEX_THREAD_MAX_ROLLOUT_BYTES',
+  'CLAUDECLAW_CODEX_THREAD_ROLLOUT_HARD_BYTES',
+  'CLAUDECLAW_CODEX_THREAD_OVERSIZE_IDLE_MS',
   'CREDENTIAL_PROXY_PORT',
   'CREDENTIAL_PROXY_HOST',
   'IDLE_TIMEOUT',
   'RUNNER_IDLE_WAIT_MS',
   'MAX_CONCURRENT_CONTAINERS',
+  'SKOOBI_SKILLS_CURATOR_FOLDER',
   'TZ',
 ]);
 
@@ -70,7 +74,12 @@ export const CODE_ROOT = resolveCodeRootFromModuleUrl(import.meta.url);
 // In developer mode: cwd is the claudeclaw repo.
 // In plugin mode: cwd is whatever directory the user ran `claude` from.
 // The directory IS the instance. Multiple instances = multiple directories.
-export const STATE_ROOT = process.cwd();
+//
+// Tests set SKOOBI_TEST_STATE_ROOT to an isolated temporary directory.
+// Without that override, each instance continues to use its working directory.
+export const STATE_ROOT = process.env.SKOOBI_TEST_STATE_ROOT
+  ? path.resolve(process.env.SKOOBI_TEST_STATE_ROOT)
+  : process.cwd();
 
 export const STORE_DIR = path.resolve(STATE_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(STATE_ROOT, 'groups');
@@ -108,6 +117,42 @@ export const MAX_TRANSCRIPT_BYTES = Math.max(
     10,
   ) || 40 * 1024 * 1024,
 );
+// Soft byte cap on a Codex thread's rollout .jsonl: past it the runner
+// rotates to a fresh thread, but only once the thread has sat idle for
+// CODEX_THREAD_OVERSIZE_IDLE_MS; past the hard cap it rotates regardless.
+// The rollout is an on-disk log, not the model context (codex compacts), so
+// the old 40MB cap cut working threads after 1–3 turns of screenshots; what
+// size costs is codex parsing the whole file on each resume, which the hard
+// cap bounds. Same NaN guard and 1MB floor as above. The runner reads these
+// via the CLAUDECLAW_CODEX_THREAD_* env keys, which sandbox-runner.ts
+// forwards into the child env; the defaults mirror agent/runner/src/index.ts.
+export const CODEX_THREAD_MAX_ROLLOUT_BYTES = Math.max(
+  1024 * 1024,
+  parseInt(
+    process.env.CLAUDECLAW_CODEX_THREAD_MAX_ROLLOUT_BYTES ||
+      envConfig.CLAUDECLAW_CODEX_THREAD_MAX_ROLLOUT_BYTES ||
+      String(512 * 1024 * 1024),
+    10,
+  ) || 512 * 1024 * 1024,
+);
+export const CODEX_THREAD_ROLLOUT_HARD_BYTES = Math.max(
+  1024 * 1024,
+  parseInt(
+    process.env.CLAUDECLAW_CODEX_THREAD_ROLLOUT_HARD_BYTES ||
+      envConfig.CLAUDECLAW_CODEX_THREAD_ROLLOUT_HARD_BYTES ||
+      String(2 * 1024 * 1024 * 1024),
+    10,
+  ) || 2 * 1024 * 1024 * 1024,
+);
+export const CODEX_THREAD_OVERSIZE_IDLE_MS = Math.max(
+  0,
+  parseInt(
+    process.env.CLAUDECLAW_CODEX_THREAD_OVERSIZE_IDLE_MS ||
+      envConfig.CLAUDECLAW_CODEX_THREAD_OVERSIZE_IDLE_MS ||
+      String(3 * 60 * 60 * 1000),
+    10,
+  ) || 3 * 60 * 60 * 1000,
+);
 export const CREDENTIAL_PROXY_PORT = parseInt(
   process.env.CREDENTIAL_PROXY_PORT ||
     envConfig.CREDENTIAL_PROXY_PORT ||
@@ -128,6 +173,19 @@ export const RUNNER_IDLE_WAIT_MS = Math.max(
     10,
   ) || 15000,
 );
+
+// shared data/skills registry directly. data/skills is injected into every
+// group's prompt, so write access there is an instruction-injection primitive
+// against every other agent — including full-access ones with a host shell.
+// Every other group proposes skills over IPC (`propose_skill` → .proposals)
+// for operator approval. Empty keeps the legacy behaviour (any trusted-owner
+// group may write), so an existing deployment does not change silently.
+export const SKILLS_CURATOR_FOLDER = (
+  process.env.SKOOBI_SKILLS_CURATOR_FOLDER ||
+  envConfig.SKOOBI_SKILLS_CURATOR_FOLDER ||
+  ''
+).trim();
+
 export const MAX_CONCURRENT_CONTAINERS = Math.max(
   1,
   parseInt(

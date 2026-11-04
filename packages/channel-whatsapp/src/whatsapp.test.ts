@@ -157,7 +157,11 @@ vi.mock('@skoobi/voice-stt', () => ({
 import {
   WhatsAppChannel,
   WhatsAppChannelOpts,
+  personalGroupRegistrationMatches,
+  reconnectDelayMs,
+  shouldLogReconnectAttempt,
   type WhatsAppObserverMediaBackfillProgress,
+  type WhatsAppRegisteredGroup,
 } from './whatsapp.js';
 import { downloadWhatsappMedia } from './whatsapp-media.js';
 import { transcribeAudioFile } from '@skoobi/voice-stt';
@@ -326,14 +330,43 @@ describe('WhatsAppChannel', () => {
       );
 
       const { logger } = await import('@skoobi/shared/logger');
+      // Baileys' own message text passes (redacted); its objects never do.
       expect(logger.warn).toHaveBeenCalledWith(
-        { source: 'baileys' },
+        {
+          source: 'baileys',
+          baileysMessage: 'transport warning with private payload',
+        },
         'WhatsApp transport warning',
       );
       const logged = JSON.stringify(vi.mocked(logger.warn).mock.calls);
       expect(logged).not.toContain('PRIVATE_SESSION');
       expect(logged).not.toContain('PRIVATE_KEY_BYTES');
       expect(logged).not.toContain('private-number');
+    });
+
+    it('logs a transport error with its name and status code, without the error text', async () => {
+      const channel = new WhatsAppChannel(createTestOpts());
+      await connectChannel(channel);
+      const { default: makeWASocket } = await import('@whiskeysockets/baileys');
+      const privateLogger = vi.mocked(makeWASocket).mock.calls[0][0].logger!;
+      const err = Object.assign(new TypeError('fetch failed for 15551234567'), {
+        output: { statusCode: 428 },
+      });
+      privateLogger.error({ err, jid: '15551234567@s.whatsapp.net' }, 'error in validating connection');
+
+      const { logger } = await import('@skoobi/shared/logger');
+      expect(logger.error).toHaveBeenCalledWith(
+        {
+          source: 'baileys',
+          baileysMessage: 'error in validating connection',
+          errorName: 'TypeError',
+          statusCode: 428,
+        },
+        'WhatsApp transport error',
+      );
+      const logged = JSON.stringify(vi.mocked(logger.error).mock.calls);
+      expect(logged).not.toContain('15551234567');
+      expect(logged).not.toContain('fetch failed');
     });
   });
 
@@ -461,6 +494,101 @@ describe('WhatsAppChannel', () => {
 
       // The channel sets a 5s retry — just verify it doesn't crash
       await new Promise((r) => setTimeout(r, 100));
+    });
+  });
+
+// Reconnect backoff is bounded and jittered.
+
+  describe('reconnect backoff', () => {
+    it('doubles the delay from 1 s to a 30 s ceiling with bounded jitter', () => {
+      const noJitter = () => 0;
+      expect(reconnectDelayMs(1, noJitter)).toBe(1_000);
+      expect(reconnectDelayMs(2, noJitter)).toBe(2_000);
+      expect(reconnectDelayMs(3, noJitter)).toBe(4_000);
+      expect(reconnectDelayMs(5, noJitter)).toBe(16_000);
+      expect(reconnectDelayMs(6, noJitter)).toBe(30_000);
+      expect(reconnectDelayMs(50, noJitter)).toBe(30_000);
+      expect(reconnectDelayMs(1_000_000, noJitter)).toBe(30_000);
+      // Jitter adds at most 500 ms and never goes negative or NaN.
+      expect(reconnectDelayMs(1, () => 0.999)).toBe(1_499);
+      expect(reconnectDelayMs(1, () => Number.NaN)).toBe(1_000);
+      expect(reconnectDelayMs(0, noJitter)).toBe(1_000);
+    });
+
+    it('logs attempts 1–3 and then every tenth one', () => {
+      const logged = Array.from({ length: 31 }, (_, index) => index + 1).filter(
+        shouldLogReconnectAttempt,
+      );
+      expect(logged).toEqual([1, 2, 3, 10, 20, 30]);
+    });
+
+    it('backs off between reconnects, throttles the log line and resets after open', async () => {
+      vi.useFakeTimers();
+      const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+      // Thirteen reconnects re-register handlers on the one fake socket.
+      fakeSocket._ev.setMaxListeners(0);
+      try {
+        const channel = new WhatsAppChannel(createTestOpts());
+        const connectPromise = channel.connect();
+        await vi.advanceTimersByTimeAsync(0);
+        triggerConnection('open');
+        await connectPromise;
+
+        const { default: makeWASocket } =
+          await import('@whiskeysockets/baileys');
+        const { logger } = await import('@skoobi/shared/logger');
+        const sockets = () => vi.mocked(makeWASocket).mock.calls.length;
+        const reconnectLogs = () =>
+          vi
+            .mocked(logger.info)
+            .mock.calls.filter(
+              (call) =>
+                call[1] === 'Reconnecting after credential state is durable...',
+            );
+        expect(sockets()).toBe(1);
+
+        // Expected delays for attempts 1..12 with the jitter pinned to 0.
+        const expectedDelays = [
+          1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000, 30_000,
+          30_000, 30_000, 30_000,
+        ];
+        for (const [index, delay] of expectedDelays.entries()) {
+          const socketsBefore = sockets();
+          triggerDisconnect(428);
+          await vi.advanceTimersByTimeAsync(delay - 1);
+          expect(sockets()).toBe(socketsBefore);
+          await vi.advanceTimersByTimeAsync(1);
+          expect(sockets()).toBe(socketsBefore + 1);
+          const attempt = index + 1;
+          if (shouldLogReconnectAttempt(attempt)) {
+            expect(reconnectLogs().at(-1)?.[0]).toMatchObject({
+              attempt,
+              delayMs: delay,
+            });
+          }
+        }
+        // Attempts 1, 2, 3 and 10 were logged; 4–9, 11, 12 stayed quiet.
+        expect(reconnectLogs().map((call) => (call[0] as { attempt: number }).attempt)).toEqual([
+          1, 2, 3, 10,
+        ]);
+
+        // A successful open resets the series: the next close reconnects
+        // after 1 s again, and the line is logged again.
+        triggerConnection('open');
+        const socketsBefore = sockets();
+        triggerDisconnect(428);
+        await vi.advanceTimersByTimeAsync(999);
+        expect(sockets()).toBe(socketsBefore);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(sockets()).toBe(socketsBefore + 1);
+        expect(reconnectLogs().at(-1)?.[0]).toMatchObject({
+          attempt: 1,
+          delayMs: 1_000,
+        });
+      } finally {
+        randomSpy.mockRestore();
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -1881,6 +2009,151 @@ describe('WhatsAppChannel', () => {
       expect(channel.ownsJid('unrelated@g.us')).toBe(false);
     });
 
+// Reconnecting must preserve the registration timestamp when configuration
+// has not changed.
+    describe('registry upsert only on change (C5)', () => {
+      const SELF_JID = '1234567890@s.whatsapp.net';
+
+      /** Opts whose registry remembers what the channel registered. */
+      function createStatefulPersonalOpts(
+        seed: Record<string, WhatsAppRegisteredGroup> = {},
+      ): WhatsAppChannelOpts & {
+        registry: Record<string, WhatsAppRegisteredGroup>;
+      } {
+        const template = createPersonalOpts().registeredGroups();
+        const registry: Record<string, WhatsAppRegisteredGroup> = {
+          ...template,
+          ...seed,
+        };
+        const opts = createPersonalOpts({
+          registeredGroups: vi.fn(() => registry),
+          registerGroup: vi.fn((jid: string, group: WhatsAppRegisteredGroup) => {
+            registry[jid] = group;
+          }),
+        });
+        return Object.assign(opts, { registry });
+      }
+
+      it('registers once across reconnects when the host registry keeps the row', async () => {
+        vi.useFakeTimers();
+        fakeSocket._ev.setMaxListeners(0);
+        try {
+          const opts = createStatefulPersonalOpts();
+          const channel = new WhatsAppChannel(opts);
+          const connectPromise = channel.connect();
+          await vi.advanceTimersByTimeAsync(0);
+          triggerConnection('open');
+          await connectPromise;
+          expect(opts.registerGroup).toHaveBeenCalledOnce();
+          const firstAddedAt = opts.registry[SELF_JID].added_at;
+
+          vi.setSystemTime(Date.now() + 60_000);
+          triggerDisconnect(428);
+          await vi.advanceTimersByTimeAsync(2_000);
+          triggerConnection('open');
+          await vi.advanceTimersByTimeAsync(0);
+
+          expect(opts.registerGroup).toHaveBeenCalledOnce();
+          expect(opts.registry[SELF_JID].added_at).toBe(firstAddedAt);
+          expect(channel.ownsJid(SELF_JID)).toBe(true);
+          const { logger } = await import('@skoobi/shared/logger');
+          expect(logger.debug).toHaveBeenCalledWith(
+            'WhatsApp personal self-chat registration unchanged',
+          );
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('skips the upsert when a database-loaded row already matches', async () => {
+        // Register once to learn the derived row, then simulate the next
+        // process start: the row comes back from SQLite (undefined config
+        // fields dropped, requiresTrigger explicit) with an older added_at.
+        const first = createStatefulPersonalOpts();
+        await connectChannel(new WhatsAppChannel(first));
+        const stored = JSON.parse(
+          JSON.stringify(first.registry[SELF_JID]),
+        ) as WhatsAppRegisteredGroup;
+        const restored: WhatsAppRegisteredGroup = {
+          ...stored,
+          added_at: '2026-09-28T10:00:00.000Z',
+        };
+
+        fakeSocket = createFakeSocket();
+        const second = createStatefulPersonalOpts({ [SELF_JID]: restored });
+        const channel = new WhatsAppChannel(second);
+        await connectChannel(channel);
+
+        expect(second.registerGroup).not.toHaveBeenCalled();
+        expect(second.registry[SELF_JID].added_at).toBe(
+          '2026-09-28T10:00:00.000Z',
+        );
+        expect(channel.ownsJid(SELF_JID)).toBe(true);
+      });
+
+      it('re-registers when the template changed, keeping the original added_at', async () => {
+        const first = createStatefulPersonalOpts();
+        await connectChannel(new WhatsAppChannel(first));
+        const restored: WhatsAppRegisteredGroup = {
+          ...first.registry[SELF_JID],
+          added_at: '2026-09-28T10:00:00.000Z',
+        };
+
+        fakeSocket = createFakeSocket();
+        const second = createStatefulPersonalOpts({ [SELF_JID]: restored });
+        second.registry['template@g.us'] = {
+          ...second.registry['template@g.us'],
+          agentConfig: {
+            ...second.registry['template@g.us'].agentConfig,
+            systemPrompt: 'Template rules, revised.',
+          },
+        };
+        await connectChannel(new WhatsAppChannel(second));
+
+        expect(second.registerGroup).toHaveBeenCalledOnce();
+        const registered = vi.mocked(second.registerGroup!).mock.calls[0][1];
+        expect(registered.added_at).toBe('2026-09-28T10:00:00.000Z');
+        expect(registered.agentConfig?.systemPrompt).toContain(
+          'Template rules, revised.',
+        );
+      });
+
+      it('compares rows the way they survive a database round trip', () => {
+        const base: WhatsAppRegisteredGroup = {
+          name: 'Fixture WhatsApp',
+          folder: 'wa-owner',
+          trigger: '',
+          added_at: '2026-01-01T00:00:00.000Z',
+          requiresTrigger: false,
+          isMain: true,
+          runtime: 'sandbox',
+          agentConfig: { model: undefined, personaId: 'p', fullAccess: false },
+        };
+        expect(
+          personalGroupRegistrationMatches(base, {
+            ...base,
+            added_at: '2026-02-02T00:00:00.000Z',
+            agentConfig: { fullAccess: false, personaId: 'p' },
+          }),
+        ).toBe(true);
+        expect(
+          personalGroupRegistrationMatches(base, {
+            ...base,
+            agentConfig: { ...base.agentConfig, personaId: 'other' },
+          }),
+        ).toBe(false);
+        expect(
+          personalGroupRegistrationMatches(base, { ...base, runtime: undefined }),
+        ).toBe(false);
+        expect(
+          personalGroupRegistrationMatches(
+            { ...base, requiresTrigger: undefined },
+            { ...base, requiresTrigger: true },
+          ),
+        ).toBe(true);
+      });
+    });
+
     it('routes third-party notify and append events only to passive storage', async () => {
       const opts = createPersonalOpts();
       const channel = new WhatsAppChannel(opts);
@@ -1930,6 +2203,47 @@ describe('WhatsAppChannel', () => {
       );
     });
 
+    it('keeps commercial-looking incoming chats passive and cannot send to them', async () => {
+      const opts = createPersonalOpts();
+      const channel = new WhatsAppChannel(opts);
+      await connectChannel(channel);
+      fakeSocket.sendPresenceUpdate.mockClear();
+      const destination = '5551234@s.whatsapp.net';
+      await triggerMessages([
+        {
+          key: {
+            id: 'passive-commercial-ru',
+            remoteJid: destination,
+            fromMe: false,
+          },
+          message: {
+            conversation:
+              'Здравствуйте! Пишу по объявлению об аренде самоката.',
+          },
+          messageTimestamp: Math.floor(Date.now() / 1000) + 1,
+        },
+        {
+          key: {
+            id: 'passive-commercial-kk',
+            remoteJid: destination,
+            fromMe: false,
+          },
+          message: {
+            conversation: 'Сәлеметсіз бе! Самокат жалдау туралы жазып отырмын.',
+          },
+          messageTimestamp: Math.floor(Date.now() / 1000) + 2,
+        },
+      ]);
+      expect(hostMock.onObservedMessage).toHaveBeenCalledTimes(2);
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(channel.ownsJid(destination)).toBe(false);
+      await expect(
+        channel.sendMessage(destination, 'Unauthorized reply'),
+      ).rejects.toThrow('only permits the authenticated self-chat');
+      expect(fakeSocket.sendMessage).not.toHaveBeenCalled();
+      expect(fakeSocket.sendPresenceUpdate).not.toHaveBeenCalled();
+    });
+
     it('enriches third-party voice asynchronously with shared local STT', async () => {
       vi.mocked(downloadWhatsappMedia).mockResolvedValueOnce({
         path: '/tmp/wa-owner/received/contact-voice.oga',
@@ -1977,15 +2291,106 @@ describe('WhatsAppChannel', () => {
           ),
         }),
       );
+      // Live observer downloads now pass a context too (observer flag for the
+      // size-cap log level, onFailure for the one-retry decision).
       expect(downloadWhatsappMedia).toHaveBeenCalledWith(
         expect.anything(),
         'wa-owner',
         'voice',
         { tier: 'guest', tenantId: 'wa-owner' },
+        expect.objectContaining({ source: 'live', observer: true }),
       );
       expect(transcribeAudioFile).toHaveBeenCalledWith(
         '/tmp/wa-owner/received/contact-voice.oga',
       );
+    });
+
+    // Retry transient live observer download failures after reconnect.
+    describe('one retry after a transient network failure', () => {
+      const voiceMessage = (id: string) => ({
+        key: { id, remoteJid: '5551234@s.whatsapp.net', fromMe: false },
+        message: { audioMessage: { mimetype: 'audio/ogg', ptt: true } },
+        pushName: 'Alice',
+        messageTimestamp: Math.floor(Date.now() / 1000),
+      });
+
+      it('retries a live download once after 30–60 s and then enriches', async () => {
+        vi.useFakeTimers();
+        try {
+          vi.mocked(downloadWhatsappMedia)
+            .mockImplementationOnce(async (_msg, _folder, _kind, _adm, ctx) => {
+              ctx?.onFailure?.({ transient: true, errorKind: 'TypeError' });
+              return null;
+            })
+            .mockResolvedValueOnce({
+              path: '/tmp/wa-owner/received/contact-voice.oga',
+              filename: 'contact-voice.oga',
+              originalName: null,
+              mimetype: 'audio/ogg',
+            });
+          vi.mocked(transcribeAudioFile).mockResolvedValueOnce('после повтора');
+          const channel = new WhatsAppChannel(createPersonalOpts());
+          const connectPromise = channel.connect();
+          await vi.advanceTimersByTimeAsync(0);
+          triggerConnection('open');
+          await connectPromise;
+
+          await triggerMessages([voiceMessage('observer-voice-retry')]);
+          await vi.advanceTimersByTimeAsync(0);
+          expect(downloadWhatsappMedia).toHaveBeenCalledTimes(1);
+          const { logger } = await import('@skoobi/shared/logger');
+          expect(logger.info).toHaveBeenCalledWith(
+            expect.objectContaining({ lane: 'audio', priority: 'notify' }),
+            'WhatsApp observer media download will be retried once',
+          );
+
+          await vi.advanceTimersByTimeAsync(29_999);
+          expect(downloadWhatsappMedia).toHaveBeenCalledTimes(1);
+          await vi.advanceTimersByTimeAsync(30_001);
+          expect(downloadWhatsappMedia).toHaveBeenCalledTimes(2);
+          await (channel as any).observerAudioQueue.waitForIdle();
+          await vi.advanceTimersByTimeAsync(0);
+
+          expect(hostMock.onObservedMessage).toHaveBeenLastCalledWith(
+            expect.objectContaining({
+              id: 'observer-voice-retry',
+              mediaEnriched: true,
+              content: expect.stringContaining('после повтора'),
+            }),
+          );
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('does not retry a non-transient failure (HTTP status, size cap)', async () => {
+        vi.useFakeTimers();
+        try {
+          vi.mocked(downloadWhatsappMedia).mockImplementation(
+            async (_msg, _folder, _kind, _adm, ctx) => {
+              ctx?.onFailure?.({
+                transient: false,
+                errorKind: 'WhatsappMediaHttpError',
+              });
+              return null;
+            },
+          );
+          const channel = new WhatsAppChannel(createPersonalOpts());
+          const connectPromise = channel.connect();
+          await vi.advanceTimersByTimeAsync(0);
+          triggerConnection('open');
+          await connectPromise;
+
+          await triggerMessages([voiceMessage('observer-voice-403')]);
+          await vi.advanceTimersByTimeAsync(120_000);
+          expect(downloadWhatsappMedia).toHaveBeenCalledTimes(1);
+          expect(
+            (channel as any).observerAudioQueue.snapshot().retrying,
+          ).toBe(0);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
     });
 
     it('enriches third-party photos with local OCR and a safe media ref', async () => {
@@ -3456,6 +3861,8 @@ describe('WhatsAppChannel', () => {
           'wa-owner',
           'voice',
           { tier: 'guest', tenantId: 'wa-owner' },
+          // Context gained observer/onFailure fields (one-retry).
+          expect.objectContaining({ source: 'history', observer: true }),
         );
         await channel.disconnect();
       });
@@ -3522,6 +3929,69 @@ describe('WhatsAppChannel', () => {
         'paused',
         'test@g.us',
       );
+    });
+
+    it('stays offline on connect so the owner\'s phone keeps its notifications', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+
+      await connectChannel(channel);
+
+      const { default: makeWASocket } = await import('@whiskeysockets/baileys');
+      const socketConfig = vi.mocked(makeWASocket).mock.calls.at(-1)![0];
+      expect(socketConfig.markOnlineOnConnect).toBe(false);
+      expect(fakeSocket.sendPresenceUpdate).not.toHaveBeenCalledWith('available');
+    });
+
+    it('goes online only while a reply is being composed', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+
+      await connectChannel(channel);
+      fakeSocket.sendPresenceUpdate.mockClear();
+
+      await channel.setTyping('test@g.us', true);
+      await channel.setTyping('test@g.us', false);
+
+      expect(fakeSocket.sendPresenceUpdate.mock.calls).toEqual([
+        ['available'],
+        ['composing', 'test@g.us'],
+        ['paused', 'test@g.us'],
+        ['unavailable'],
+      ]);
+    });
+
+    it('stays online until the last composing chat stops', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+
+      await connectChannel(channel);
+      fakeSocket.sendPresenceUpdate.mockClear();
+
+      await channel.setTyping('a@g.us', true);
+      await channel.setTyping('b@g.us', true);
+      await channel.setTyping('a@g.us', false);
+      expect(fakeSocket.sendPresenceUpdate).not.toHaveBeenCalledWith('unavailable');
+      await channel.setTyping('b@g.us', false);
+
+      const calls = fakeSocket.sendPresenceUpdate.mock.calls;
+      expect(calls.filter((c: unknown[]) => c[0] === 'available')).toHaveLength(1);
+      expect(calls.at(-1)).toEqual(['unavailable']);
+    });
+
+    it('goes offline even when the paused update fails', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+
+      await connectChannel(channel);
+      await channel.setTyping('test@g.us', true);
+      fakeSocket.sendPresenceUpdate.mockClear();
+      fakeSocket.sendPresenceUpdate.mockRejectedValueOnce(new Error('Failed'));
+
+      await expect(
+        channel.setTyping('test@g.us', false),
+      ).resolves.toBeUndefined();
+      expect(fakeSocket.sendPresenceUpdate).toHaveBeenLastCalledWith('unavailable');
     });
 
     it('handles typing indicator failure gracefully', async () => {

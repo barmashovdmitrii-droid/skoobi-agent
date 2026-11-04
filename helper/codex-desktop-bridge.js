@@ -6,6 +6,7 @@ import { execFile, spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
+import { assessTurnResult, isTurnResult } from './codex-task-result.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -81,7 +82,6 @@ const APP_SERVER_DISABLED_FEATURES = [
   'in_app_browser',
   'standalone_web_search',
   'network_proxy',
-  'code_mode_host',
   'code_mode',
   'image_generation',
   'hooks',
@@ -174,7 +174,11 @@ export function configuredMcpServerNames(configFile) {
 }
 
 export function isolatedAppServerArgs(mcpServerNames = []) {
-  const args = [];
+  // Stable code-mode host executes the model's tool orchestration; it is not
+  // an extra filesystem/network permission. Modern models call functions.exec
+  // even with the experimental code_mode feature off. Disabling the host makes
+  // those calls fail before they can reach the sandboxed shell/file tools.
+  const args = ['--enable', 'code_mode_host'];
   for (const feature of APP_SERVER_DISABLED_FEATURES) {
     args.push('--disable', feature);
   }
@@ -388,6 +392,7 @@ export function summarizeTurn(turn) {
   const summary = {
     id: turn.id,
     status: turn.status,
+    result: assessTurnResult(turn),
     startedAt: turn.startedAt ?? null,
     completedAt: turn.completedAt ?? null,
     durationMs: turn.durationMs ?? null,
@@ -838,6 +843,7 @@ export class CodexDesktopBridge {
     }
     this.openThread = options.openThread;
     this.stateLoadError = null;
+    this.toolRuntime = { state: 'not_checked' };
     this.state = null;
     this.#reloadState();
     this.mutationTail = Promise.resolve();
@@ -1038,6 +1044,7 @@ export class CodexDesktopBridge {
     ];
     if (
       state.version !== 1 ||
+      (state.result !== undefined && !isTurnResult(state.result)) ||
       requiredStrings.some(
         (key) => typeof state[key] !== 'string' || !state[key].trim(),
       ) ||
@@ -1143,6 +1150,7 @@ export class CodexDesktopBridge {
       }
       const state = JSON.parse(fs.readFileSync(fd, 'utf8'));
       if (!this.#validState(state)) throw new Error('invalid state file');
+      state.result ??= assessTurnResult({ status: state.status, items: [] });
       return { state, error: null };
     } catch (error) {
       if (error?.code === 'ENOENT') return { state: null, error: null };
@@ -1193,6 +1201,23 @@ export class CodexDesktopBridge {
     this.stateLoadError = null;
   }
 
+  #assessManagedTurn(turn) {
+    const assessment = assessTurnResult(turn);
+    if (assessment.reason === 'turn_error') return assessment;
+    // A repeated empty notification/history page must not erase known failures.
+    if (
+      this.state?.turnId === turn?.id &&
+      this.state.status === turn.status &&
+      TERMINAL_TURN_STATUSES.has(turn.status) &&
+      (!Array.isArray(turn.items) || turn.items.length === 0) &&
+      this.state.result?.state !== 'pending' &&
+      isTurnResult(this.state.result)
+    ) {
+      return this.state.result;
+    }
+    return assessment;
+  }
+
   #updateStateFromTurn(turn, threadId) {
     if (
       !this.state ||
@@ -1204,6 +1229,7 @@ export class CodexDesktopBridge {
     this.#saveState({
       ...this.state,
       status: turn.status,
+      result: this.#assessManagedTurn(turn),
       updatedAt: new Date().toISOString(),
       completedAt: TERMINAL_TURN_STATUSES.has(turn.status)
         ? new Date().toISOString()
@@ -1233,6 +1259,24 @@ export class CodexDesktopBridge {
       throw new Error(
         'Codex turn ended but its managed command processes are still running.',
       );
+    }
+    // Completion notifications may omit items; inspect the actual final turn
+    // before assessing a result. An unavailable history never implies success.
+    if (!Array.isArray(turn.items) || turn.items.length === 0) {
+      try {
+        const history = await this.#request('thread/read', {
+          threadId,
+          includeTurns: true,
+        });
+        if (this.#authorizedCwd(history?.thread?.cwd) === this.state.cwd) {
+          const full = history.thread.turns?.find(
+            (item) => item.id === turn.id && item.status === turn.status,
+          );
+          if (full) turn = full;
+        }
+      } catch {
+        /* Keep a conservative assessment of the notification. */
+      }
     }
     return this.#updateStateFromTurn(turn, threadId);
   }
@@ -1749,6 +1793,75 @@ export class CodexDesktopBridge {
     }
   }
 
+  async #preflightTools(cwd) {
+    this.toolRuntime = { state: 'checking', cwd };
+    this.toolRuntimeInstanceId = null;
+    try {
+      const effective = await this.#request('config/read', {
+        cwd,
+        includeLayers: false,
+      });
+      if (effective?.config?.features?.code_mode_host !== true) {
+        throw new Error('runtime_unavailable');
+      }
+      const preflightInstanceId = this.client.serverInstanceId?.();
+      if (!preflightInstanceId) throw new Error('runtime_identity_unavailable');
+      const nonce = randomUUID();
+      const probePath = path.join(cwd, `.skoobi-tool-probe-${nonce}`);
+      const script = `const fs=require('node:fs');const [p,n]=process.argv.slice(1);let own=false;try{fs.writeFileSync(p,n,{flag:'wx',mode:0o600});own=true;if(fs.readFileSync(p,'utf8')!==n)throw Error('probe_mismatch');process.stdout.write(n)}finally{if(own)fs.unlinkSync(p)}`;
+      const probe = await this.#request('command/exec', {
+        command: [process.execPath, '-e', script, probePath, nonce],
+        cwd,
+        sandboxPolicy: this.#safeTurnParams('', '', cwd).sandboxPolicy,
+        timeoutMs: 5_000,
+      });
+      if (this.client.serverInstanceId?.() !== preflightInstanceId)
+        throw new Error('runtime_changed');
+      if (probe?.exitCode !== 0 || probe.stdout !== nonce)
+        throw new Error('command_probe_failed');
+      this.toolRuntimeInstanceId = this.client.serverInstanceId?.();
+      this.toolRuntime = {
+        state: 'ready',
+        cwd,
+        checkedAt: new Date().toISOString(),
+        scope: 'sandboxed_command_read_write',
+      };
+    } catch {
+      this.toolRuntimeInstanceId = this.client.serverInstanceId?.();
+      this.toolRuntime = {
+        state: 'blocked',
+        cwd,
+        checkedAt: new Date().toISOString(),
+      };
+      throw new Error(
+        'Codex local tool preflight failed; no task turn was started.',
+      );
+    }
+  }
+
+  async #refreshResultEvidence() {
+    if (!this.state || !TERMINAL_TURN_STATUSES.has(this.state.status)) return;
+    try {
+      const history = await this.#request('thread/read', {
+        threadId: this.state.threadId,
+        includeTurns: true,
+      });
+      if (this.#authorizedCwd(history?.thread?.cwd) !== this.state.cwd) return;
+      const turn = history.thread.turns?.find(
+        (item) =>
+          item.id === this.state.turnId && item.status === this.state.status,
+      );
+      if (turn) {
+        const result = this.#assessManagedTurn(turn);
+        if (JSON.stringify(result) !== JSON.stringify(this.state.result)) {
+          this.#saveState({ ...this.state, result });
+        }
+      }
+    } catch {
+      /* Preserve existing bounded evidence if history is unavailable. */
+    }
+  }
+
   #safeTurnParams(threadId, prompt, cwd) {
     return {
       threadId,
@@ -1801,6 +1914,7 @@ export class CodexDesktopBridge {
       turnId,
       cwd,
       status: 'inProgress',
+      result: assessTurnResult({ status: 'inProgress', items: [] }),
       startedAt: continuingTask ? this.state.startedAt : now,
       updatedAt: now,
       completedAt: null,
@@ -1819,7 +1933,13 @@ export class CodexDesktopBridge {
     return this.#withMutation(
       async () => {
         await this.#refreshState();
+        await this.#refreshResultEvidence();
         return {
+          toolRuntime:
+            this.client.status().running &&
+            this.toolRuntimeInstanceId === this.client.serverInstanceId?.()
+              ? this.toolRuntime
+              : { state: 'not_checked' },
           appServer: this.client.status(),
           task: this.state,
           stateError: this.stateLoadError,
@@ -1904,6 +2024,7 @@ export class CodexDesktopBridge {
       this.#updateStateFromTurn(savedTurn, previousState.threadId);
       return { action: 'completed', task: this.state };
     }
+    await this.#preflightTools(safeCwd);
     const terminalBaselineItemIds = await this.#captureTerminalBaseline(
       previousState.threadId,
     );
@@ -2009,6 +2130,7 @@ export class CodexDesktopBridge {
     }
     await this.#assertNoActiveTurn();
     await this.#assertNoDesktopTurnActive();
+    await this.#preflightTools(safeCwd);
     const started = await this.#request('thread/start', {
       cwd: safeCwd,
       approvalPolicy: 'never',
@@ -2069,6 +2191,7 @@ export class CodexDesktopBridge {
         'The Codex thread working directory changed while it was being checked.',
       );
     }
+    await this.#preflightTools(safeCwd);
     const resumed = await this.#request('thread/resume', {
       threadId,
       cwd: safeCwd,
@@ -2234,10 +2357,15 @@ export class CodexDesktopBridge {
         status: snapshot.task.status,
         items: [],
       };
+      const assessment = assessTurnResult(terminalTurn);
+      const result =
+        terminalTurn.items?.length || assessment.reason === 'turn_error'
+          ? assessment
+          : snapshot.task.result;
       return {
         timedOut: false,
-        task: snapshot.task,
-        turn: summarizeTurn(terminalTurn),
+        task: { ...snapshot.task, result },
+        turn: { ...summarizeTurn(terminalTurn), result },
       };
     }
     const boundedTimeout = Math.min(
@@ -2274,7 +2402,15 @@ export class CodexDesktopBridge {
     return {
       timedOut: !turn,
       task,
-      turn: turn ? summarizeTurn(turn) : null,
+      turn: turn
+        ? {
+            ...summarizeTurn(turn),
+            result:
+              task?.threadId === activeThread && task?.turnId === activeTurn
+                ? task.result
+                : assessTurnResult(turn),
+          }
+        : null,
     };
   }
 

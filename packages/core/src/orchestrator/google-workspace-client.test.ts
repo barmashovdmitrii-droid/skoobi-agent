@@ -105,6 +105,9 @@ describe('host-only Google Workspace config', () => {
     const link = path.join(root, 'link');
     const large = path.join(root, 'large');
     fs.writeFileSync(unsafe, 'VERY_SECRET_TOKEN', { mode: 0o644 });
+    // A parent service may enforce umask 077. Make this fixture genuinely
+    // permissive instead of relying on creation mode surviving the umask.
+    fs.chmodSync(unsafe, 0o644);
     fs.symlinkSync(unsafe, link);
     fs.writeFileSync(large, 'x'.repeat(16 * 1024 + 1), { mode: 0o600 });
     try {
@@ -756,6 +759,72 @@ describe('Google Sheets digest and formula controls', () => {
       });
     }
     expect(postCalls).toBe(1);
+  });
+});
+
+
+describe('oversized Google Sheets reads', () => {
+  const rows = (count: number, width: number) =>
+    Array.from({ length: count }, (_, row) =>
+      Array.from({ length: width }, (_, column) => `r${row + 1}c${column + 1}`),
+    );
+
+  async function readError(reply: unknown, range: string): Promise<string> {
+    const client = new GoogleWorkspaceClient(BASE_CONFIG, {
+      fetch: withToken(() => jsonResponse(reply)),
+    });
+    try {
+      await client.sheetsGetValues({ spreadsheetId: 'sheet-1', range });
+    } catch (error) {
+      expect(error).toBeInstanceOf(GoogleWorkspaceClientError);
+      expect((error as GoogleWorkspaceClientError).code).toBe('invalid_input');
+      return (error as Error).message;
+    }
+    throw new Error('read unexpectedly succeeded');
+  }
+
+  it('names the row count, the range Google returned and the last rows', async () => {
+    const message = await readError(
+      { range: "'Звонки'!A1:J6200", values: rows(6100, 4) },
+      "'Звонки'!A1:J20000",
+    );
+    expect(message.startsWith('Sheet response has too many rows.')).toBe(true);
+    expect(message).toContain("Google returned 6100 rows for 'Звонки'!A1:J6200.");
+    expect(message).toContain('Data rows 1-6100');
+    expect(message).toContain("the last ones are 'Звонки'!A5101:J6100.");
+    expect(message.length).toBeLessThan(1000);
+  });
+
+  it('sizes the window by the cell limit for a wide range', async () => {
+    const message = await readError(
+      { range: 'Sheet1!B11:O900', values: rows(890, 14) },
+      'Sheet1!B11:O900',
+    );
+    expect(message.startsWith('Sheet values exceed 10000 cells.')).toBe(true);
+    // 14 columns → 714 rows per read; data rows 11..900.
+    expect(message).toContain('Data rows 11-900; read 714 rows at a time');
+    expect(message).toContain('the last ones are Sheet1!B187:O900.');
+  });
+
+  it('still states the facts when the returned range is not plain A1', async () => {
+    const message = await readError({ values: rows(1200, 2) }, 'Sheet1');
+    expect(message).toBe(
+      'Sheet response has too many rows. Google returned 1200 rows for Sheet1. One read takes at most 1000 rows and 10000 cells.',
+    );
+  });
+
+  it('keeps the bare text for oversized values a caller tries to write', async () => {
+    const client = new GoogleWorkspaceClient(BASE_CONFIG, {
+      fetch: withToken(() => jsonResponse({ range: 'Sheet1!A1:A2', values: [] })),
+    });
+    await expect(
+      client.sheetsUpdateValues({
+        spreadsheetId: 'sheet-1',
+        range: 'Sheet1!A1:A1001',
+        values: rows(1001, 1),
+        expectedDigest: '0'.repeat(64),
+      }),
+    ).rejects.toThrow(/^Sheet response has too many rows\.$/);
   });
 });
 

@@ -2,7 +2,7 @@
   "name": "@skoobi/core",
   "version": "0.0.0",
   "private": true,
-  "description": "Skoobi core: the orchestrator family (db/event-store/tenant-registry/queues/registries/ipc/scheduler/engine wiring/message loop), moved as a family — the package mirrors the old src/ layout (orchestrator/, later runtimes/, cost-tracking/, webhook/) so mutual relative imports stay untouched. Root src keeps re-export stubs + the main-instance assembly.",
+  "description": "Skoobi core: the orchestrator family (db/event-store/tenant-registry/queues/registries/ipc/scheduler/engine wiring/message loop), moved as a family — the package mirrors the old src/ layout (orchestrator/, later runtimes/, run-telemetry/, webhook/) so mutual relative imports stay untouched. Root src keeps re-export stubs + the main-instance assembly.",
   "type": "module",
   "main": "./dist/orchestrator/index.js",
   "types": "./dist/orchestrator/index.d.ts",
@@ -54,6 +54,10 @@
     "./calendar-adapter": {
       "types": "./dist/orchestrator/calendar-adapter.d.ts",
       "default": "./dist/orchestrator/calendar-adapter.js"
+    },
+    "./calendar-recurrence": {
+      "types": "./dist/orchestrator/calendar-recurrence.d.ts",
+      "default": "./dist/orchestrator/calendar-recurrence.js"
     },
     "./group-queue": {
       "types": "./dist/orchestrator/group-queue.d.ts",
@@ -127,6 +131,10 @@
       "types": "./dist/orchestrator/task-scheduler.d.ts",
       "default": "./dist/orchestrator/task-scheduler.js"
     },
+    "./task-next-run": {
+      "types": "./dist/orchestrator/task-next-run.d.ts",
+      "default": "./dist/orchestrator/task-next-run.js"
+    },
     "./live-mode": {
       "types": "./dist/orchestrator/live-mode.d.ts",
       "default": "./dist/orchestrator/live-mode.js"
@@ -155,9 +163,9 @@
       "types": "./dist/orchestrator/message-loop.d.ts",
       "default": "./dist/orchestrator/message-loop.js"
     },
-    "./cost-tracking": {
-      "types": "./dist/cost-tracking/index.d.ts",
-      "default": "./dist/cost-tracking/index.js"
+    "./run-telemetry": {
+      "types": "./dist/run-telemetry/index.d.ts",
+      "default": "./dist/run-telemetry/index.js"
     },
     "./webhook": {
       "types": "./dist/webhook/index.d.ts",
@@ -166,6 +174,10 @@
     "./webhook/server": {
       "types": "./dist/webhook/server.d.ts",
       "default": "./dist/webhook/server.js"
+    },
+    "./cost-tracking": {
+      "types": "./dist/cost-tracking/index.d.ts",
+      "default": "./dist/cost-tracking/index.js"
     }
   },
   "scripts": {
@@ -173,7 +185,6 @@
   },
   "dependencies": {
     "@skoobi/shared": "*",
-    "@skoobi/billing": "*",
     "@skoobi/providers": "*",
     "better-sqlite3": "^11.8.1",
     "googleapis": "^173.0.0",
@@ -182,6 +193,7 @@
     "cron-parser": "^5.5.0",
     "yaml": "^2.8.3",
     "zod": "^4.3.6",
+    "@skoobi/billing": "*",
     "@skoobi/payments": "*"
   }
 }

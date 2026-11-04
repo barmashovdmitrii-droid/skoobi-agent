@@ -21,6 +21,10 @@ export type ProviderCircuitConfig = {
   // timeout. The granted lease is max(halfOpenProbeWindowMs,
   // probeTimeoutMs + probeTimeoutMarginMs).
   probeTimeoutMarginMs: number;
+  // Failures further apart than this do not add up: the count starts over.
+  // Without it, two blips a day apart plus a third a week later opened the
+  // breaker for every chat.
+  failureWindowMs?: number;
 };
 
 export type ProviderCircuitSnapshot = {
@@ -96,6 +100,7 @@ export const DEFAULT_PROVIDER_CIRCUIT_CONFIG: ProviderCircuitConfig = {
   // full agent) pass their effective timeout when acquiring the lease.
   halfOpenProbeWindowMs: 360_000,
   probeTimeoutMarginMs: 60_000,
+  failureWindowMs: 600_000,
 };
 
 let providerCircuitDb: Database.Database | undefined;
@@ -152,11 +157,20 @@ function normalizeConfig(
         DEFAULT_PROVIDER_CIRCUIT_CONFIG.probeTimeoutMarginMs,
     ),
   );
+  const failureWindowMs = Math.max(
+    1,
+    Math.trunc(
+      config.failureWindowMs ??
+        DEFAULT_PROVIDER_CIRCUIT_CONFIG.failureWindowMs ??
+        600_000,
+    ),
+  );
   return {
     failuresToOpen,
     cooldownMs,
     halfOpenProbeWindowMs,
     probeTimeoutMarginMs,
+    failureWindowMs,
   };
 }
 
@@ -556,6 +570,33 @@ export function recordProviderCircuitFailure(input: {
   const snapshot = ensureCircuitState(input.provider, now, config);
   const previousState = snapshot.state;
 
+  // A host-side policy refusal happens before the provider is contacted. It
+  // therefore carries no signal about provider health and must never consume
+  // the shared failure budget. In particular, forwarded/untrusted owner input
+  // can be rejected repeatedly without opening the breaker for the next direct
+  // owner request.
+  //
+  // A turn timeout is the same: the provider may still be making tool calls
+  // when our own task budget runs out. A hung provider surfaces as a stream
+  // or network error, which still counts. A half-open probe
+  // that times out keeps the old behaviour: the probe did not prove recovery.
+  if (
+    input.reason === 'policy_blocked' ||
+    (input.reason === 'timeout' && previousState === 'closed')
+  ) {
+    return {
+      provider: input.provider,
+      state: previousState,
+      previousState,
+      opened: false,
+      failureCount: snapshot.failure_count,
+      failuresToOpen: snapshot.failures_to_open,
+      openUntil: snapshot.open_until,
+      reason: input.reason,
+      ignored: true,
+    };
+  }
+
   if (input.probeToken && previousState !== 'half_open') {
     return {
       provider: input.provider,
@@ -619,10 +660,16 @@ export function recordProviderCircuitFailure(input: {
     };
   }
 
+  const priorFailures =
+    previousState === 'closed' &&
+    snapshot.last_failure_at !== null &&
+    now - snapshot.last_failure_at > (config.failureWindowMs ?? 600_000)
+      ? 0
+      : snapshot.failure_count;
   const nextFailureCount =
     previousState === 'half_open'
-      ? Math.max(snapshot.failure_count + 1, config.failuresToOpen)
-      : snapshot.failure_count + 1;
+      ? Math.max(priorFailures + 1, config.failuresToOpen)
+      : priorFailures + 1;
   const shouldOpen =
     previousState === 'half_open' || nextFailureCount >= config.failuresToOpen;
 

@@ -118,3 +118,31 @@ describe('mount-security guest hardening', () => {
     ).toMatchObject({ allowed: true, effectiveReadonly: false });
   });
 });
+
+describe('mount-security logging', () => {
+  it('logs a rejected mount once per process and group, then only at debug (C41)', async () => {
+    const { validateAdditionalMounts, root } = await loadWithIsolatedConfig();
+    // Same module registry as mount-security: the shared logger it uses.
+    const { logger } = await import('./logger.js');
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const debug = vi.spyOn(logger, 'debug').mockImplementation(() => undefined);
+    try {
+      // Outside the allowed root: rejected on every run of a no-sandbox chat.
+      const outside = path.dirname(root);
+      const mounts = [{ hostPath: outside, containerPath: 'outside' }];
+      for (let run = 0; run < 3; run += 1) {
+        expect(validateAdditionalMounts(mounts, 'Owner chat', true)).toEqual([]);
+      }
+      const rejected = (spy: typeof warn) =>
+        spy.mock.calls.filter((call) => call[1] === 'Additional mount REJECTED');
+      expect(rejected(warn)).toHaveLength(1);
+      expect(rejected(debug)).toHaveLength(2);
+      // Another group's verdict about the same path is news.
+      validateAdditionalMounts(mounts, 'Other chat', true);
+      expect(rejected(warn)).toHaveLength(2);
+    } finally {
+      warn.mockRestore();
+      debug.mockRestore();
+    }
+  });
+});

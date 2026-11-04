@@ -5,7 +5,7 @@ vi.mock('./db.js', () => ({
   storeMessage: vi.fn(),
 }));
 
-import { createMessageIngestion, IngestionDeps } from './ingestion.js';
+import { createMessageIngestion, IngestionDeps, IngestionPersistenceError } from './ingestion.js';
 import { storeMessage } from './db.js';
 import type { IngestionEnvelope } from './types.js';
 
@@ -33,6 +33,22 @@ function webhookEnvelope(overrides?: Partial<IngestionEnvelope>): IngestionEnvel
 }
 
 describe('MessageIngestion', () => {
+  it('rejects uncommitted input without queueing or post-hooks and permits a later retry', async () => {
+    const deps = mockDeps();
+    const ingestion = createMessageIngestion(deps);
+    const observed = vi.fn();
+    ingestion.addPostHook(observed);
+    storeMessageMock.mockImplementationOnce(() => {
+      throw new Error('SQLITE_BUSY');
+    });
+    await expect(ingestion.ingest(webhookEnvelope())).rejects.toBeInstanceOf(IngestionPersistenceError);
+    expect(deps.enqueueMessageCheck).not.toHaveBeenCalled();
+    expect(observed).not.toHaveBeenCalled();
+    await expect(ingestion.ingest(webhookEnvelope())).resolves.toBe(true);
+    expect(deps.enqueueMessageCheck).toHaveBeenCalledTimes(1);
+    expect(observed).toHaveBeenCalledTimes(1);
+  });
+
   it('ingests webhook and enqueues', async () => {
     const deps = mockDeps();
     const ingestion = createMessageIngestion(deps);

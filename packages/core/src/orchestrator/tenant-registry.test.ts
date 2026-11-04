@@ -8,7 +8,9 @@ import {
   createTelegramSenderIdentity,
   defaultTelegramIdentityId,
   defaultTelegramTenantId,
+  defaultWhatsappTenantId,
   parseTelegramJid,
+  parseWhatsappJid,
   parseOwnerAllowlistConfig,
   parseSkoobiRuntimeMode,
   parseTenantJson,
@@ -675,5 +677,136 @@ describe('tenant parsing and sender identity', () => {
         ownerAllowlist: allowlist,
       }).is_owner_sender,
     ).toBe(false);
+  });
+});
+
+describe('WhatsApp tenants', () => {
+  const WHATSAPP_JID = '120363012345678901@s.whatsapp.net';
+
+  it('parses direct and group JIDs, and nothing else', () => {
+    expect(parseWhatsappJid(WHATSAPP_JID)).toEqual({
+      chatId: '120363012345678901',
+      isGroup: false,
+    });
+    expect(parseWhatsappJid('1111111@g.us')).toEqual({
+      chatId: '1111111',
+      isGroup: true,
+    });
+    expect(parseWhatsappJid('tg:100000001')).toBeNull();
+    expect(parseWhatsappJid('')).toBeNull();
+    expect(parseWhatsappJid('120363012345678901@example.com')).toBeNull();
+  });
+
+  it('gives a WhatsApp group a tenant so its turns can be recorded', () => {
+    // Before M2 this returned undefined and every event for the channel was
+    // dropped on the floor.
+    const groupsDir = makeTmpGroupsDir();
+    fs.mkdirSync(path.join(groupsDir, 'whatsapp_main'), { recursive: true });
+
+    const registry = TenantRegistry.fromRegisteredGroups(
+      { [WHATSAPP_JID]: group('whatsapp_main', { isMain: true }) },
+      { groupsDir },
+    );
+
+    const tenant = registry.resolveWhatsappJid(WHATSAPP_JID);
+    expect(tenant?.channel).toBe('whatsapp');
+    expect(tenant?.tenant_id).toBe(defaultWhatsappTenantId('120363012345678901'));
+    expect(tenant?.chat_id).toBe('120363012345678901');
+    expect(tenant?.mode).toBe('owner');
+    expect(tenant?.bot_id).toBeUndefined();
+  });
+
+  it('keeps the channels in separate indexes', () => {
+    // A shared index would let a Telegram lookup for chat 120363012345678901 resolve
+    // to the WhatsApp tenant.
+    const groupsDir = makeTmpGroupsDir();
+    fs.mkdirSync(path.join(groupsDir, 'whatsapp_main'), { recursive: true });
+    fs.mkdirSync(path.join(groupsDir, 'telegram_main'), { recursive: true });
+
+    const registry = TenantRegistry.fromRegisteredGroups(
+      {
+        [WHATSAPP_JID]: group('whatsapp_main', { isMain: true }),
+        'tg:100000001': group('telegram_main', { isMain: true }),
+      },
+      { groupsDir },
+    );
+
+    // The load-bearing one: the message path resolves through
+    // resolveTelegramJid, and shouldStartLiveMode() would treat an is_main
+    // tenant as owner. If this ever starts returning the WhatsApp tenant, the
+    // channel silently moves onto the Codex live path.
+    expect(registry.resolveTelegramJid(WHATSAPP_JID)).toBeUndefined();
+    expect(registry.resolveTelegramChat('120363012345678901')).toBeUndefined();
+    expect(registry.resolveWhatsappJid('tg:100000001')).toBeUndefined();
+    expect(registry.resolveTelegramJid('tg:100000001')?.channel).toBe(
+      'telegram',
+    );
+    expect(registry.resolveJid(WHATSAPP_JID)?.channel).toBe('whatsapp');
+    expect(registry.resolveJid('tg:100000001')?.channel).toBe('telegram');
+  });
+
+  it('refuses a guest-chosen tenant_id (finding #30 applies to WhatsApp too)', () => {
+    const groupsDir = makeTmpGroupsDir();
+    const folder = path.join(groupsDir, 'whatsapp_guest');
+    fs.mkdirSync(folder, { recursive: true });
+    fs.writeFileSync(
+      path.join(folder, 'tenant.json'),
+      JSON.stringify({ tenant_id: 'wa_chat_victim', channel: 'whatsapp' }),
+    );
+
+    const registry = TenantRegistry.fromRegisteredGroups(
+      { [WHATSAPP_JID]: group('whatsapp_guest') },
+      { groupsDir },
+    );
+
+    const tenant = registry.resolveWhatsappJid(WHATSAPP_JID);
+    expect(tenant?.tenant_id).toBe(defaultWhatsappTenantId('120363012345678901'));
+    expect(tenant?.mode).toBe('guest');
+  });
+
+  it('honours an operator tenant_id on a trusted main group', () => {
+    const groupsDir = makeTmpGroupsDir();
+    const folder = path.join(groupsDir, 'whatsapp_main');
+    fs.mkdirSync(folder, { recursive: true });
+    fs.writeFileSync(
+      path.join(folder, 'tenant.json'),
+      JSON.stringify({ tenant_id: 'wa_operator_chosen', channel: 'whatsapp' }),
+    );
+
+    const registry = TenantRegistry.fromRegisteredGroups(
+      { [WHATSAPP_JID]: group('whatsapp_main', { isMain: true }) },
+      { groupsDir },
+    );
+
+    expect(registry.resolveWhatsappJid(WHATSAPP_JID)?.tenant_id).toBe(
+      'wa_operator_chosen',
+    );
+  });
+
+  it('rejects a tenant.json whose channel contradicts the JID', () => {
+    const groupsDir = makeTmpGroupsDir();
+    const folder = path.join(groupsDir, 'telegram_main');
+    fs.mkdirSync(folder, { recursive: true });
+    fs.writeFileSync(
+      path.join(folder, 'tenant.json'),
+      JSON.stringify({ tenant_id: 'mismatch', channel: 'whatsapp' }),
+    );
+
+    const registry = TenantRegistry.fromRegisteredGroups(
+      { 'tg:100000001': group('telegram_main', { isMain: true }) },
+      { groupsDir },
+    );
+
+    // The file is ignored, the host-derived id stands.
+    expect(registry.resolveTelegramJid('tg:100000001')?.tenant_id).toBe(
+      defaultTelegramTenantId('100000001'),
+    );
+  });
+
+  it('still rejects a channel nobody supports', () => {
+    expect(() => parseTenantJson({ channel: 'signal' })).toThrow(
+      'Unsupported tenant channel: signal',
+    );
+    expect(parseTenantJson({ channel: 'whatsapp' }).channel).toBe('whatsapp');
   });
 });

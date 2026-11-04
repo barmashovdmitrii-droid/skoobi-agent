@@ -378,59 +378,139 @@ export function bumpSkillUsage(
   }
 }
 
-function scoreSkill(skill: SkillSummary, input: SkillSelectionInput): number {
-  if (skill.status !== 'active') return 0;
+// Service tails of media placeholders (telegram.ts, document-telegram.ts,
+// whatsapp.ts); see skillScoringText.
+const MEDIA_SERVICE_TAIL_RES: readonly RegExp[] = [
+  /(?:—\s*)?use Read tool to inspect visual context/gi,
+  /Key-frame files:[^\]<]*/gi,
+  // The extract may itself contain «]», so cut to the LAST «]» of the message
+  // body: escapeXml keeps «<» out of the body, the next tag ends it. Only these
+  // labels trail the placeholder; a caption comes before them (WhatsApp) or
+  // after the closing «]» (Telegram), so it survives.
+  /(?:Preview|Locally extracted text|Local analysis|Selected frames[^:\]<]*):[^<]*\]/gi,
+  /Preview unavailable \([^)]*\)/gi,
+  /(?:File:\s*)?received\/[^\s\]<,;]+/gi,
+];
+
+
+export function skillScoringText(text: string): string {
+  let cleaned = text;
+  for (const re of MEDIA_SERVICE_TAIL_RES) cleaned = cleaned.replace(re, ' ');
+  return cleaned
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\[(?:Voice|Audio):\s*/gi, '')
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+}
+
+/**
+ * A trigger matches only from the start of a word: «напомни» no longer fires
+ * the memory skill's «помни», «кинопоиск» the web skill's «поиск»,
+ * «автосервис» the ops skill's «сервис». There is deliberately no boundary on
+ * the right — many triggers are stems («обуч», «скил», «самодоработ»,
+ * «запчаст»). `\b` is not an option: in JavaScript it knows only ASCII
+ * letters, so `/\bпочини/` never matches Cyrillic at all.
+ *
+ * The price is Russian verb prefixes: «вспомни», «закоммить», «запушь»,
+ * «перепроверь» no longer carry «помни», «коммить», «пушь», «проверь». A
+ * prefixed form that should select a skill has to be listed by itself — the
+ * memory pattern below, the ops skills' triggers in data/skills.
+ */
+const WORD_START = '(?<![\\p{L}\\p{N}_])';
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function matchesAtWordStart(text: string, needle: string): boolean {
+  return new RegExp(`${WORD_START}${escapeRegExp(needle)}`, 'u').test(text);
+}
+
+const BUILT_IN_SKILL_PATTERNS: ReadonlyArray<{
+  nameIncludes: string;
+  pattern: RegExp;
+  bonus: number;
+}> = [
+  {
+    nameIncludes: 'web',
+    pattern: new RegExp(`${WORD_START}(?:интернет|найди|поиск|search|latest|актуальн)`, 'iu'),
+    bonus: 24,
+  },
+  {
+    nameIncludes: 'voice',
+    pattern: new RegExp(`${WORD_START}(?:голос|озвуч|скажи\\s+голосом|voice|аудио)`, 'iu'),
+    bonus: 24,
+  },
+  {
+    nameIncludes: 'memory',
+    // «вспомни»/«вспоминай» ask to recall; «вспомнил» says the user did.
+    pattern: new RegExp(
+      `${WORD_START}(?:помни|памят|запомни|(?:вс|при)помни(?!л)|(?:вс|при)помина(?!л)|что ты знаешь|memory|remember)`,
+      'iu',
+    ),
+    bonus: 20,
+  },
+  {
+    nameIncludes: 'image',
+    pattern: new RegExp(`${WORD_START}(?:нарис|картин|изображен|сгенерируй.*фото|draw|image)`, 'iu'),
+    bonus: 20,
+  },
+  {
+    nameIncludes: 'parts',
+    pattern: new RegExp(`${WORD_START}(?:запчаст|детал|поставщик|точк|компан|контакт|авто)`, 'iu'),
+    bonus: 14,
+  },
+];
+
+interface SkillScore {
+  /** Trigger and built-in pattern points: a skill is selected only when > 0. */
+  score: number;
+  /** Name/tag/description word hits: orders skills with an equal score. */
+  tieBreak: number;
+}
+
+
+
+function scoreSkill(skill: SkillSummary, input: SkillSelectionInput): SkillScore {
+  const none: SkillScore = { score: 0, tieBreak: 0 };
+  if (skill.status !== 'active') return none;
   if (skill.folders.length > 0 && !skill.folders.includes(input.group.folder)) {
-    return 0;
+    return none;
   }
   if (
     skill.channels.length > 0 &&
     !skill.channels.includes(input.chatJid.split(':')[0])
   ) {
-    return 0;
+    return none;
   }
-  const text = input.text.toLowerCase();
+  const text = skillScoringText(input.text);
   let score = 0;
   for (const trigger of skill.triggers) {
     const normalized = trigger.toLowerCase().trim();
     if (!normalized) continue;
-    if (text.includes(normalized))
+    if (matchesAtWordStart(text, normalized)) {
       score += Math.min(80, 20 + normalized.length);
+    }
   }
+  for (const builtIn of BUILT_IN_SKILL_PATTERNS) {
+    if (skill.name.includes(builtIn.nameIncludes) && builtIn.pattern.test(text)) {
+      score += builtIn.bonus;
+    }
+  }
+  if (score === 0) return none;
   const terms = [
     skill.name.replace(/[-_]/g, ' '),
     ...skill.tags,
     ...skill.description.split(/\s+/).filter((term) => term.length >= 5),
   ];
+  let tieBreak = 0;
   for (const term of terms) {
     const normalized = term.toLowerCase().trim();
-    if (normalized.length >= 4 && text.includes(normalized)) score += 4;
+    if (normalized.length >= 4 && matchesAtWordStart(text, normalized)) {
+      tieBreak += 4;
+    }
   }
-  if (
-    skill.name.includes('web') &&
-    /(?:интернет|найди|поиск|search|latest|актуальн)/i.test(text)
-  ) {
-    score += 24;
-  }
-  if (
-    skill.name.includes('voice') &&
-    /(?:голос|озвуч|скажи\s+голосом|voice|аудио)/i.test(text)
-  ) {
-    score += 24;
-  }
-  if (
-    skill.name.includes('memory') &&
-    /(?:помни|памят|запомни|что ты знаешь|memory|remember)/i.test(text)
-  ) {
-    score += 20;
-  }
-  if (
-    skill.name.includes('image') &&
-    /(?:нарис|картин|изображен|сгенерируй.*фото|draw|image)/i.test(text)
-  ) {
-    score += 20;
-  }
-  return score;
+  return { score, tieBreak };
 }
 
 export function selectSkills(input: SkillSelectionInput): LoadedSkill[] {
@@ -442,10 +522,13 @@ export function selectSkills(input: SkillSelectionInput): LoadedSkill[] {
   );
   if (maxSkills === 0) return [];
   return listSkills({ skillsDir: root })
-    .map((skill) => ({ skill, score: scoreSkill(skill, input) }))
+    .map((skill) => ({ skill, ...scoreSkill(skill, input) }))
     .filter((item) => item.score > 0)
     .sort(
-      (a, b) => b.score - a.score || a.skill.name.localeCompare(b.skill.name),
+      (a, b) =>
+        b.score - a.score ||
+        b.tieBreak - a.tieBreak ||
+        a.skill.name.localeCompare(b.skill.name),
     )
     .slice(0, maxSkills)
     .map((item) => {

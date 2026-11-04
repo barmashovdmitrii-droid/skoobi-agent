@@ -4,7 +4,14 @@ import { readEnvFile } from '@skoobi/shared/env';
 
 // Панель живёт по правилам инстансов Скуби: state = cwd. Панель мониторит
 // тот инстанс, из чьей папки запущена (WorkingDirectory в launchd-плисте).
-export const STATE_ROOT = process.cwd();
+//
+// SKOOBI_TEST_STATE_ROOT — единственное исключение, ради того чтобы прогон
+// тестов не дописывал синтетику в боевой журнал действий панели
+//. Переменную выставляет только vitest.config.ts;
+// в проде её нет, поведение не меняется.
+export const STATE_ROOT = process.env.SKOOBI_TEST_STATE_ROOT
+  ? path.resolve(process.env.SKOOBI_TEST_STATE_ROOT)
+  : process.cwd();
 export const STORE_DIR = path.join(STATE_ROOT, 'store');
 export const LOG_FILE = path.join(STATE_ROOT, 'logs', 'claudeclaw.log');
 export const ACTIONS_LOG_FILE = path.join(

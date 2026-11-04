@@ -8,6 +8,7 @@ vi.mock('@skoobi/shared/env', () => ({
 
 const ENV_KEYS = [
   'ASSISTANT_NAME',
+  'ASSISTANT_HAS_OWN_NUMBER',
   'SKOOBI_WHATSAPP_STATE_ROOT',
   'SKOOBI_WHATSAPP_PERSONAL_OBSERVER_ENABLED',
   'SKOOBI_WHATSAPP_OWNER_FOLDER',
@@ -48,6 +49,22 @@ describe('WhatsApp personal observer config', () => {
     delete process.env.ASSISTANT_NAME;
     vi.resetModules();
     expect((await import('./channel-config.js')).ASSISTANT_NAME).toBe('Skoobi');
+  });
+
+  it('requires an explicit lowercase true for dedicated-number mode', async () => {
+    process.env.ASSISTANT_HAS_OWN_NUMBER = 'false';
+    vi.resetModules();
+    let config = await import('./channel-config.js');
+    expect(config.ASSISTANT_HAS_OWN_NUMBER).toBe(false);
+
+    process.env.ASSISTANT_HAS_OWN_NUMBER = 'TRUE';
+    vi.resetModules();
+    config = await import('./channel-config.js');
+    expect(config.ASSISTANT_HAS_OWN_NUMBER).toBe(false);
+    process.env.ASSISTANT_HAS_OWN_NUMBER = 'true';
+    vi.resetModules();
+    config = await import('./channel-config.js');
+    expect(config.ASSISTANT_HAS_OWN_NUMBER).toBe(true);
   });
 
   it('uses explicit state root and parses bounded observer settings', async () => {

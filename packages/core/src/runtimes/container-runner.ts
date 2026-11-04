@@ -3,6 +3,7 @@
  * Spawns agent execution in containers and handles IPC
  */
 import { ChildProcess, exec, spawn } from 'child_process';
+import { isolatedObserverForRun } from '../orchestrator/run-trust.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -16,6 +17,7 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
+  SKILLS_CURATOR_FOLDER,
   TIMEZONE,
 } from '../orchestrator/config.js';
 import {
@@ -123,10 +125,97 @@ export interface CodexRunnerInputConfig {
   fallbackModel?: string;
   reasoningEffort?: string;
   webSearchEnabled?: boolean;
-  /** Per-turn hard timeout inside the runner. */
+  /** Per-turn hard timeout (cap) inside the runner. */
   timeoutMs?: number;
+  /**
+   * Stop the turn after this long with no progress (no codex event, no
+   * rollout growth). Unset = only the hard cap applies.
+   */
+  inactivityTimeoutMs?: number;
+  /** The same limit while a command or tool is still running. */
+  inactivityInFlightTimeoutMs?: number;
   /** Images attached to the current turn (host paths readable in-sandbox). */
   imagePaths?: string[];
+  /**
+   * Codex's own sandbox for model-generated shell commands. Unset keeps the
+   * default full access; 'read-only' is used for a turn carrying forwarded or
+   * quoted foreign text (message-loop isIndirectOwnerContentBatch).
+   */
+  sandboxMode?: 'read-only';
+  /** OpenAI service tier; set only when the owner enabled the fast tier. */
+  serviceTier?: 'priority';
+  /** Above this share of the account limit the runner skips the fast tier. */
+  serviceTierMaxUsedPercent?: number;
+  /**
+   * The host's reading of the account limit at run start, across every
+   * CODEX_HOME on the machine (codexAccountUsedPercentAcrossHomes). The
+   * runner only sees its own group's rollouts, which go stale while the
+   * other chat burns the quota; it takes the larger of the two readings.
+   */
+  accountUsedPercent?: number | null;
+}
+
+/**
+ * What a codex turn ran with and did, as the runner saw it in the rollout
+ * (agent/runner codex-exec.ts CodexTurnTelemetry). Written next to the run
+ * in model_traces / session_finished; the INFO line per turn comes from it.
+ */
+export interface CodexTurnTelemetry {
+  /**
+   * Where `usage` comes from: 'turn_delta' — this turn's share of the
+   * thread totals; 'cumulative_first_turn' — a fresh or unreadable thread,
+   * the total as is; 'cumulative_counter_reset' — the thread counter went
+   * down, «after» as is.
+   */
+  usageSource?: 'turn_delta' | 'cumulative_first_turn' | 'cumulative_counter_reset';
+  /** Requests to the model (token_count events) this turn. */
+  modelRequests?: number;
+  /** The tier the runner asked for (null = the account default). */
+  requestedServiceTier?: 'priority' | null;
+  /** The tier codex applied (null = standard; undefined = not observed). */
+  serviceTier?: string | null;
+  reasoningEffort?: string | null;
+  /** Account limit used after the turn, %, max over the limit windows. */
+  accountUsedPercent?: number | null;
+  /** The fast tier was asked for but dropped for this turn by the ceiling. */
+  fastTierDroppedForQuota?: boolean;
+  /** Tool calls this turn: name → count (tools.<name>( in exec scripts). */
+  toolCalls?: Record<string, number>;
+  /** Tokens (input + output) of sub-agent threads, already in the usage. */
+  subagentTokens?: number;
+  /**
+   * Failed tool calls: name → count — «Script failed» results and MCP
+   * results with isError (agent/runner createCodexToolStats).
+   */
+  toolErrors?: Record<string, number>;
+  /** Shell commands that exited non-zero — for reference, not a failure. */
+  toolExitNonzero?: number;
+  /** «Wall time» of the turn's scripts and function calls: sum and longest, ms. */
+  toolWallMsTotal?: number;
+  toolWallMsMax?: number;
+  /** codex CLI version (rollout session_meta). */
+  codexCliVersion?: string;
+}
+
+/**
+ * Host grant for the runner's read-only chat_history MCP tool. Issued per run
+ * by the orchestrator (buildChatHistoryGrant) and only ever honoured for an
+ * owner-tier main run: restrictRuntimeInputToAuthorizedTier strips it
+ * everywhere else.
+ */
+export interface ChatHistoryRunGrant {
+  /** Absolute path of store/messages.db (opened read-only by the runner). */
+  dbPath: string;
+  /** Host TIMEZONE; the tool prints local times in it. */
+  timeZone: string;
+  /** 'whatsapp' = the owner's observed WhatsApp; 'bot' = chats with Skoobi. */
+  sources: Array<'whatsapp' | 'bot'>;
+  /** Skoobi chats the run may read; every bot query is limited to these. */
+  botChatJids: string[];
+  /** Bot chat JID → absolute group folder (base for its received/ files). */
+  mediaRoots: Record<string, string>;
+  /** Group folder whose received/ holds the WhatsApp observer's media. */
+  observerMediaRoot?: string;
 }
 
 export interface ContainerInput {
@@ -136,11 +225,19 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  /**
+   * Разрешение эмитить промежуточные реплики для ЭТОГО хода. Выдаётся хостом
+   * поштучно; по умолчанию отсутствует, и тогда раннер ведёт себя как раньше.
+   */
+  emitProgressMessages?: boolean;
   assistantName?: string;
   agentConfig?: import('../orchestrator/types.js').AgentConfig;
   tenantId?: string;
   /** Host-derived authorization tier for credential-proxy availability. */
   credentialProxyTier?: 'owner' | 'guest';
+
+
+  runTrust?: import('../orchestrator/run-trust.js').RunTrust;
   senderIdentity?: SenderIdentity;
   /** Host-issued bearer scoped to this exact run identity (not a signing key). */
   memoryWriteCapability?: string;
@@ -165,6 +262,8 @@ export interface ContainerInput {
     columnCount: number;
     maxRowsPerCall: number;
   }>;
+  /** Read-only chat history grant; owner-tier main runs only. */
+  chatHistory?: ChatHistoryRunGrant;
   /**
    * LLM backend for this run. Default 'claude_sdk'. 'codex_cli' runs the same
    * workspace/tools/memory through the Codex CLI (reserve fallback when the
@@ -173,6 +272,36 @@ export interface ContainerInput {
   provider?: 'claude_sdk' | 'codex_cli';
   /** Required when provider === 'codex_cli'. */
   codex?: CodexRunnerInputConfig;
+  /**
+   * The owner's own batch that carries forwarded/quoted foreign text. The run
+   * keeps the owner tier without a direct sender identity, in read-only mode
+   * (codex.sandboxMode, quarantined tools) — see restrictRuntimeInputToAuthorizedTier.
+   */
+  indirectOwnerContent?: boolean;
+  /**
+   * The host folds piped follow-ups the runner absorbs into its cursor, so
+   * the runner may restart a turn that is still only thinking with them.
+   */
+  allowFollowUpSupersede?: boolean;
+  /**
+   * Host-enabled processing of pending corrections before final delivery.
+   * The normal follow-up path retains those inputs until delivery is
+   * acknowledged.
+   */
+  finalizeHold?: boolean;
+  /**
+   * Проверка ссылок финального ответа перед отправкой. Выдаётся хостом
+   * поштучно: только ходам владельца на основном пути Codex и только там, где
+   * у раннера прямая сеть (sandbox-runner снимает её с песочницы).
+   */
+  linkCheck?: LinkCheckRunConfig;
+}
+
+export interface LinkCheckRunConfig {
+  /** shadow — только замер; mark — пометка мёртвых; fix — один ход-исправление. */
+  mode: 'shadow' | 'mark' | 'fix';
+  /** Усилие хода-исправления; нет поля — усилие самого хода. */
+  fixReasoningEffort?: string;
 }
 
 export interface ContainerOutput {
@@ -180,6 +309,27 @@ export interface ContainerOutput {
   // refresh watchdogs on it but must not treat it as delivered output.
   status: 'success' | 'error' | 'heartbeat';
   result: string | null;
+  /**
+   * Промежуточная реплика модели ВНУТРИ хода. Это НЕ результат: курсор она не
+   * двигает, ответом не считается, в messages не пишется.
+   *
+   * Едет строго на кадре heartbeat и строго в этом поле, никогда в result:
+   * планировщик задач роутит любой непустой result в тред задачи как результат
+   * прогона и закрывает stdin, то есть задача оборвалась бы на первой же фразе
+   * модели и была бы помечена успешной.
+   */
+  progressText?: string;
+  /**
+   * Heartbeat only: the runner folded this many piped follow-up messages into
+   * the turn it is running (it restarted a turn that was still only thinking),
+   * so the coming answer covers them too — see message-loop onFollowUpsAbsorbed.
+   */
+  absorbedFollowUps?: number;
+  /**
+   * Heartbeat only: the runner took this many piped batches as a turn of
+   * their own (keeps the host's list of piped batches in step).
+   */
+  consumedFollowUps?: number;
   newSessionId?: string;
   error?: string;
   usage?: {
@@ -207,6 +357,52 @@ export interface ContainerOutput {
   sideEffected?: boolean;
   /** Exact side-effecting tool names observed by a supporting runner. */
   sideEffectTools?: string[];
+  /** Success/error frames of a codex run: what the turn ran with and did. */
+  codexTurn?: CodexTurnTelemetry;
+  /**
+   * Heartbeat only: the provider answered in this run (codex's first
+   * completed item). A half-open breaker probe settles on it.
+   */
+  providerResponded?: boolean;
+  /**
+   * Heartbeat only: the runner dropped the chat's codex thread before this
+   * turn and starts a fresh one.
+   */
+  threadRotated?: {
+    reason: string;
+    threadId: string;
+    rolloutBytes?: number;
+  };
+  /**
+   * Heartbeat only: the runner stopped a turn that was still only thinking
+   * because newer messages arrived, and restarts it with them (one answer to
+   * a burst). The runner's stderr is kept only for failed runs, so this is
+   * the host's only trace of it — recorded as a supersede_restart event.
+   */
+  supersedeRestart?: {
+    /** 1-based count of restarts within this user turn. */
+    restart: number;
+    /** Piped files folded into the restarted turn. */
+    newerMessages: number;
+    /** Age of the user turn when the restart happened. */
+    turnAgeMs: number;
+    /** The restart continues the chat thread (it holds the earlier messages). */
+    threadHeld: boolean;
+  };
+  /**
+   * Heartbeat only: messages were waiting when the answer was ready, and
+   * what the runner's finalize hold did with them. Runner-produced, so the
+   * host records it through finalizeHoldEventPayload, never as is.
+   */
+  finalizeHold?: Record<string, unknown>;
+  /** Deferred IPC checkpoints covered by this final; host removes after delivery. */
+  finalizedInputFiles?: string[];
+  /**
+   * Success frame only: the runner's link-check summary (counts, hosts of dead
+   * links). Runner-produced, so the host records it through
+   * linkCheckEventPayload, never as is.
+   */
+  linkCheck?: Record<string, unknown>;
 }
 
 /** Redact credential material before it reaches persistent/runtime logs. */
@@ -362,31 +558,54 @@ function redactContainerOutput(
  * tier is host-derived for the concrete batch and therefore supplies the
  * missing per-run authorization bit.
  *
- * Scheduled tasks currently carry no durable owner provenance and deliberately
- * arrive as guest-tier. They stay sandboxed until that provenance exists.
+ * A scheduled task arrives owner-tier only when the scheduler re-proved its
+ * stored owner provenance (task-scheduler.ts); it then keeps its task
+ * capability and Google tool list like a direct owner turn, but never the
+ * chat history. Every other scheduled row arrives guest-tier and loses both.
  */
 export function restrictRuntimeInputToAuthorizedTier(
   input: ContainerInput,
 ): ContainerInput {
   const telegramRun = String(input.chatJid).startsWith('tg:');
-  const restrictedWhatsAppObserverRuntime =
-    input.isMain === true &&
-    input.agentConfig?.whatsappObserverAccess === true &&
-    String(input.chatJid).endsWith('@s.whatsapp.net');
+  // Решение хоста, если оно есть; пересчёт — только запасной путь.
+  const restrictedWhatsAppObserverRuntime = isolatedObserverForRun(
+    input.runTrust,
+    {
+      groupIsMain: input.isMain === true,
+      chatJid: input.chatJid,
+      whatsappObserverAccess: input.agentConfig?.whatsappObserverAccess,
+    },
+  );
   const directSenderIdentity =
     !telegramRun || input.senderIdentity?.telegram_message_origin === 'direct'
       ? input.senderIdentity
       : undefined;
+  // A forwarded/quoted batch has no direct sender identity, but when the host
+  // proved every message is the owner's and pinned the turn read-only
+  // (quarantine + Codex read-only sandbox), it still runs as the owner instead
+  // of being refused as a guest.
+  const readOnlyIndirectOwner =
+    telegramRun &&
+    input.indirectOwnerContent === true &&
+    input.runTrust?.untrustedContentAttached === true &&
+    input.provider === 'codex_cli' &&
+    input.codex?.sandboxMode === 'read-only';
   const trustedOwner =
     input.isMain === true &&
     input.credentialProxyTier === 'owner' &&
     !restrictedWhatsAppObserverRuntime &&
-    (!telegramRun || directSenderIdentity !== undefined);
+    (!telegramRun || directSenderIdentity !== undefined || readOnlyIndirectOwner);
   if (trustedOwner) {
     return {
       ...input,
       senderIdentity: directSenderIdentity,
       sessionId: safeRuntimeSessionIdOrUndefined(input.sessionId),
+      // Chat history is for the owner's own direct turns: never for a
+      // scheduled task or a forwarded/quoted batch, even at owner tier.
+      chatHistory:
+        input.isScheduledTask === true || input.indirectOwnerContent === true
+          ? undefined
+          : input.chatHistory,
     };
   }
 
@@ -412,6 +631,9 @@ export function restrictRuntimeInputToAuthorizedTier(
     codexControlRunId: undefined,
     googleAllowedTools: undefined,
     googleSheetTargetHints: undefined,
+    chatHistory: undefined,
+    // A guest-tier run never fetches model-made URLs from the host.
+    linkCheck: undefined,
     ...(restrictedWhatsAppObserverRuntime
       ? {
           memoryWriteCapability: undefined,
@@ -727,10 +949,15 @@ export function buildVolumeMounts(
   // co-member message in the main group remains read-only here too.
   const skillsDir = path.join(DATA_DIR, 'skills');
   fs.mkdirSync(path.join(skillsDir, '.proposals'), { recursive: true });
+
+  // runtimes deliberately — a guard that exists in only one of them is how
+
   mounts.push({
     hostPath: skillsDir,
     containerPath: '/workspace/skills',
-    readonly: !trustedOwner,
+    readonly: !(SKILLS_CURATOR_FOLDER
+      ? trustedOwner && group.folder === SKILLS_CURATOR_FOLDER
+      : trustedOwner),
   });
 
   // Per-group Claude sessions directory (isolated from other groups)

@@ -38,9 +38,13 @@ import {
   type WhatsAppPersonalObserverConfig,
 } from './channel-config.js';
 import { secureAuthDirectory } from './auth-storage.js';
-import { installBaileysConsolePrivacyGuard } from './baileys-log-privacy.js';
+import {
+  installBaileysConsolePrivacyGuard,
+  summarizeBaileysLogCall,
+} from './baileys-log-privacy.js';
 import { CredentialSaveBarrier } from './whatsapp-auth-flow.js';
 import {
+  OBSERVER_MEDIA_RETRY_EXHAUSTED,
   ObserverMediaQueue,
   type ObserverMediaQueueLifecycleEvent,
 } from './observer-media-queue.js';
@@ -52,6 +56,7 @@ import { extractDocumentTextLocally } from './local-document.js';
 import {
   downloadWhatsappMedia,
   type WhatsappMediaAdmission,
+  type WhatsappMediaDownloadContext,
   type WhatsappMediaKind,
 } from './whatsapp-media.js';
 import { processDownloadedWhatsappVideo } from './whatsapp-video.js';
@@ -59,7 +64,13 @@ import { processDownloadedWhatsappVideo } from './whatsapp-video.js';
 installBaileysConsolePrivacyGuard();
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
-const RECONNECT_DELAY_MS = 1_000;
+// Exponential backoff bounds reconnect work during network outages. Jitter
+// spreads attempts from several instances sharing an uplink.
+const RECONNECT_BASE_DELAY_MS = 1_000;
+const RECONNECT_MAX_DELAY_MS = 30_000;
+const RECONNECT_JITTER_MS = 500;
+const RECONNECT_LOG_EVERY_N_ATTEMPTS = 10;
+const RECONNECT_ALWAYS_LOG_ATTEMPTS = 3;
 const OBSERVER_MEDIA_BACKFILL_MESSAGE_COUNT = 32;
 const OBSERVER_MEDIA_BACKFILL_INITIAL_DELAY_MS = 2_000;
 const OBSERVER_MEDIA_BACKFILL_MATCHED_DELAY_MS = 15_000;
@@ -73,9 +84,76 @@ const OBSERVER_MEDIA_BACKFILL_PROGRESS_VERSION = 1 as const;
 const OBSERVER_MEDIA_BACKFILL_DEFAULT_MAX_VISITED_CHATS = 50_000;
 const OBSERVER_MEDIA_BACKFILL_ABSOLUTE_MAX_VISITED_CHATS = 1_000_000;
 const MAX_SAFE_TIMEOUT_MS = 2_147_483_647;
+const WHATSAPP_BOT_TEXT_PREFIX = `[${ASSISTANT_NAME}] 🧊 `;
 // Baileys proto.HistorySync.HistorySyncType.ON_DEMAND. Keep this local so the
 // transport enum is not pulled into observer policy code at runtime.
 const WHATSAPP_HISTORY_SYNC_ON_DEMAND = 6;
+
+/**
+ * Delay before reconnect attempt `attempt` (1-based): 1 s, 2 s, 4 s, ... up to
+ * the 30 s ceiling, plus up to 500 ms of jitter. The counter resets on a
+ * successful `open`, so the first attempt after any healthy session is again
+ * immediate (`restartRequired` after a stream error stays a 1 s restart).
+ */
+export function reconnectDelayMs(
+  attempt: number,
+  random: () => number = Math.random,
+): number {
+  const exponent = Math.max(0, Math.min(30, Math.floor(attempt) - 1));
+  const base = Math.min(
+    RECONNECT_MAX_DELAY_MS,
+    RECONNECT_BASE_DELAY_MS * 2 ** exponent,
+  );
+  const jitterSource = Number(random());
+  const jitter = Number.isFinite(jitterSource)
+    ? Math.floor(Math.min(1, Math.max(0, jitterSource)) * RECONNECT_JITTER_MS)
+    : 0;
+  return base + jitter;
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(value, (_key, inner: unknown) =>
+    inner && typeof inner === 'object' && !Array.isArray(inner)
+      ? Object.fromEntries(
+          Object.keys(inner as Record<string, unknown>)
+            .sort()
+            .map((key) => [key, (inner as Record<string, unknown>)[key]]),
+        )
+      : inner,
+  );
+}
+
+/**
+ * True when re-registering `next` over `existing` would change nothing but
+ * `added_at`. The host registry row is compared the way it survives a
+ * database round trip: `undefined` config fields are dropped (JSON), the
+ * trigger requirement defaults to true, and extra host-only fields are
+ * ignored. Reconnecting must preserve unchanged self-chat registration.
+ */
+export function personalGroupRegistrationMatches(
+  existing: WhatsAppRegisteredGroup,
+  next: WhatsAppRegisteredGroup,
+): boolean {
+  const view = (group: WhatsAppRegisteredGroup) =>
+    canonicalJson({
+      name: group.name,
+      folder: group.folder,
+      trigger: group.trigger,
+      requiresTrigger: group.requiresTrigger ?? true,
+      isMain: group.isMain === true,
+      runtime: group.runtime || null,
+      agentConfig: group.agentConfig ?? null,
+    });
+  return view(existing) === view(next);
+}
+
+/** Log the first three attempts of a reconnect series, then every tenth. */
+export function shouldLogReconnectAttempt(attempt: number): boolean {
+  return (
+    attempt <= RECONNECT_ALWAYS_LOG_ATTEMPTS ||
+    attempt % RECONNECT_LOG_EVERY_N_ATTEMPTS === 0
+  );
+}
 
 // --- Структурный view-тип ядра (пакет не импортирует root src) ---
 // Ядровый RegisteredGroup структурно шире этого view; обвязка
@@ -195,6 +273,8 @@ export interface WhatsAppChannelHost {
     timestamp: string;
     fromMe: boolean;
   }[];
+  /** Observer media rows still without local content (media_enriched = 0). */
+  countObservedMediaGaps?(): number;
   getObservedMediaBackfillProgress?():
     | WhatsAppObserverMediaBackfillProgress
     | undefined;
@@ -223,7 +303,14 @@ interface ObserverMediaEnrichmentJob {
   message: WAMessage;
   kind: ObserverEnrichmentKind;
   caption: string;
+  source: 'live' | 'history';
 }
+
+type ObserverEnrichmentOutcome =
+  | { kind: 'content'; content: string }
+  /** Download failed on the network while the live URL is fresh: retry once. */
+  | { kind: 'retry' }
+  | { kind: 'none' };
 
 type ObserverHistoryBackfillResult =
   | 'matched'
@@ -370,7 +457,9 @@ function safeObserverHistoryTimerDelay(delayMs: number): number {
 /**
  * Baileys logs authenticated phone/LID values at info and may embed JIDs in
  * warning objects. Give it a deliberately metadata-free warn/error adapter;
- * the channel emits its own bounded operational metrics separately.
+ * the channel emits its own bounded operational metrics separately. Only
+ * the redacted message text and the error's name and status code pass
+ * (summarizeBaileysLogCall), never the objects.
  */
 function createBaileysPrivateLogger(): {
   level: string;
@@ -388,12 +477,21 @@ function createBaileysPrivateLogger(): {
     trace: (..._args: unknown[]) => undefined,
     debug: (..._args: unknown[]) => undefined,
     info: (..._args: unknown[]) => undefined,
-    warn: (..._args: unknown[]) =>
-      logger.warn({ source: 'baileys' }, 'WhatsApp transport warning'),
-    error: (..._args: unknown[]) =>
-      logger.error({ source: 'baileys' }, 'WhatsApp transport error'),
-    fatal: (..._args: unknown[]) =>
-      logger.error({ source: 'baileys' }, 'WhatsApp transport fatal error'),
+    warn: (...args: unknown[]) =>
+      logger.warn(
+        { source: 'baileys', ...summarizeBaileysLogCall(args) },
+        'WhatsApp transport warning',
+      ),
+    error: (...args: unknown[]) =>
+      logger.error(
+        { source: 'baileys', ...summarizeBaileysLogCall(args) },
+        'WhatsApp transport error',
+      ),
+    fatal: (...args: unknown[]) =>
+      logger.error(
+        { source: 'baileys', ...summarizeBaileysLogCall(args) },
+        'WhatsApp transport fatal error',
+      ),
   };
   return privateLogger;
 }
@@ -409,20 +507,25 @@ export class WhatsAppChannel implements Channel {
 
   private sock!: WASocket;
   private connected = false;
+  /** Chats with a reply being composed right now — the only time we go online. */
+  private typingJids = new Set<string>();
   private lidToPhoneMap: Record<string, string> = {};
   private groupSyncTimerStarted = false;
   private groupSyncTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Consecutive reconnect attempts since the last successful open. */
+  private reconnectAttempt = 0;
   private socketGeneration = 0;
   private stopping = false;
   private selfChatJid: string | null = null;
   /**
-   * Baileys can replay initial self-chat history as `messages.upsert: notify`.
-   * Type alone is therefore not a live-message boundary.  This per-socket
-   * cutoff is armed only after `connection=open`; self-chat notifications
-   * without a valid timestamp, or older than the current socket, fail closed.
+   * Baileys can replay initial history as `messages.upsert: notify`. Type alone
+   * is therefore not a live-message boundary. This per-socket cutoff is armed
+   * only after `connection=open`; notifications without a valid timestamp, or
+   * older than the current socket, fail closed for self-chat
+   * ingress decisions.
    */
-  private selfChatLiveSinceEpochSeconds: number | null = null;
+  private connectionOpenEpochSeconds: number | null = null;
   private personalGroup: WhatsAppRegisteredGroup | null = null;
   private observerHistoryBackfillTimer: ReturnType<typeof setTimeout> | null =
     null;
@@ -450,6 +553,28 @@ export class WhatsAppChannel implements Channel {
     const queueLifecycle =
       (lane: 'audio' | 'visual') =>
       (event: ObserverMediaQueueLifecycleEvent) => {
+        if (event.phase === 'retry_scheduled') {
+          logger.info(
+            {
+              lane,
+              priority: event.priority,
+              retryDelayMs: event.retryDelayMs,
+            },
+            'WhatsApp observer media download will be retried once',
+          );
+          return;
+        }
+        if (
+          event.phase === 'failed' &&
+          event.errorKind === OBSERVER_MEDIA_RETRY_EXHAUSTED
+        ) {
+          // The download itself already logged its own failure line.
+          logger.info(
+            { lane, priority: event.priority },
+            'WhatsApp observer media retry failed; left as a gap for history backfill',
+          );
+          return;
+        }
         if (
           event.phase === 'failed' ||
           (event.phase === 'rejected' && event.rejectionReason === 'full')
@@ -495,7 +620,7 @@ export class WhatsAppChannel implements Channel {
     if (this.stopping) return;
     const generation = ++this.socketGeneration;
     if (this.personalObserver.enabled) {
-      this.selfChatLiveSinceEpochSeconds = null;
+      this.connectionOpenEpochSeconds = null;
     }
     const isCurrent = (): boolean =>
       !this.stopping && generation === this.socketGeneration;
@@ -523,6 +648,11 @@ export class WhatsAppChannel implements Channel {
       printQRInTerminal: false,
       logger: baileysLogger as never,
       browser: Browsers.macOS('Clawdio'),
+      // This is the owner's personal account. While a linked client shows as
+      // online, WhatsApp stops pushing notifications to the phone, and the
+      // owner may miss messages. With this off,
+      // Baileys announces 'unavailable' on every connect.
+      markOnlineOnConnect: false,
     });
     this.sock = socket;
     const credentialSaves = new CredentialSaveBarrier();
@@ -545,7 +675,7 @@ export class WhatsAppChannel implements Channel {
 
       if (connection === 'close') {
         this.connected = false;
-        this.selfChatLiveSinceEpochSeconds = null;
+        this.connectionOpenEpochSeconds = null;
         this.cancelObserverHistoryBackfill();
         const reason = (
           lastDisconnect?.error as { output?: { statusCode?: number } }
@@ -560,10 +690,18 @@ export class WhatsAppChannel implements Channel {
         );
 
         if (shouldReconnect) {
-          logger.info('Reconnecting after credential state is durable...');
+          this.reconnectAttempt += 1;
+          const attempt = this.reconnectAttempt;
+          const delayMs = reconnectDelayMs(attempt);
+          if (shouldLogReconnectAttempt(attempt)) {
+            logger.info(
+              { attempt, delayMs },
+              'Reconnecting after credential state is durable...',
+            );
+          }
           void credentialSaves
             .drain()
-            .then(() => this.scheduleReconnect())
+            .then(() => this.scheduleReconnect(delayMs))
             .catch((err) => {
               logger.error(
                 { errorKind: errorLogKind(err) },
@@ -585,15 +723,16 @@ export class WhatsAppChannel implements Channel {
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
         this.reconnectTimer = null;
         this.connected = true;
+        this.reconnectAttempt = 0;
+        if (this.personalObserver.enabled) {
+          this.connectionOpenEpochSeconds = openedAtEpochSeconds;
+        }
         logger.info('Connected to WhatsApp');
 
-        // Announce availability so WhatsApp relays subsequent presence updates (typing indicators)
-        socket.sendPresenceUpdate('available').catch((err) => {
-          logger.warn(
-            { errorKind: errorLogKind(err) },
-            'Failed to send presence update',
-          );
-        });
+        // Stay offline to WhatsApp between replies (markOnlineOnConnect:false
+        // above); setTyping goes online only while a reply is being composed.
+        // A new socket starts with nobody typing.
+        this.typingJids.clear();
 
         // Build LID to phone mapping from auth state for self-chat translation
         if (socket.user) {
@@ -612,9 +751,6 @@ export class WhatsAppChannel implements Channel {
           }
           if (this.personalObserver.enabled) {
             this.configurePersonalSelfChat(phoneJid);
-            this.selfChatLiveSinceEpochSeconds = this.selfChatJid
-              ? openedAtEpochSeconds
-              : null;
             this.scheduleObserverHistoryBackfill(socket, isCurrent);
           }
         }
@@ -690,7 +826,10 @@ export class WhatsAppChannel implements Channel {
     });
 
     let processMessagesUpsert:
-      | ((upsert: BaileysEventMap['messages.upsert']) => Promise<void>)
+      | ((
+          upsert: BaileysEventMap['messages.upsert'],
+          source?: ObserverMediaEnrichmentJob['source'],
+        ) => Promise<void>)
       | undefined;
 
     socket.ev.on('messaging-history.set', (history) => {
@@ -709,10 +848,13 @@ export class WhatsAppChannel implements Channel {
           // History is deliberately re-used only as a passive append batch.
           // Calling the shared handler directly lets the backfill waiter
           // observe when every bounded queue admission has completed.
-          await processMessagesUpsert({
-            messages: history.messages,
-            type: 'append',
-          });
+          await processMessagesUpsert(
+            {
+              messages: history.messages,
+              type: 'append',
+            },
+            'history',
+          );
         }
       })();
       this.observeHistoryBackfillChunk(socket, history, processing);
@@ -724,7 +866,7 @@ export class WhatsAppChannel implements Channel {
       });
     });
 
-    processMessagesUpsert = async ({ messages, type }) => {
+    processMessagesUpsert = async ({ messages, type }, source = 'live') => {
       if (!isCurrent() || this.sock !== socket) return;
       const eventType: WhatsAppObservedEventType =
         type === 'notify' ? 'notify' : 'append';
@@ -807,6 +949,7 @@ export class WhatsAppChannel implements Channel {
                   message: normalizedMsg,
                   kind: media.kind,
                   caption: media.caption,
+                  source,
                 });
               }
             }
@@ -843,6 +986,7 @@ export class WhatsAppChannel implements Channel {
                     message: normalizedMsg,
                     kind: media.kind,
                     caption: media.caption,
+                    source,
                   });
                 }
               }
@@ -1006,7 +1150,7 @@ export class WhatsAppChannel implements Channel {
     pending?.resolve();
   }
 
-  private scheduleReconnect(delayMs = RECONNECT_DELAY_MS): void {
+  private scheduleReconnect(delayMs = RECONNECT_BASE_DELAY_MS): void {
     if (this.stopping || this.reconnectTimer) return;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
@@ -1016,7 +1160,13 @@ export class WhatsAppChannel implements Channel {
           { errorKind: errorLogKind(err) },
           'WhatsApp reconnect attempt failed',
         );
-        this.scheduleReconnect(5_000);
+        // A socket that could not even be created counts as a failed attempt
+        // of the same series: never retry faster than 5 s, and keep backing
+        // off while the failures continue.
+        this.reconnectAttempt += 1;
+        this.scheduleReconnect(
+          Math.max(5_000, reconnectDelayMs(this.reconnectAttempt)),
+        );
       });
     }, delayMs);
   }
@@ -1648,7 +1798,8 @@ export class WhatsAppChannel implements Channel {
     }
 
     this.selfChatJid = phoneJid;
-    const groups = Object.values(this.opts.registeredGroups());
+    const registry = this.opts.registeredGroups();
+    const groups = Object.values(registry);
     const configuredTemplate = this.personalObserver.templateGroupFolder;
     const templateMatches = configuredTemplate
       ? groups.filter((group) => group.folder === configuredTemplate)
@@ -1699,11 +1850,17 @@ export class WhatsAppChannel implements Channel {
       whatsappObserverAccess: true,
     };
 
+      // Re-register only when configuration differs from the stored row;
+      // reconnects must preserve the original registration timestamp.
+    const existing =
+      registry[phoneJid]?.folder === this.personalObserver.ownerFolder
+        ? registry[phoneJid]
+        : undefined;
     this.personalGroup = {
       name: `${ASSISTANT_NAME} WhatsApp`,
       folder: this.personalObserver.ownerFolder,
       trigger: '',
-      added_at: new Date().toISOString(),
+      added_at: existing?.added_at || new Date().toISOString(),
       requiresTrigger: false,
       isMain: true,
       // Tenant resolution is Telegram-only. On a Codex-primary instance a
@@ -1713,7 +1870,12 @@ export class WhatsAppChannel implements Channel {
       agentConfig,
     };
 
-    if (this.opts.registerGroup) {
+    if (
+      existing &&
+      personalGroupRegistrationMatches(existing, this.personalGroup)
+    ) {
+      logger.debug('WhatsApp personal self-chat registration unchanged');
+    } else if (this.opts.registerGroup) {
       this.opts.registerGroup(phoneJid, this.personalGroup);
     } else {
       logger.warn(
@@ -1746,7 +1908,7 @@ export class WhatsAppChannel implements Channel {
   }
 
   private isFreshPersonalSelfChatNotification(msg: WAMessage): boolean {
-    const cutoff = this.selfChatLiveSinceEpochSeconds;
+    const cutoff = this.connectionOpenEpochSeconds;
     const timestamp = this.messageEpochSeconds(msg);
     return cutoff !== null && timestamp !== null && timestamp >= cutoff;
   }
@@ -1850,12 +2012,13 @@ export class WhatsAppChannel implements Channel {
         priority: job.observation.eventType,
         run: async (jobSignal) => {
           if (jobSignal.aborted) return;
-          const content = await this.enrichObservedMedia(job, jobSignal);
-          if (!content || jobSignal.aborted) return;
+          const outcome = await this.enrichObservedMedia(job, jobSignal);
+          if (jobSignal.aborted || outcome.kind === 'none') return;
+          if (outcome.kind === 'retry') return 'retry';
           this.deliverThirdPartyObservations([
             {
               ...job.observation,
-              content: content.slice(0, 24_000),
+              content: outcome.content.slice(0, 24_000),
               mediaEnriched: true,
             },
           ]);
@@ -1869,18 +2032,44 @@ export class WhatsAppChannel implements Channel {
   private async enrichObservedMedia(
     job: ObserverMediaEnrichmentJob,
     signal: AbortSignal,
-  ): Promise<string> {
+  ): Promise<ObserverEnrichmentOutcome> {
+    const content = await this.enrichObservedMediaContent(job, signal);
+    return content.kind === 'content' && !content.content
+      ? { kind: 'none' }
+      : content;
+  }
+
+  private async enrichObservedMediaContent(
+    job: ObserverMediaEnrichmentJob,
+    signal: AbortSignal,
+  ): Promise<ObserverEnrichmentOutcome> {
     const admission: WhatsappMediaAdmission = {
       tier: 'guest',
       tenantId: this.personalObserver.ownerFolder,
+    };
+    let transientFailure = false;
+    const context: WhatsappMediaDownloadContext = {
+      source: job.source,
+      observer: true,
+      onFailure: (failure) => {
+        transientFailure = failure.transient;
+      },
     };
     const downloaded = await downloadWhatsappMedia(
       job.message,
       this.personalObserver.ownerFolder,
       job.kind,
       admission,
+      context,
     );
-    if (!downloaded || signal.aborted) return '';
+    if (!downloaded) {
+      // Only a live notification still has a fresh CDN URL worth one retry
+      // (30–60 s, ObserverMediaQueue). History pages are re-swept anyway.
+      return transientFailure && job.source === 'live' && !signal.aborted
+        ? { kind: 'retry' }
+        : { kind: 'none' };
+    }
+    if (signal.aborted) return { kind: 'none' };
 
     if (job.kind === 'voice' || job.kind === 'audio') {
       const transcript = await transcribeAudioFile(downloaded.path).catch(
@@ -1898,9 +2087,12 @@ export class WhatsAppChannel implements Channel {
         },
       );
       const label = job.kind === 'voice' ? 'Голосовое' : 'Аудио';
-      return transcript?.trim()
-        ? `[${label} WhatsApp. Локальная расшифровка: ${transcript.trim()}]`
-        : `[${label} WhatsApp. Локальная расшифровка не получена]`;
+      return {
+        kind: 'content',
+        content: transcript?.trim()
+          ? `[${label} WhatsApp. Локальная расшифровка: ${transcript.trim()}]`
+          : `[${label} WhatsApp. Локальная расшифровка не получена]`,
+      };
     }
 
     if (job.kind === 'document') {
@@ -1925,7 +2117,7 @@ export class WhatsAppChannel implements Channel {
       if (extractedText) {
         parts.push(`Локально извлечённый текст: ${extractedText}`);
       }
-      return `[${parts.join('. ')}]`;
+      return { kind: 'content', content: `[${parts.join('. ')}]` };
     }
 
     if (job.kind === 'image') {
@@ -1949,7 +2141,7 @@ export class WhatsAppChannel implements Channel {
       if (job.caption.trim()) parts.push(`Подпись: ${job.caption.trim()}`);
       const visual = formatLocalVisualDescription(localDescription);
       if (visual) parts.push(`Локальный анализ: ${visual}`);
-      return `[${parts.join('. ')}]`;
+      return { kind: 'content', content: `[${parts.join('. ')}]` };
     }
 
     const analysis = await processDownloadedWhatsappVideo(downloaded.path);
@@ -1997,7 +2189,7 @@ export class WhatsAppChannel implements Channel {
     if (analysis.skippedReason) {
       parts.push(`Часть анализа пропущена: ${analysis.skippedReason}`);
     }
-    return `[${parts.join('. ')}]`;
+    return { kind: 'content', content: `[${parts.join('. ')}]` };
   }
 
   private buildThirdPartyObservation(input: {
@@ -2144,7 +2336,7 @@ export class WhatsAppChannel implements Channel {
     // Skip only when the assistant has its own dedicated phone number.
     const prefixed = ASSISTANT_HAS_OWN_NUMBER
       ? text
-      : `[${ASSISTANT_NAME}] 🧊 ${text}`;
+      : `${WHATSAPP_BOT_TEXT_PREFIX}${text}`;
 
     if (!this.connected) {
       logger.warn(
@@ -2177,6 +2369,7 @@ export class WhatsAppChannel implements Channel {
 
   ownsJid(jid: string): boolean {
     if (this.personalObserver.enabled) {
+      // Other chats are passive observer data, never outbound destinations.
       return !!this.selfChatJid && normalizePhoneJid(jid) === this.selfChatJid;
     }
     return jid.endsWith('@g.us') || jid.endsWith('@s.whatsapp.net');
@@ -2186,7 +2379,7 @@ export class WhatsAppChannel implements Channel {
     this.stopping = true;
     this.socketGeneration += 1;
     this.connected = false;
-    this.selfChatLiveSinceEpochSeconds = null;
+    this.connectionOpenEpochSeconds = null;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.cancelObserverHistoryBackfill();
@@ -2208,7 +2401,24 @@ export class WhatsAppChannel implements Channel {
         { jidHash: jidLogRef(jid), status },
         'Sending presence update',
       );
-      await this.sock.sendPresenceUpdate(status, jid);
+      // Online only for the duration of a reply: a typing indicator needs an
+      // available client, but staying available mutes the owner's phone.
+      if (isTyping) {
+        const wasIdle = this.typingJids.size === 0;
+        this.typingJids.add(jid);
+        if (wasIdle) await this.sock.sendPresenceUpdate('available');
+        await this.sock.sendPresenceUpdate(status, jid);
+      } else {
+        // Leave the set first, so a failed 'paused' cannot pin us online.
+        const wasTyping = this.typingJids.delete(jid);
+        try {
+          await this.sock.sendPresenceUpdate(status, jid);
+        } finally {
+          if (wasTyping && this.typingJids.size === 0) {
+            await this.sock.sendPresenceUpdate('unavailable');
+          }
+        }
+      }
     } catch (err) {
       logger.debug(
         { jidHash: jidLogRef(jid), errorKind: errorLogKind(err) },

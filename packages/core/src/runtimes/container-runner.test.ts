@@ -18,6 +18,9 @@ vi.mock('../orchestrator/config.js', () => ({
   DATA_DIR: '/tmp/claudeclaw-test-data',
   GROUPS_DIR: '/tmp/claudeclaw-test-groups',
   IDLE_TIMEOUT: 1800000, // 30min
+  // Empty = legacy behaviour (any trusted-owner group may curate skills), which
+  // is what the existing mount assertions below were written against.
+  SKILLS_CURATOR_FOLDER: '',
   TIMEZONE: 'America/Los_Angeles',
 }));
 
@@ -723,6 +726,149 @@ describe('received-media runtime isolation', () => {
     expect(restricted.googleSheetTargetHints).toBeUndefined();
   });
 
+  it('keeps the Google tool list for an owner-tier scheduled task, strips it for any guest-tier one', () => {
+    const googleSheetTargetHints = [
+      {
+        label: 'тестовая сотрудница',
+        spreadsheetId: 'public-fixture-resource-0002',
+        range: "'Лист1'!A47:G1000",
+        columnCount: 7,
+        maxRowsPerCall: 1,
+      },
+    ];
+    // The shape task-scheduler.ts hands an owner-created task in a main chat.
+    const scheduledOwner = {
+      ...testInput,
+      chatJid: 'tg:100000001',
+      isMain: true,
+      isScheduledTask: true,
+      credentialProxyTier: 'owner' as const,
+      senderIdentity: {
+        channel: 'telegram' as const,
+        chat_id: '100000001',
+        telegram_user_id: '100000001',
+        identity_id: 'telegram_user_100000001',
+        is_owner_sender: true,
+        telegram_message_origin: 'direct' as const,
+      },
+      taskAuthorizationCapability: 'capability-id.capability-secret',
+      googleAllowedTools: ['google_sheets_get_values', 'google_sheets_update_values'],
+      googleSheetTargetHints,
+      provider: 'codex_cli' as const,
+      codex: { command: 'codex', model: 'm' },
+    };
+    const kept = restrictRuntimeInputToAuthorizedTier(scheduledOwner);
+    expect(kept).toMatchObject({
+      isMain: true,
+      credentialProxyTier: 'owner',
+      taskAuthorizationCapability: 'capability-id.capability-secret',
+      googleAllowedTools: [
+        'google_sheets_get_values',
+        'google_sheets_update_values',
+      ],
+      googleSheetTargetHints,
+    });
+    expect(kept.chatHistory).toBeUndefined();
+
+    // A legacy/co-member row, and an owner row whose chat is not main.
+    for (const guestRun of [
+      { ...scheduledOwner, credentialProxyTier: 'guest' as const },
+      { ...scheduledOwner, isMain: false },
+    ]) {
+      const restricted = restrictRuntimeInputToAuthorizedTier(guestRun);
+      expect(restricted.credentialProxyTier).toBe('guest');
+      expect(restricted.taskAuthorizationCapability).toBeUndefined();
+      expect(restricted.googleAllowedTools).toBeUndefined();
+      expect(restricted.googleSheetTargetHints).toBeUndefined();
+    }
+  });
+
+  it('keeps the chat_history grant only for a direct owner run', () => {
+    const chatHistory = {
+      dbPath: '/state/store/messages.db',
+      timeZone: 'Asia/Almaty',
+      sources: ['bot', 'whatsapp'] as Array<'bot' | 'whatsapp'>,
+      botChatJids: ['tg:42'],
+      mediaRoots: {},
+    };
+    const directIdentity = {
+      channel: 'telegram' as const,
+      chat_id: '42',
+      telegram_user_id: '42',
+      identity_id: 'owner-42',
+      is_owner_sender: true,
+      telegram_message_origin: 'direct' as const,
+    };
+    const owner = {
+      ...testInput,
+      chatJid: 'tg:42',
+      isMain: true,
+      credentialProxyTier: 'owner' as const,
+      senderIdentity: directIdentity,
+      chatHistory,
+    };
+    expect(restrictRuntimeInputToAuthorizedTier(owner).chatHistory).toEqual(
+      chatHistory,
+    );
+    // Guest tier (incl. a co-member of the multi-sender main chat).
+    expect(
+      restrictRuntimeInputToAuthorizedTier({
+        ...owner,
+        credentialProxyTier: 'guest',
+      }).chatHistory,
+    ).toBeUndefined();
+    expect(
+      restrictRuntimeInputToAuthorizedTier({
+        ...owner,
+        chatJid: 'tg:-100123',
+        credentialProxyTier: 'guest',
+      }).chatHistory,
+    ).toBeUndefined();
+    // Scheduled task or forwarded/quoted batch, even at owner tier.
+    expect(
+      restrictRuntimeInputToAuthorizedTier({ ...owner, isScheduledTask: true })
+        .chatHistory,
+    ).toBeUndefined();
+    expect(
+      restrictRuntimeInputToAuthorizedTier({
+        ...owner,
+        senderIdentity: {
+          ...directIdentity,
+          telegram_message_origin: 'forwarded' as const,
+        },
+        provider: 'codex_cli' as const,
+        indirectOwnerContent: true,
+        runTrust: {
+          tier: 'owner' as const,
+          isolatedObserverSurface: false,
+          untrustedContentAttached: true,
+          reason: 'forwarded',
+        },
+        codex: { command: 'codex', model: 'm', sandboxMode: 'read-only' },
+      }),
+    ).toMatchObject({ isMain: true, chatHistory: undefined });
+    // The isolated WhatsApp observer surface.
+    expect(
+      restrictRuntimeInputToAuthorizedTier({
+        ...owner,
+        chatJid: '77000000000@s.whatsapp.net',
+        senderIdentity: undefined,
+        agentConfig: { whatsappObserverAccess: true },
+      }).chatHistory,
+    ).toBeUndefined();
+  });
+
+  it('never lets a guest-tier run fetch model-made links', () => {
+    const restricted = restrictRuntimeInputToAuthorizedTier({
+      ...testInput,
+      isMain: true,
+      credentialProxyTier: 'guest',
+      linkCheck: { mode: 'fix' },
+    });
+    expect(restricted.credentialProxyTier).toBe('guest');
+    expect(restricted.linkCheck).toBeUndefined();
+  });
+
   it('does not clear a normal non-main guest session', () => {
     const restricted = restrictRuntimeInputToAuthorizedTier({
       ...testInput,
@@ -776,6 +922,57 @@ describe('received-media runtime isolation', () => {
         'tg:42',
       ).find((mount) => mount.containerPath === '/workspace/user-memory'),
     ).toMatchObject({ readonly: false });
+  });
+
+  it('keeps a forwarded owner batch as owner only when it is pinned read-only', () => {
+    const forwardedIdentity = {
+      channel: 'telegram' as const,
+      chat_id: '42',
+      telegram_user_id: '42',
+      identity_id: 'owner-42',
+      is_owner_sender: true,
+      telegram_message_origin: 'forwarded' as const,
+    };
+    const base = {
+      ...testInput,
+      chatJid: 'tg:42',
+      isMain: true,
+      credentialProxyTier: 'owner' as const,
+      senderIdentity: forwardedIdentity,
+      provider: 'codex_cli' as const,
+      indirectOwnerContent: true,
+      runTrust: {
+        tier: 'owner' as const,
+        isolatedObserverSurface: false,
+        untrustedContentAttached: true,
+        reason: 'ход владельца, но в промпте есть чужой текст',
+      },
+    };
+    const readOnly = restrictRuntimeInputToAuthorizedTier({
+      ...base,
+      codex: { command: 'codex', model: 'm', sandboxMode: 'read-only' },
+    });
+    expect(readOnly).toMatchObject({
+      isMain: true,
+      credentialProxyTier: 'owner',
+    });
+    // Without a direct identity nothing is bound to the forwarded text.
+    expect(readOnly.senderIdentity).toBeUndefined();
+
+    // Not pinned read-only, or not quarantined → still refused as a guest.
+    expect(
+      restrictRuntimeInputToAuthorizedTier({
+        ...base,
+        codex: { command: 'codex', model: 'm' },
+      }),
+    ).toMatchObject({ isMain: false, credentialProxyTier: 'guest' });
+    expect(
+      restrictRuntimeInputToAuthorizedTier({
+        ...base,
+        runTrust: { ...base.runTrust, untrustedContentAttached: false },
+        codex: { command: 'codex', model: 'm', sandboxMode: 'read-only' },
+      }),
+    ).toMatchObject({ isMain: false, credentialProxyTier: 'guest' });
   });
 });
 

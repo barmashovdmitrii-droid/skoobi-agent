@@ -12,6 +12,10 @@ import {
 } from './instructions.js';
 import { SKOOBI_TRUTHFULNESS_PROMPT } from './truthfulness.js';
 
+// Keep test state outside the runtime working directory.
+
+import { GROUPS_DIR } from './config.js';
+
 let tmpDirs: string[] = [];
 
 function makeTmpDir(): string {
@@ -54,8 +58,7 @@ describe('tenant instruction loader', () => {
   it('injects AGENT.md without duplicating CLAUDE.md system context', () => {
     const dir = makeTmpDir();
     const folder = path.basename(dir);
-    const cwd = process.cwd();
-    const groupsDir = path.join(cwd, 'groups', folder);
+    const groupsDir = path.join(GROUPS_DIR, folder);
     fs.mkdirSync(groupsDir, { recursive: true });
 
     try {
@@ -109,7 +112,7 @@ describe('tenant instruction loader', () => {
   it('can suppress canonical tenant files for an isolated downgraded-main run', () => {
     const dir = makeTmpDir();
     const folder = path.basename(dir);
-    const groupsDir = path.join(process.cwd(), 'groups', folder);
+    const groupsDir = path.join(GROUPS_DIR, folder);
     fs.mkdirSync(groupsDir, { recursive: true });
     try {
       fs.writeFileSync(
@@ -175,7 +178,7 @@ describe('tenant instruction safety hardening', () => {
   it('XML-escapes tenant content so a guest cannot inject forged structural tags into the host prompt', () => {
     const dir = makeTmpDir();
     const folder = path.basename(dir);
-    const groupsDir = path.join(process.cwd(), 'groups', folder);
+    const groupsDir = path.join(GROUPS_DIR, folder);
     fs.mkdirSync(groupsDir, { recursive: true });
     try {
       // A guest tries to forge an owner-sender message block (mimicking the real
@@ -209,7 +212,7 @@ describe('tenant instruction safety hardening', () => {
   it('a forged <skoobi_truthfulness> in a tenant file cannot suppress the real safety prompt', () => {
     const dir = makeTmpDir();
     const folder = path.basename(dir);
-    const groupsDir = path.join(process.cwd(), 'groups', folder);
+    const groupsDir = path.join(GROUPS_DIR, folder);
     fs.mkdirSync(groupsDir, { recursive: true });
     try {
       fs.writeFileSync(
@@ -356,7 +359,7 @@ describe('tenant instruction safety hardening', () => {
   it('a guest AGENT.md symlink to host secrets is NOT injected into the agent system prompt', () => {
     const dir = makeTmpDir();
     const folder = path.basename(dir);
-    const groupsDir = path.join(process.cwd(), 'groups', folder);
+    const groupsDir = path.join(GROUPS_DIR, folder);
     fs.mkdirSync(groupsDir, { recursive: true });
     const outside = makeTmpDir();
     const secret = path.join(outside, 'dotenv');

@@ -426,6 +426,81 @@ describe('processGoogleWorkspaceRequest', () => {
     expect(execute).toHaveBeenCalledTimes(1);
   });
 
+  it('standing append re-sent with a fresh digest: a chat turn writes it again, a scheduled occurrence answers from the journal', async () => {
+    const spreadsheetId = 'public-fixture-resource-0002';
+    const range = "'Самокаты'!A1:C1000";
+    const row = [['28.09', 'самокат 7', 'вернул']];
+    const execute = vi.fn(async () => ({ updatedRange: "'Самокаты'!A12:C12" }));
+    const run = (
+      journal: GoogleMutationJournal,
+      policy: Record<string, unknown>,
+      requestId: string,
+      expectedDigest: string,
+      values: unknown[][] = row,
+    ) => {
+      const envelope = {
+        type: 'google_api',
+        request_id: requestId,
+        tool: 'google_sheets_append_values',
+        args: { spreadsheetId, range, values, expectedDigest },
+      };
+      const grant = authorize(
+        capabilityFor(['google_sheets_append_values'], {
+          standing: true,
+          ...policy,
+        }),
+        envelope,
+        `authorize_${requestId}`,
+      );
+      return processGoogleWorkspaceRequest({
+        raw: { ...envelope, ownerAuthorizationGrant: grant },
+        sourceGroup: 'telegram_main',
+        execute,
+        journal,
+      });
+    };
+
+    // Chat turn (unchanged): an exact retry is answered from the journal, the
+    // same row after a new read is a new write the owner asked for.
+    const turn = memoryJournal();
+    expect(await run(turn, {}, 'google_turn_1', 'a'.repeat(64))).toMatchObject({
+      ok: true,
+    });
+    expect(await run(turn, {}, 'google_turn_2', 'a'.repeat(64))).toMatchObject({
+      ok: true,
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(await run(turn, {}, 'google_turn_3', 'b'.repeat(64))).toMatchObject({
+      ok: true,
+    });
+    expect(execute).toHaveBeenCalledTimes(2);
+
+    // Scheduled occurrence: the re-dispatch re-reads (new digest) and gets the
+    // first append's outcome instead of a second row; another row still goes.
+    execute.mockClear();
+    const occurrence = memoryJournal();
+    const policy = { scheduledOccurrence: true };
+    const first = await run(occurrence, policy, 'google_occ_1', 'a'.repeat(64));
+    expect(first).toMatchObject({
+      ok: true,
+      result: { updatedRange: "'Самокаты'!A12:C12" },
+    });
+    const reread = await run(
+      occurrence,
+      policy,
+      'google_occ_2',
+      'b'.repeat(64),
+    );
+    expect(reread).toMatchObject({ ok: true, result: first.result });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(
+      await run(occurrence, policy, 'google_occ_3', 'c'.repeat(64), [
+        ['28.09', 'самокат 9', 'выдал'],
+      ]),
+    ).toMatchObject({ ok: true });
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+
   it('executes distinct named create targets once each while deduping exact retries', async () => {
     const allowedCreateTargets = [
       { tool: 'google_docs_create', title: 'Plan', root: true },

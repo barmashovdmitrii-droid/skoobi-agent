@@ -130,7 +130,9 @@ export function createSqliteGoogleMutationJournal(): GoogleMutationJournal {
         | undefined;
       // The durable key intentionally describes a stable mutation slot (for
       // example one document target), not the full payload. A cached outcome
-      // is reusable only for the exact same canonical operation. Legacy rows
+      // is reusable only for the exact same canonical operation (for a
+      // scheduled occurrence's standing sheet append: the same one minus its
+      // read digest, see processGoogleWorkspaceRequest). Legacy rows
       // have a NULL fingerprint and therefore fail closed instead of lending
       // an unverifiable cached success to a new request.
       if (
@@ -349,7 +351,13 @@ export async function processGoogleWorkspaceRequest(input: {
   const mutation = GOOGLE_WORKSPACE_WRITE_TOOLS.has(operation.tool);
   const journal = input.journal || createSqliteGoogleMutationJournal();
   if (mutation) {
-    const operationFingerprint = googleWorkspaceOperationFingerprint(operation);
+    // Host-computed with the grant from this exact envelope: a scheduled-task
+    // occurrence's standing sheet append is journaled without its read digest
+    // (task-authorization.ts), so the same row re-sent with a fresh digest is
+    // answered from the journal instead of coming back as payload_mismatch.
+    const operationFingerprint =
+      authorization.googleJournalFingerprint ||
+      googleWorkspaceOperationFingerprint(operation);
     const state = journal.begin({
       intentId: authorization.googleIntentId,
       operationKey: authorization.googleOperationKey,

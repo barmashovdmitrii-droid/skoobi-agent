@@ -50,10 +50,37 @@ export interface TenantApprovedSender {
   role?: string;
 }
 
+
+
+export type TenantChannel = 'telegram' | 'whatsapp';
+
+const TENANT_CHANNELS = new Set<string>(['telegram', 'whatsapp']);
+
+/** `<phone>@s.whatsapp.net` for a direct chat, `<id>@g.us` for a group. */
+const WHATSAPP_JID = /^([0-9A-Za-z._-]{1,64})@(s\.whatsapp\.net|g\.us)$/;
+
+export function parseWhatsappJid(
+  jid: string,
+): { chatId: string; isGroup: boolean } | null {
+  const match = WHATSAPP_JID.exec(String(jid || '').trim());
+  if (!match) return null;
+  return { chatId: match[1], isGroup: match[2] === 'g.us' };
+}
+
+/**
+ * Tenant id for a WhatsApp chat, derived only from the host-controlled JID.
+ * Same rule as the Telegram side (finding #30): a tenant must never be able to
+ * name itself, since quota and plan grants key on this value.
+ */
+export function defaultWhatsappTenantId(chatId: string): string {
+  const safe = chatId.trim().replace(/[^A-Za-z0-9_-]/g, '_');
+  return `wa_chat_${safe || 'unknown'}`;
+}
+
 export interface TenantJson {
   tenant_id?: string;
   folder?: string;
-  channel?: 'telegram';
+  channel?: TenantChannel;
   chat_id?: string;
   bot_id?: string;
   persona_id?: string;
@@ -70,7 +97,7 @@ export interface TenantJson {
 export interface TenantRecord {
   tenant_id: string;
   folder: string;
-  channel: 'telegram';
+  channel: TenantChannel;
   chat_id: string;
   bot_id?: string;
   persona_id?: string;
@@ -86,6 +113,15 @@ export interface TenantRecord {
   source: 'tenant_json' | 'legacy_registered_group';
   group: RegisteredGroup;
 }
+
+/**
+ * A tenant narrowed to one channel. The Telegram variant is what
+ * resolveTelegramChat/resolveTelegramJid return, so the compiler — not a
+ * comment — guarantees the Telegram message path can never be handed a tenant
+ * from another channel.
+ */
+export type TelegramTenantRecord = TenantRecord & { channel: 'telegram' };
+export type WhatsappTenantRecord = TenantRecord & { channel: 'whatsapp' };
 
 export interface TenantRegistryOptions {
   groupsDir?: string;
@@ -174,7 +210,7 @@ export function parseTenantJson(raw: unknown): TenantJson {
 
   const obj = raw as Record<string, unknown>;
   const channel = stringValue(obj.channel);
-  if (channel && channel !== 'telegram') {
+  if (channel && !TENANT_CHANNELS.has(channel)) {
     throw new Error(`Unsupported tenant channel: ${channel}`);
   }
 
@@ -186,7 +222,7 @@ export function parseTenantJson(raw: unknown): TenantJson {
   return {
     tenant_id: stringValue(obj.tenant_id),
     folder: stringValue(obj.folder),
-    channel: channel === 'telegram' ? 'telegram' : undefined,
+    channel: channel ? (channel as TenantChannel) : undefined,
     chat_id: stringValue(obj.chat_id),
     bot_id: stringValue(obj.bot_id),
     persona_id: stringValue(obj.persona_id),
@@ -210,13 +246,11 @@ function resolveGroupDir(groupsDir: string, folder: string): string | null {
 
 function loadTenantJson(
   groupsDir: string,
-  jid: string,
   group: RegisteredGroup,
+  channel: TenantChannel,
+  chatId: string,
+  botId?: string,
 ): TenantJson | null {
-  const parsedJid = parseTelegramJid(jid);
-  if (!parsedJid) return null;
-  const chatId = parsedJid.chatId;
-
   const groupDir = resolveGroupDir(groupsDir, group.folder);
   if (!groupDir) return null;
 
@@ -237,26 +271,30 @@ function loadTenantJson(
     return null;
   }
 
-  if (parsed.channel && parsed.channel !== 'telegram') return null;
+  if (parsed.channel && parsed.channel !== channel) return null;
   if (parsed.chat_id && parsed.chat_id !== chatId) return null;
-  if (parsed.bot_id && parsedJid.botId && parsed.bot_id !== parsedJid.botId) {
-    return null;
-  }
+  if (parsed.bot_id && botId && parsed.bot_id !== botId) return null;
   if (parsed.folder && parsed.folder !== group.folder) return null;
 
   return parsed;
 }
 
-function tenantRecordFromGroup(
+function telegramTenantRecord(
   groupsDir: string,
   jid: string,
   group: RegisteredGroup,
-): TenantRecord | null {
+): TelegramTenantRecord | null {
   const parsedJid = parseTelegramJid(jid);
   if (!parsedJid) return null;
   const chatId = parsedJid.chatId;
 
-  const tenant = loadTenantJson(groupsDir, jid, group);
+  const tenant = loadTenantJson(
+    groupsDir,
+    group,
+    'telegram',
+    chatId,
+    parsedJid.botId,
+  );
   // Finding #30: the group dir (and therefore tenant.json) is mounted
   // read-WRITE into the guest sandbox, so for an UNTRUSTED group every
   // trust-relevant field must come from host state, not the file. Only a
@@ -294,8 +332,51 @@ function tenantRecordFromGroup(
   };
 }
 
+function whatsappTenantRecord(
+  groupsDir: string,
+  jid: string,
+  group: RegisteredGroup,
+): WhatsappTenantRecord | null {
+  const parsedJid = parseWhatsappJid(jid);
+  if (!parsedJid) return null;
+  const chatId = parsedJid.chatId;
+
+  const tenant = loadTenantJson(groupsDir, group, 'whatsapp', chatId);
+  // Same trust rule as the Telegram branch (finding #30): only a trusted main
+  // group may carry an operator-provisioned tenant_id; everyone else gets one
+  // derived from the host-controlled JID.
+  const isTrustedGroup = group.isMain === true;
+  return {
+    tenant_id:
+      (isTrustedGroup && tenant?.tenant_id) || defaultWhatsappTenantId(chatId),
+    folder: group.folder,
+    channel: 'whatsapp',
+    chat_id: chatId,
+    // WhatsApp has no per-bot identity to namespace by, so bot_id stays unset
+    // rather than borrowing the Telegram default and implying a bot that is not
+    // there.
+    persona_id:
+      tenant?.persona_id || group.agentConfig?.personaId || DEFAULT_PERSONA_ID,
+    mode: group.isMain ? 'owner' : 'guest',
+    runtime: parseSkoobiRuntimeMode(tenant?.runtime),
+    language: tenant?.language,
+    // approved_senders is a Telegram-shaped list (telegram_user_id); a WhatsApp
+    // tenant carries none rather than a list of ids that mean something else.
+    approved_senders: [],
+    models: tenant?.models || {},
+    quota: { enabled: tenant?.quota?.enabled === true },
+    legacy_jid: jid,
+    source: tenant ? 'tenant_json' : 'legacy_registered_group',
+    group,
+  };
+}
+
 export class TenantRegistry {
-  private readonly byTelegramChatKey = new Map<string, TenantRecord>();
+  // Indexed per channel on purpose. A shared index would let a WhatsApp chat id
+  // resolve through resolveTelegramChat(), handing the Telegram message path a
+  // tenant from another channel.
+  private readonly byTelegramChatKey = new Map<string, TelegramTenantRecord>();
+  private readonly byWhatsappChat = new Map<string, WhatsappTenantRecord>();
   private readonly byTenantId = new Map<string, TenantRecord>();
 
   static fromRegisteredGroups(
@@ -305,7 +386,20 @@ export class TenantRegistry {
     const registry = new TenantRegistry();
     const groupsDir = options.groupsDir || GROUPS_DIR;
     for (const [jid, group] of Object.entries(groups)) {
-      const record = tenantRecordFromGroup(groupsDir, jid, group);
+      if (parseWhatsappJid(jid)) {
+        const record = whatsappTenantRecord(groupsDir, jid, group);
+        if (!record) continue;
+        // WhatsApp has no thread JIDs, so the first record for a chat stands.
+        if (!registry.byWhatsappChat.has(record.chat_id)) {
+          registry.byWhatsappChat.set(record.chat_id, record);
+        }
+        if (!registry.byTenantId.has(record.tenant_id)) {
+          registry.byTenantId.set(record.tenant_id, record);
+        }
+        continue;
+      }
+
+      const record = telegramTenantRecord(groupsDir, jid, group);
       if (!record) continue;
       if (
         !registry.byTelegramChatKey.has(
@@ -331,7 +425,7 @@ export class TenantRegistry {
   resolveTelegramChat(
     chatId: string | number,
     botId?: string,
-  ): TenantRecord | undefined {
+  ): TelegramTenantRecord | undefined {
     // Bot-explicit on the hot path: a missing botId resolves to the default
     // bot id so default-bot JIDs map deterministically against records keyed
     // under defaultTelegramBotId().
@@ -346,7 +440,7 @@ export class TenantRegistry {
     // guess, since a chat_id-only scan can resolve to the wrong tenant and
     // leak its persona/tenant_id/quota across bots.
     const chatKey = String(chatId);
-    let match: TenantRecord | undefined;
+    let match: TelegramTenantRecord | undefined;
     for (const record of this.byTelegramChatKey.values()) {
       if (record.chat_id !== chatKey) continue;
       if (match) return undefined;
@@ -355,11 +449,30 @@ export class TenantRegistry {
     return match;
   }
 
-  resolveTelegramJid(jid: string): TenantRecord | undefined {
+  resolveTelegramJid(jid: string): TelegramTenantRecord | undefined {
     const parsed = parseTelegramJid(jid);
     return parsed
       ? this.resolveTelegramChat(parsed.chatId, parsed.botId)
       : undefined;
+  }
+
+  resolveWhatsappJid(jid: string): WhatsappTenantRecord | undefined {
+    const parsed = parseWhatsappJid(jid);
+    return parsed ? this.byWhatsappChat.get(parsed.chatId) : undefined;
+  }
+
+  /**
+   * Resolve a JID from any supported channel.
+   *
+   * Deliberately NOT a drop-in replacement for resolveTelegramJid() everywhere.
+   * The tenant record also drives runtime selection — shouldStartLiveMode()
+   * treats an is_main tenant as owner and, with owner-live enabled, would move
+   * that chat onto the Codex live path. Broadening the resolution used on the
+   * message path would therefore reroute WhatsApp as a side effect of adding
+   * telemetry. Use this only where a tenant is read for observability.
+   */
+  resolveJid(jid: string): TenantRecord | undefined {
+    return this.resolveTelegramJid(jid) ?? this.resolveWhatsappJid(jid);
   }
 
   resolveTenant(tenantId: string): TenantRecord | undefined {

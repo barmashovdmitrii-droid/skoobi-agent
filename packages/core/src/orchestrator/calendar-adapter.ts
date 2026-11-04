@@ -2,6 +2,7 @@ import fs from 'fs';
 
 import { calendar_v3, google } from 'googleapis';
 
+import { calendarRecurrenceForTask } from './calendar-recurrence.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 import type { ScheduledTask } from './types.js';
@@ -160,10 +161,16 @@ export interface CalendarEventRecord {
 export interface CreateReminderEventInput {
   taskId: string;
   prompt: string;
+  /**
+   * Start of the FIRST occurrence: a bare wall-clock string for a one-off task,
+   * or the task's absolute `next_run` for a recurring one.
+   */
   scheduleValue: string;
   calendarId?: string;
   timeZone?: string;
   reminderMinutes?: number;
+  /** RFC 5545 lines (`RRULE:FREQ=...`) turning this into a repeating event. */
+  recurrence?: string[];
 }
 
 export interface ListCalendarEventsInput {
@@ -249,30 +256,128 @@ export function loadGoogleCalendarConfig(
   };
 }
 
-function addMinutesToLocalDateTime(value: string, minutes: number): string {
+/** `YYYY-MM-DDTHH:MM[:SS]` with no zone — a wall-clock time in the calendar's zone. */
+const NAIVE_LOCAL_DATE_TIME =
+  /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?$/;
+
+const pad = (n: number) => String(n).padStart(2, '0');
+
+function formatNaiveLocalDateTime(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  second: number,
+): string {
+  return `${year}-${pad(month)}-${pad(day)}T${pad(hour)}:${pad(minute)}:${pad(second)}`;
+}
+
+/**
+ * Render an absolute instant as a wall-clock time in `timeZone`.
+ *
+ * Recurring tasks carry `next_run` as an absolute UTC timestamp, so the first
+ * occurrence has to be expressed in the calendar's own zone. Doing this through
+ * Intl rather than the Date local getters keeps the result correct on a host
+ * whose system zone differs from the calendar's.
+ */
+function formatInstantInTimeZone(date: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(date);
+
+  const field = (type: Intl.DateTimeFormatPartTypes): number => {
+    const found = parts.find((part) => part.type === type);
+    const value = Number.parseInt(found?.value || '', 10);
+    if (!Number.isFinite(value)) {
+      throw new Error(`Invalid calendar event start time: ${date.toISOString()}`);
+    }
+    return value;
+  };
+
+  return formatNaiveLocalDateTime(
+    field('year'),
+    field('month'),
+    field('day'),
+    field('hour'),
+    field('minute'),
+    field('second'),
+  );
+}
+
+/**
+ * Normalize a schedule value into a wall-clock start time for the calendar.
+ *
+ * A bare `2026-09-10T12:00:00` is already wall-clock and is kept verbatim; a
+ * zoned or UTC timestamp (what `next_run` holds) is converted into `timeZone`.
+ */
+export function toCalendarLocalDateTime(
+  value: string,
+  timeZone: string,
+): string {
+  const naive = NAIVE_LOCAL_DATE_TIME.exec(String(value).trim());
+  if (naive) {
+    return formatNaiveLocalDateTime(
+      Number(naive[1]),
+      Number(naive[2]),
+      Number(naive[3]),
+      Number(naive[4]),
+      Number(naive[5]),
+      naive[6] ? Number(naive[6]) : 0,
+    );
+  }
+
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
     throw new Error(`Invalid calendar event start time: ${value}`);
   }
-  const next = new Date(date.getTime() + minutes * 60_000);
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return [
-    next.getFullYear(),
-    '-',
-    pad(next.getMonth() + 1),
-    '-',
-    pad(next.getDate()),
-    'T',
-    pad(next.getHours()),
-    ':',
-    pad(next.getMinutes()),
-    ':',
-    pad(next.getSeconds()),
-  ].join('');
+  return formatInstantInTimeZone(date, timeZone);
 }
 
-export function normalizeReminderSummary(prompt: string): string {
-  const cleaned = prompt
+/**
+ * Advance a wall-clock time by whole minutes.
+ *
+ * The arithmetic runs on a UTC-constructed date purely so that the calendar
+ * math never picks up the host's own zone; the value in and the value out are
+ * both wall-clock in the calendar's zone.
+ */
+function addMinutesToLocalDateTime(value: string, minutes: number): string {
+  const naive = NAIVE_LOCAL_DATE_TIME.exec(String(value).trim());
+  if (!naive) {
+    throw new Error(`Invalid calendar event start time: ${value}`);
+  }
+  const base = Date.UTC(
+    Number(naive[1]),
+    Number(naive[2]) - 1,
+    Number(naive[3]),
+    Number(naive[4]),
+    Number(naive[5]),
+    naive[6] ? Number(naive[6]) : 0,
+  );
+  const next = new Date(base + minutes * 60_000);
+  return formatNaiveLocalDateTime(
+    next.getUTCFullYear(),
+    next.getUTCMonth() + 1,
+    next.getUTCDate(),
+    next.getUTCHours(),
+    next.getUTCMinutes(),
+    next.getUTCSeconds(),
+  );
+}
+
+
+const QUOTED_MESSAGE = /«([^»]{3,})»/;
+
+
+export function stripReminderLead(text: string): string {
+  return String(text || '')
     .replace(/<internal>.*$/is, '')
     .replace(/^\s*(?:напомни(?:ть)?|напоминание(?:\s+для\s+\S+)?)[\s:.-]+/i, '')
     .replace(
@@ -281,24 +386,57 @@ export function normalizeReminderSummary(prompt: string): string {
     )
     .replace(/\s+/g, ' ')
     .trim();
-  const summary = cleaned || 'Skoobi reminder';
+}
+
+export function normalizeReminderSummary(prompt: string): string {
+  const withoutInternal = String(prompt || '').replace(/<internal>.*$/is, '');
+  const quoted = QUOTED_MESSAGE.exec(withoutInternal);
+  const summary =
+    stripReminderLead(quoted ? quoted[1] : withoutInternal) || 'Skoobi reminder';
   return summary.length > MAX_SUMMARY_LENGTH
     ? `${summary.slice(0, MAX_SUMMARY_LENGTH - 1).trimEnd()}…`
     : summary;
 }
 
+/**
+ * Reminder wording, matched against an already-lowercased prompt.
+ *
+ * Two Russian stems, not one: `напомин-` carries the noun forms («напоминание»,
+ * «напоминания»), `напомн-` the verb forms («напомни», «напомнить»). An earlier
+ * single-stem pattern glued the noun endings onto the verb stem and so tested
+ * for «напомнание», a word that does not exist and cannot match the noun.
+ *
+ * The trailing class is spelled out because `\w` and `\b` are ASCII-only in
+ * JavaScript and never fire against Cyrillic; `ё` sits outside `а-я` and needs
+ * its own mention. Lowercasing the prompt beforehand avoids relying on the `i`
+ * flag's case folding for non-ASCII letters.
+ */
+const REMINDER_PROMPT_PATTERN = /напомин[а-яё]*|напомн[а-яё]*|remind/;
+
+export function promptReadsAsReminder(prompt: string): boolean {
+  return REMINDER_PROMPT_PATTERN.test(String(prompt || '').toLowerCase());
+}
+
+/**
+ * Decide whether a scheduled task should be mirrored into the owner's calendar.
+ *
+ * Recurring tasks are mirrored as repeating events, but only when their cron or
+ * interval schedule has an exact RRULE translation (see calendar-recurrence).
+ * An untranslatable schedule is left out entirely rather than pinned to a
+ * single arbitrary occurrence.
+ */
 export function shouldCreateCalendarEventForTask(
-  task: Pick<ScheduledTask, 'schedule_type' | 'prompt'>,
+  task: Pick<ScheduledTask, 'schedule_type' | 'prompt'> & {
+    schedule_value?: string;
+  },
   requested?: boolean,
 ): boolean {
   if (requested === false) return false;
-  if (task.schedule_type !== 'once') return false;
+  if (calendarRecurrenceForTask(task).kind === 'unsupported') return false;
   const prompt = String(task.prompt || '').trim();
   if (!prompt || /^<internal>/i.test(prompt)) return false;
   if (requested === true) return true;
-  return /(?:напомн(?:и|ить|ание|ания|анию|анием)?|remind(?:er)?)/i.test(
-    prompt,
-  );
+  return promptReadsAsReminder(prompt);
 }
 
 function eventTime(
@@ -359,8 +497,9 @@ export class GoogleCalendarAdapter implements CalendarAdapter {
     const timeZone = input.timeZone || this.config.timeZone;
     const reminderMinutes =
       input.reminderMinutes ?? this.config.reminderMinutes;
+    const startValue = toCalendarLocalDateTime(input.scheduleValue, timeZone);
     const endValue = addMinutesToLocalDateTime(
-      input.scheduleValue,
+      startValue,
       this.config.eventDurationMinutes,
     );
 
@@ -374,8 +513,11 @@ export class GoogleCalendarAdapter implements CalendarAdapter {
           '',
           input.prompt,
         ].join('\n'),
-        start: eventTime(input.scheduleValue, timeZone),
+        start: eventTime(startValue, timeZone),
         end: eventTime(endValue, timeZone),
+        ...(input.recurrence?.length
+          ? { recurrence: [...input.recurrence] }
+          : {}),
         reminders: {
           useDefault: false,
           overrides: [{ method: 'popup', minutes: reminderMinutes }],

@@ -5,8 +5,17 @@
 // семантика сохранена без затаскивания core-config в shared.
 import path from 'path';
 
-const GROUPS_DIR = path.resolve(process.cwd(), 'groups');
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+// SKOOBI_TEST_STATE_ROOT — тот же тестовый оверрайд, что в
+// packages/core/src/orchestrator/config.ts. Держим правило в ОДНОМ виде в обоих
+// местах: иначе прогон тестов резолвит groups/ в боевой каталог, даже когда
+// ядро уже переключено на временный.
+// В проде переменной нет — поведение не меняется.
+const STATE_ROOT = process.env.SKOOBI_TEST_STATE_ROOT
+  ? path.resolve(process.env.SKOOBI_TEST_STATE_ROOT)
+  : process.cwd();
+
+const GROUPS_DIR = path.resolve(STATE_ROOT, 'groups');
+const DATA_DIR = path.resolve(STATE_ROOT, 'data');
 
 const GROUP_FOLDER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const RESERVED_FOLDERS = new Set(['global']);

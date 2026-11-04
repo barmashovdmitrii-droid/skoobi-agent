@@ -460,6 +460,131 @@ describe('max-accuracy retry and candidate selection', () => {
     ).toBe('kk');
   });
 
+    // Silence detected by the automatic pass should not trigger language retries.
+  describe('silence and empty output skip the ru/kk retries', () => {
+    it.each([
+      ['[BLANK_AUDIO]', 'no_speech'],
+      ['  (silence)  ', 'no_speech'],
+      ['[no speech]', 'no_speech'],
+      ['', 'empty'],
+    ])(
+      'auto pass %j → one Whisper pass, unusable with invalidReason %s',
+      async (text, invalidReason) => {
+        // Only the auto pass is scripted: a ru/kk retry would hit ENOENT.
+        const execLocal = localExecForPasses({
+          auto: { text, language: 'en', languageProbability: 0.31 },
+        });
+        const transcribe = createSerializedLocalTranscriber(
+          () => config(),
+          execLocal,
+        );
+
+        await expect(transcribe(await sourceFile())).resolves.toBeNull();
+
+        const whisperLanguages = execLocal.mock.calls
+          .filter(([executable]) => executable.includes('whisper'))
+          .map(([, args]) => args[args.indexOf('-l') + 1]);
+        expect(whisperLanguages).toEqual(['auto']);
+        expect(sharedMocks.logger.warn).not.toHaveBeenCalled();
+        expect(sharedMocks.logger.info).toHaveBeenCalledWith(
+          expect.objectContaining({
+            passCount: 1,
+            retryReason: null,
+            invalidReason,
+            selectedLanguage: null,
+          }),
+          'Local transcription was unusable',
+        );
+      },
+    );
+
+    it('still retries ru/kk for language-dependent damage such as repetition', async () => {
+      const execLocal = localExecForPasses({
+        auto: {
+          text: 'да да да да да да да да',
+          language: 'ru',
+          languageProbability: 0.99,
+          tokenProbabilities: [0.9],
+        },
+        ru: { text: 'да да да да да да да да', tokenProbabilities: [0.9] },
+        kk: { text: 'иә иә иә иә иә иә иә иә', tokenProbabilities: [0.9] },
+      });
+      const transcribe = createSerializedLocalTranscriber(
+        () => config(),
+        execLocal,
+      );
+
+      await expect(transcribe(await sourceFile())).resolves.toBeNull();
+      expect(sharedMocks.logger.info).toHaveBeenCalledWith(
+        expect.objectContaining({
+          passCount: 3,
+          retryReason: 'invalid_transcript',
+          invalidReason: 'repetition',
+        }),
+        'Local transcription was unusable',
+      );
+    });
+
+    it('classifies silence markers separately from corrupt output', () => {
+      expect(validateTranscript('[BLANK_AUDIO]')).toEqual({
+        valid: false,
+        invalidReason: 'no_speech',
+      });
+      expect(validateTranscript('(speaking in foreign language)')).toEqual({
+        valid: false,
+        invalidReason: 'corruption',
+      });
+      expect(
+        retryReasonForAutoCandidate(
+          candidate('auto', null, { valid: false, invalidReason: 'no_speech' }),
+          config(),
+        ),
+      ).toBeNull();
+      expect(
+        retryReasonForAutoCandidate(
+          candidate('auto', null, {
+            valid: false,
+            invalidReason: 'corruption',
+          }),
+          config(),
+        ),
+      ).toBe('invalid_transcript');
+    });
+
+    it('logs a short path-free ffmpeg stderr excerpt when audio extraction fails', async () => {
+      const source = await sourceFile();
+      const execLocal = vi.fn<LocalExecFile>(async (executable) => {
+        expect(executable).toBe('/local/bin/ffmpeg');
+        throw Object.assign(new Error('Command failed'), {
+          code: 1,
+          stderr: `${source}: Invalid data found\nOutput file #0 does not contain any stream\n`,
+        });
+      });
+      const transcribe = createSerializedLocalTranscriber(
+        () => config(),
+        execLocal,
+      );
+
+      await expect(transcribe(source)).resolves.toBeNull();
+
+      expect(sharedMocks.logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({
+          stage: 'ffmpeg',
+          stderrSnippet: expect.stringContaining(
+            'Output file #0 does not contain any stream',
+          ),
+        }),
+        'Local audio transcription failed',
+      );
+      const snippet = (
+        sharedMocks.logger.error.mock.calls[0][0] as { stderrSnippet: string }
+      ).stderrSnippet;
+      expect(snippet).not.toContain(dirname(source));
+      expect(snippet).toContain('…/voice.ogg');
+      expect(snippet.length).toBeLessThanOrEqual(160);
+    });
+  });
+
   it('uses only real retry signals and rejects empty/repetitive/corrupt text', () => {
     expect(validateTranscript(null)).toEqual({
       valid: false,
@@ -473,6 +598,35 @@ describe('max-accuracy retry and candidate selection', () => {
       valid: false,
       invalidReason: 'corruption',
     });
+    // Whisper can hallucinate subtitle credits over music or silence.
+    for (const artifact of [
+      'Субтитры сделал FixtureAuthor',
+      'Субтитры создавал FixtureAuthor.',
+      'Продолжение следует...',
+      'Редактор субтитров А.Тестовый Корректор Б.Примерный',
+      '[Музыка]',
+      '[Музыка] [Аплодисменты]',
+      '♪♪',
+      '♪ Спасибо за просмотр! ♪',
+    ]) {
+      expect(validateTranscript(artifact)).toEqual({
+        valid: false,
+        invalidReason: 'artifact',
+      });
+    }
+    // Real speech that merely contains such words is kept.
+    for (const speech of [
+      'Скуби, субтитры сделал сам, посмотри ролик',
+      'Продолжение следует завтра, напомни мне',
+      'Музыка громкая, переведи слова песни',
+      'Музыка',
+      'Корректор, проверь текст договора',
+    ]) {
+      expect(validateTranscript(speech)).toEqual({
+        valid: true,
+        invalidReason: null,
+      });
+    }
 
     const lowLanguage = candidateFromWhisperOutput(
       'auto',

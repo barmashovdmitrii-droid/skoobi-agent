@@ -33,7 +33,23 @@ export const logger = pino({
     paths: PINO_REDACT_PATHS,
     censor: '<redacted>',
   },
-  transport: { target: 'pino-pretty', options: { colorize: true } },
+  transport: {
+    target: 'pino-pretty',
+    options: {
+// Enable color only for terminals, with LOG_COLOR as an explicit override.
+// File logs should not contain ANSI escapes.
+      colorize:
+        process.env.LOG_COLOR === '1'
+          ? true
+          : process.env.LOG_COLOR === '0'
+            ? false
+            : Boolean(process.stdout.isTTY),
+      // pino-pretty's default prints TIME ONLY. Over a log that spans months
+      // and gets rotated, "[10:19:56.746]" cannot be correlated with anything —
+      // not a crash, not a deploy, not a launchd restart. Always carry the date.
+      translateTime: 'SYS:yyyy-mm-dd HH:MM:ss.l',
+    },
+  },
 });
 
 // Benign/transient stream error codes. These come from writes to pipes/sockets

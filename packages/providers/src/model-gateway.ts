@@ -107,6 +107,15 @@ export type ModelGatewayConfig = {
     fallbackModel: string;
     allowModelDowngrade: boolean;
     reasoningEffort: CodexReasoningEffort | '';
+    /**
+     * OpenAI service tier for interactive chat turns. 'priority' ("Fast" in
+     * the Codex catalog) roughly halves step time but consumes the shared
+     * account's quota faster, so it is OFF unless the owner sets
+     * SKOOBI_CODEX_SERVICE_TIER=priority.
+     */
+    serviceTier?: 'priority';
+    /** Account-limit share above which the fast tier is skipped (default 80). */
+    serviceTierMaxUsedPercent?: number;
     webSearchEnabled: boolean;
     timeoutMs: number;
     maxStdoutBytes: number;
@@ -215,6 +224,9 @@ export function loadModelGatewayConfig(
     'SKOOBI_CODEX_ALLOW_MODEL_DOWNGRADE',
     'SKOOBI_CODEX_REASONING_EFFORT',
     'SKOOBI_CODEX_WEB_SEARCH_ENABLED',
+    'SKOOBI_CODEX_SERVICE_TIER',
+    'SKOOBI_CODEX_SERVICE_TIER_MAX_USED_PERCENT',
+    'SKOOBI_CHEAP_MODEL',
     'SKOOBI_QUOTA_DEGRADED_MODEL',
     'SKOOBI_CODEX_TIMEOUT_MS',
     'SKOOBI_CODEX_MAX_STDOUT_BYTES',
@@ -231,8 +243,12 @@ export function loadModelGatewayConfig(
     yamlConfig.runtime?.codex_subscription ||
     {};
   const envRoleOverrides: Partial<Record<ModelRole, string>> = {};
-  const degradedModel = stringFrom(env.SKOOBI_QUOTA_DEGRADED_MODEL);
-  if (degradedModel) envRoleOverrides.cheap = degradedModel;
+  // Prefer the explicit cheap-role model key. Keep the historical quota-named
+  // key as a compatibility fallback for existing instance configurations.
+  const cheapModel =
+    stringFrom(env.SKOOBI_CHEAP_MODEL) ||
+    stringFrom(env.SKOOBI_QUOTA_DEGRADED_MODEL);
+  if (cheapModel) envRoleOverrides.cheap = cheapModel;
   const apiKeyEnv = stringFrom(
     env.SKOOBI_MODEL_GATEWAY_API_KEY_ENV,
     stringFrom(gateway.api_key_env, 'SKOOBI_MODEL_GATEWAY_KEY'),
@@ -324,6 +340,24 @@ export function loadModelGatewayConfig(
           codex.reasoning_effort ??
           codex.reasoningEffort,
       ),
+      // Read from .env like every SKOOBI_CODEX_* key: readEnvFile only returns
+      // the keys it is asked for, and the first version of this switch was
+      // not on that list, so setting it would have done nothing.
+      ...(stringFrom(
+        env.SKOOBI_CODEX_SERVICE_TIER,
+        stringFrom(process.env.SKOOBI_CODEX_SERVICE_TIER, ''),
+      ).toLowerCase() === 'priority'
+        ? {
+            serviceTier: 'priority' as const,
+            serviceTierMaxUsedPercent: Math.min(
+              100,
+              Math.max(
+                1,
+                numberFrom(env.SKOOBI_CODEX_SERVICE_TIER_MAX_USED_PERCENT, 80),
+              ),
+            ),
+          }
+        : {}),
       webSearchEnabled: boolFrom(
         env.SKOOBI_CODEX_WEB_SEARCH_ENABLED ??
           codex.web_search_enabled ??

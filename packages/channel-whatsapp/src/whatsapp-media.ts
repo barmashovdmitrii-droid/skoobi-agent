@@ -39,6 +39,76 @@ export interface WhatsappMediaAdmission {
   tenantId: string;
 }
 
+export interface WhatsappMediaDownloadFailure {
+  /**
+   * True for a network-level failure that a retry a little later may clear
+   * (undici `fetch failed`, ECONNRESET, ETIMEDOUT, ...). False for HTTP
+   * statuses, size caps, decrypt or storage errors.
+   */
+  transient: boolean;
+  /** Sanitised Error.name/typeof only. */
+  errorKind: string;
+}
+
+export interface WhatsappMediaDownloadContext {
+  source: 'live' | 'history';
+  /**
+   * Passive observer enrichment (third-party chats). Its over-cap media is a
+   * routine INFO, not a WARN: nothing the owner sent is lost.
+   */
+  observer?: boolean;
+  /** Called once with a classified failure when the download returns null. */
+  onFailure?: (failure: WhatsappMediaDownloadFailure) => void;
+}
+
+const TRANSIENT_NETWORK_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ECONNREFUSED',
+  'ENETUNREACH',
+  'ENETDOWN',
+  'EHOSTUNREACH',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'EPIPE',
+  'UND_ERR_SOCKET',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+]);
+
+function errorCodeOf(value: unknown): string | undefined {
+  const code = (value as { code?: unknown } | null)?.code;
+  return typeof code === 'string' ? code : undefined;
+}
+
+/**
+ * Retry network failures once while the live media URL is fresh. HTTP
+ * statuses, size limits, and local errors are not transient.
+ */
+export function isTransientWhatsappMediaNetworkError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (
+    err instanceof WhatsappMediaHttpError ||
+    err instanceof WhatsappMediaTooLargeError ||
+    err instanceof WhatsappMediaTimeoutError
+  ) {
+    return false;
+  }
+  const cause = (err as { cause?: unknown }).cause;
+  for (const code of [errorCodeOf(err), errorCodeOf(cause)]) {
+    if (code && TRANSIENT_NETWORK_ERROR_CODES.has(code)) return true;
+  }
+  return err.name === 'TypeError' && /^fetch failed/iu.test(err.message);
+}
+
+class WhatsappMediaHttpError extends Error {
+  constructor(readonly status: number) {
+    super(`WhatsApp media download failed with HTTP ${status}`);
+    this.name = 'WhatsappMediaHttpError';
+  }
+}
+
 // Baileys' 'buffer' download materializes the ENTIRE file in the shared process
 // heap. Its rc13 stream path is not safely cancellable either: getHttpStream()
 // drops RequestInit.signal before calling fetch. Use a native abortable fetch and
@@ -60,7 +130,20 @@ const MAX_QUEUED_GUEST_WA_DOWNLOADS = 12;
 const MAX_CONCURRENT_WA_DOWNLOADS_PER_GUEST = 2;
 const MAX_QUEUED_WA_DOWNLOADS_PER_GUEST = 4;
 const WA_DOWNLOAD_QUEUE_TIMEOUT_MS = 60_000;
-const MAX_GUEST_WA_MEDIA_STORED_BYTES = 512 * 1024 * 1024;
+// Observer and self-chat media share received/. Keep the combined directory
+// bounded while allowing retained videos and audio to coexist with new media.
+const DEFAULT_GUEST_WA_MEDIA_STORED_MB = 4096;
+export function guestMediaStoredBytesLimit(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = Number(env.SKOOBI_WA_GUEST_MEDIA_MAX_MB);
+  const mb =
+    Number.isInteger(raw) && raw >= 256 && raw <= 32_768
+      ? raw
+      : DEFAULT_GUEST_WA_MEDIA_STORED_MB;
+  return mb * 1024 * 1024;
+}
+const MAX_GUEST_WA_MEDIA_STORED_BYTES = guestMediaStoredBytesLimit();
 const MAX_RECEIVED_DIRECTORY_ENTRIES = 50_000;
 const WA_MEDIA_MAC_BYTES = 10;
 const AES_BLOCK_BYTES = 16;
@@ -537,6 +620,10 @@ async function prepareSafeReceivedDirectory(
   groupDir: string,
 ): Promise<SafeReceivedDirectory> {
   const receivedDir = path.join(groupDir, 'received');
+  // Create the validated group directory when media arrives before other
+  // tenant initialization. Keep received non-recursive to preserve the
+  // symlink and replacement checks below.
+  await fs.mkdir(groupDir, { recursive: true, mode: 0o700 });
   try {
     await fs.mkdir(receivedDir, { mode: 0o700 });
   } catch (err) {
@@ -665,6 +752,7 @@ export async function downloadWhatsappMedia(
   groupFolder: string,
   kind: WhatsappMediaKind,
   requestedAdmission?: WhatsappMediaAdmission,
+  context?: WhatsappMediaDownloadContext,
 ): Promise<DownloadedMedia | null> {
   let releaseDownloadSlot: WhatsappDownloadRelease | undefined;
   let releaseStorageReservation: (() => void) | undefined;
@@ -692,7 +780,9 @@ export async function downloadWhatsappMedia(
   try {
     const declared = declaredMediaByteLength(msg, kind);
     if (declared != null && declared > MAX_WA_MEDIA_BYTES) {
-      logger.warn(
+    // Observer media over the cap is routine; keep WARN for files directly
+    // addressed to the assistant.
+      logger[context?.observer ? 'info' : 'warn'](
         { msgId: msg.key?.id, kind, declared, cap: MAX_WA_MEDIA_BYTES },
         'WhatsApp media exceeds size cap (declared fileLength); skipping download',
       );
@@ -780,9 +870,7 @@ export async function downloadWhatsappMedia(
     ]);
     if (!response.ok) {
       await response.body?.cancel().catch(() => undefined);
-      throw new Error(
-        `WhatsApp media download failed with HTTP ${response.status}`,
-      );
+      throw new WhatsappMediaHttpError(response.status);
     }
     if (!response.body) {
       throw new Error('WhatsApp media response has no body');
@@ -859,17 +947,42 @@ export async function downloadWhatsappMedia(
     ) {
       await fs.unlink(tempPath).catch(() => undefined);
     }
-    logger.error(
-      {
-        err,
-        msgId: msg.key?.id,
-        kind,
-        ...(err instanceof WhatsappMediaTooLargeError
-          ? { size: err.actualBytes, cap: MAX_WA_MEDIA_BYTES }
-          : {}),
-      },
-      'WhatsApp media download failed',
-    );
+    if (
+      context?.source === 'history' &&
+      err instanceof WhatsappMediaHttpError &&
+      (err.status === 403 || err.status === 404 || err.status === 410)
+    ) {
+      // Historical WhatsApp CDN URLs routinely expire (403), or the media is
+      // gone from the CDN altogether (404/410). The backfill still completes
+      // and live media must
+      // keep its normal error-level signal.
+      logger.debug(
+        { kind, status: err.status, source: context.source },
+        'Historical WhatsApp media unavailable',
+      );
+    } else {
+      logger.error(
+        {
+          err,
+          msgId: msg.key?.id,
+          kind,
+          ...(err instanceof WhatsappMediaTooLargeError
+            ? { size: err.actualBytes, cap: MAX_WA_MEDIA_BYTES }
+            : {}),
+        },
+        'WhatsApp media download failed',
+      );
+    }
+    if (context?.onFailure) {
+      try {
+        context.onFailure({
+          transient: isTransientWhatsappMediaNetworkError(error),
+          errorKind: error.name || 'Error',
+        });
+      } catch {
+        // A caller's bookkeeping must never alter the null result.
+      }
+    }
     return null;
   } finally {
     if (timer) clearTimeout(timer);

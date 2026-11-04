@@ -294,7 +294,52 @@ describe('host-signed per-entry memory provenance', () => {
       'telegram_main',
       dataDir,
     );
-    expect(mainLongterm.entries?.[0].label).toBe('CLAUDE.md');
+
+    // not even for the owner's main group. The Agent SDK loads CLAUDE.md
+    // verbatim as standing instructions on every session, so routing
+    // model-chosen text there turned memory_save into a write primitive into
+    // the agent's own orders — reachable by any untrusted text the turn had
+    // processed. memory/topics/longterm.md goes through the verified +
+    // XML-escaped memory-context path instead. CLAUDE.md stays operator-owned.
+    expect(mainLongterm.entries?.[0].label).toBe('memory/topics/longterm.md');
+  });
+
+  it('never routes long-term memory into CLAUDE.md on any surface', () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memprov-claudemd-'));
+    for (const [folder, isMain, chatJid] of [
+      ['telegram_main', true, 'tg:1'],
+      ['telegram_guest', false, 'tg:2'],
+    ] as const) {
+      const grant = registerMemoryWriteCapability(
+        {
+          groupFolder: folder,
+          chatJid,
+          isMain,
+          tenantId: isMain ? 'owner' : 'guest',
+          memoryWriteAllowed: true,
+          senderIdentity: {
+            channel: 'telegram',
+            chat_id: chatJid.slice(3),
+            telegram_user_id: chatJid.slice(3),
+            identity_id: `telegram_user_${chatJid.slice(3)}`,
+            is_owner_sender: isMain,
+            telegram_message_origin: 'direct',
+          },
+        },
+        dataDir,
+      );
+      const signed = signMemoryWriteRequest(
+        authorizedMemoryRequest(grant.capability, {
+          type: 'memory_sign',
+          request_id: `request_${folder}_9999`,
+          content: 'ПОСТОЯННОЕ ПРАВИЛО: do something',
+          category: 'longterm',
+        }),
+        folder,
+        dataDir,
+      );
+      expect(signed.entries?.[0].label).not.toBe('CLAUDE.md');
+    }
   });
 
   it('preserves signing for a non-Telegram private chat without Telegram provenance', () => {

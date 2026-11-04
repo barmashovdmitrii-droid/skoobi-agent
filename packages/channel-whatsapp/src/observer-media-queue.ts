@@ -9,10 +9,18 @@
 
 export type ObserverMediaQueuePriority = 'notify' | 'append';
 
+/**
+ * A closure resolves `'retry'` to ask for one deferred re-run (a transient
+ * network failure while the live media URL is still fresh). The queue grants
+ * it once per job; a second `'retry'` ends the job as failed.
+ */
+export type ObserverMediaQueueRunOutcome = 'retry' | void;
+
 export interface ObserverMediaQueueJob {
   /**
    * Process-local deduplication key. It is retained only while the job is
-   * active or waiting and is never included in lifecycle events.
+   * active, waiting or waiting for its one retry, and is never included in
+   * lifecycle events.
    */
   key: string;
   /** Live notifications outrank passive history (`append`) work. */
@@ -21,7 +29,7 @@ export interface ObserverMediaQueueJob {
    * The closure owns all private job data. `close()` aborts the signal
    * cooperatively; a closure that ignores it may finish, but no next job starts.
    */
-  run: (signal: AbortSignal) => Promise<void>;
+  run: (signal: AbortSignal) => Promise<ObserverMediaQueueRunOutcome>;
 }
 
 export type ObserverMediaQueueRejectionReason =
@@ -38,7 +46,11 @@ export type ObserverMediaQueuePhase =
   | 'succeeded'
   | 'failed'
   | 'cancelled'
-  | 'rejected';
+  | 'rejected'
+  | 'retry_scheduled';
+
+/** Surfaced as `errorKind` when a job asks for a retry a second time. */
+export const OBSERVER_MEDIA_RETRY_EXHAUSTED = 'RetryExhausted';
 
 export interface ObserverMediaQueueSnapshot {
   /** Concurrency is intentionally fixed at one. */
@@ -46,6 +58,8 @@ export interface ObserverMediaQueueSnapshot {
   waiting: number;
   waitingNotify: number;
   waitingAppend: number;
+  /** Jobs parked on their one retry timer; not part of `waiting`. */
+  retrying: number;
   closed: boolean;
 }
 
@@ -62,6 +76,10 @@ export interface ObserverMediaQueueLifecycleEvent extends ObserverMediaQueueSnap
   cancellationReason?: ObserverMediaQueueCancellationReason;
   /** Sanitised Error.name/typeof only; never the exception message or stack. */
   errorKind?: string;
+  /** 0 for a first run, 1 for the one granted retry. */
+  attempt?: number;
+  /** Only with phase `retry_scheduled`. */
+  retryDelayMs?: number;
 }
 
 export interface ObserverMediaQueueOptions {
@@ -72,6 +90,11 @@ export interface ObserverMediaQueueOptions {
   ) => void | Promise<void>;
   /** Deterministic monotonic clock injection for tests. */
   now?: () => number;
+  /**
+   * Delay before one retry: allow a flapping uplink to settle while the
+   * WhatsApp media URL is still fresh.
+   */
+  retryDelayMs?: () => number;
 }
 
 export type ObserverMediaQueueEnqueueResult =
@@ -85,6 +108,12 @@ export interface ObserverMediaQueueCloseResult {
 
 interface WaitingJob extends ObserverMediaQueueJob {
   enqueuedAt: number;
+  attempt: number;
+}
+
+interface RetryTimer {
+  job: WaitingJob;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 interface ActiveJob {
@@ -95,6 +124,16 @@ interface ActiveJob {
 
 const MAX_DEDUPE_KEY_CHARS = 1_024;
 const MAX_CONFIGURED_WAITING = 10_000;
+const RETRY_MIN_DELAY_MS = 30_000;
+const RETRY_MAX_DELAY_MS = 60_000;
+const MAX_RETRY_ATTEMPTS = 1;
+
+function defaultRetryDelayMs(): number {
+  return (
+    RETRY_MIN_DELAY_MS +
+    Math.floor(Math.random() * (RETRY_MAX_DELAY_MS - RETRY_MIN_DELAY_MS))
+  );
+}
 
 function safeErrorKind(error: unknown): string {
   const raw = error instanceof Error ? error.name || 'Error' : typeof error;
@@ -123,9 +162,11 @@ export class ObserverMediaQueue {
   private readonly appendWaiting: WaitingJob[] = [];
   private readonly knownKeys = new Set<string>();
   private readonly idleWaiters = new Set<() => void>();
+  private readonly retryTimers = new Map<string, RetryTimer>();
   private readonly maxWaiting: number;
   private readonly onLifecycle?: ObserverMediaQueueOptions['onLifecycle'];
   private readonly nowProvider: () => number;
+  private readonly retryDelayProvider: () => number;
   private activeJob: ActiveJob | null = null;
   private closed = false;
 
@@ -142,6 +183,7 @@ export class ObserverMediaQueue {
     this.maxWaiting = options.maxWaiting;
     this.onLifecycle = options.onLifecycle;
     this.nowProvider = options.now ?? Date.now;
+    this.retryDelayProvider = options.retryDelayMs ?? defaultRetryDelayMs;
   }
 
   snapshot(): ObserverMediaQueueSnapshot {
@@ -150,6 +192,7 @@ export class ObserverMediaQueue {
       waiting: this.waitingCount(),
       waitingNotify: this.notifyWaiting.length,
       waitingAppend: this.appendWaiting.length,
+      retrying: this.retryTimers.size,
       closed: this.closed,
     };
   }
@@ -191,6 +234,7 @@ export class ObserverMediaQueue {
     const waiting: WaitingJob = {
       ...job,
       enqueuedAt: this.now(),
+      attempt: 0,
     };
     this.knownKeys.add(waiting.key);
     this.waitingQueue(waiting.priority).push(waiting);
@@ -222,7 +266,11 @@ export class ObserverMediaQueue {
     return { cancelledPending, activeAbortRequested };
   }
 
-  /** Resolves after both the active closure and all pending jobs are gone. */
+  /**
+   * Resolves after both the active closure and all pending jobs are gone. A
+   * job parked on its retry timer does not count: it holds no worker and no
+   * waiting slot, and `close()` cancels it.
+   */
   waitForIdle(): Promise<void> {
     if (this.isIdle()) return Promise.resolve();
     return new Promise((resolve) => {
@@ -255,6 +303,53 @@ export class ObserverMediaQueue {
     return Math.max(0, this.now() - startedAt);
   }
 
+  private retryDelayMs(): number {
+    try {
+      const value = Math.floor(Number(this.retryDelayProvider()));
+      return Number.isFinite(value) && value >= 0
+        ? Math.min(value, RETRY_MAX_DELAY_MS)
+        : defaultRetryDelayMs();
+    } catch {
+      return defaultRetryDelayMs();
+    }
+  }
+
+  /** Park the finished job on its one retry timer; its key stays reserved. */
+  private scheduleRetry(active: ActiveJob): void {
+    const delayMs = this.retryDelayMs();
+    const retryJob: WaitingJob = {
+      ...active.job,
+      attempt: active.job.attempt + 1,
+      enqueuedAt: this.now(),
+    };
+    const timer = setTimeout(() => {
+      this.retryTimers.delete(retryJob.key);
+      if (this.closed) {
+        this.knownKeys.delete(retryJob.key);
+        return;
+      }
+      // The retry re-enters the ordinary waiting set and keeps its priority;
+      // it bypasses `maxWaiting` because it never left the queue's budget.
+      retryJob.enqueuedAt = this.now();
+      this.waitingQueue(retryJob.priority).push(retryJob);
+      this.emitLifecycle({
+        phase: 'enqueued',
+        priority: retryJob.priority,
+        attempt: retryJob.attempt,
+      });
+      this.startNext();
+    }, delayMs);
+    timer.unref?.();
+    this.retryTimers.set(retryJob.key, { job: retryJob, timer });
+    this.emitLifecycle({
+      phase: 'retry_scheduled',
+      priority: retryJob.priority,
+      attempt: retryJob.attempt,
+      retryDelayMs: delayMs,
+      durationMs: this.elapsedSince(active.startedAt),
+    });
+  }
+
   private emitLifecycle(
     event: Pick<
       ObserverMediaQueueLifecycleEvent,
@@ -265,6 +360,8 @@ export class ObserverMediaQueue {
       | 'rejectionReason'
       | 'cancellationReason'
       | 'errorKind'
+      | 'attempt'
+      | 'retryDelayMs'
     >,
   ): void {
     if (!this.onLifecycle) return;
@@ -279,9 +376,13 @@ export class ObserverMediaQueue {
   }
 
   private cancelWaiting(reason: ObserverMediaQueueCancellationReason): number {
+    const parkedRetries = [...this.retryTimers.values()];
+    for (const parked of parkedRetries) clearTimeout(parked.timer);
+    this.retryTimers.clear();
     const cancelled = [
       ...this.notifyWaiting.splice(0),
       ...this.appendWaiting.splice(0),
+      ...parkedRetries.map((parked) => parked.job),
     ];
     for (const job of cancelled) {
       this.knownKeys.delete(job.key);
@@ -290,6 +391,7 @@ export class ObserverMediaQueue {
         priority: job.priority,
         queueWaitMs: this.elapsedSince(job.enqueuedAt),
         cancellationReason: reason,
+        attempt: job.attempt,
       });
     }
     this.resolveIdleWaitersIfIdle();
@@ -317,6 +419,7 @@ export class ObserverMediaQueue {
       phase: 'started',
       priority: job.priority,
       queueWaitMs: Math.max(0, active.startedAt - job.enqueuedAt),
+      attempt: job.attempt,
     });
     // executeActive catches every closure error and deliberately never rejects.
     void this.executeActive(active);
@@ -328,12 +431,22 @@ export class ObserverMediaQueue {
       'succeeded' | 'failed' | 'cancelled'
     > = 'succeeded';
     let errorKind: string | undefined;
+    let retryRequested = false;
     try {
       if (active.controller.signal.aborted) {
         phase = 'cancelled';
       } else {
-        await active.job.run(active.controller.signal);
-        if (active.controller.signal.aborted) phase = 'cancelled';
+        const outcome = await active.job.run(active.controller.signal);
+        if (active.controller.signal.aborted) {
+          phase = 'cancelled';
+        } else if (outcome === 'retry') {
+          if (active.job.attempt < MAX_RETRY_ATTEMPTS && !this.closed) {
+            retryRequested = true;
+          } else {
+            phase = 'failed';
+            errorKind = OBSERVER_MEDIA_RETRY_EXHAUSTED;
+          }
+        }
       }
     } catch (error) {
       if (active.controller.signal.aborted) {
@@ -344,17 +457,22 @@ export class ObserverMediaQueue {
       }
     }
 
-    this.knownKeys.delete(active.job.key);
     if (this.activeJob === active) this.activeJob = null;
-    this.emitLifecycle({
-      phase,
-      priority: active.job.priority,
-      durationMs: this.elapsedSince(active.startedAt),
-      ...(phase === 'failed' ? { errorKind } : {}),
-      ...(phase === 'cancelled'
-        ? { cancellationReason: 'closed' as const }
-        : {}),
-    });
+    if (retryRequested) {
+      this.scheduleRetry(active);
+    } else {
+      this.knownKeys.delete(active.job.key);
+      this.emitLifecycle({
+        phase,
+        priority: active.job.priority,
+        durationMs: this.elapsedSince(active.startedAt),
+        attempt: active.job.attempt,
+        ...(phase === 'failed' ? { errorKind } : {}),
+        ...(phase === 'cancelled'
+          ? { cancellationReason: 'closed' as const }
+          : {}),
+      });
+    }
 
     if (!this.closed) this.startNext();
     this.resolveIdleWaitersIfIdle();

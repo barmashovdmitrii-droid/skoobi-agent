@@ -14,9 +14,6 @@ const EVENT_ICONS: Record<string, string> = {
   runtime_selected: 'cpu',
   session_finished: 'flag',
   skill_selected: 'sparkles',
-  quota_checked: 'coin',
-  quota_charged: 'coin',
-  quota_degraded_mode_used: 'coin',
   model_gateway_live_response: 'bolt',
   error: 'alert',
   provider_failover_attempt: 'refresh',
@@ -140,12 +137,6 @@ export function humanizeEvent(input: {
         ? `Навык «${payload.skill}» для ${who}`
         : `Выбран навык для ${who}`;
       break;
-    case 'quota_charged':
-      text = `Списаны кредиты: ${who}`;
-      break;
-    case 'quota_degraded_mode_used':
-      text = `Экономный режим (квота исчерпана): ${who}`;
-      break;
     case 'error': {
       const kind = String(payload.kind || '').slice(0, 80);
       const kindRu = humanizeErrorKind(kind);
@@ -188,15 +179,6 @@ export function humanizeEvent(input: {
       break;
     case 'session_started':
       text = `Разговор с ${who} начат`;
-      break;
-    case 'quota_blocked':
-      text = `Запрос остановлен квотой: ${who}`;
-      break;
-    case 'payment_created':
-      text = `Создан счёт на оплату: ${who}`;
-      break;
-    case 'payment_confirmed':
-      text = `Оплата подтверждена: ${who}`;
       break;
     default:
       // Неизвестный тип может содержать внутренний идентификатор. Технические
@@ -250,6 +232,8 @@ export function humanizeTaskStatus(status: string | null): string {
       return 'на паузе';
     case 'completed':
       return 'завершена';
+    case 'cancelled':
+      return 'отменена';
     default:
       return status || '—';
   }
@@ -315,13 +299,22 @@ export function humanizeCron(value: string): string {
   return fallback;
 }
 
-// Строка pino-pretty лога → {time, level, text}. ANSI-коды срезаются.
-// Формат: «[18:15:49.641] INFO (19699): Telegram message sent».
+// Строка pino-pretty лога → {date?, time, level, text}. ANSI-коды срезаются.
+//
+// Два формата, оба обязаны разбираться:
+//   старый: «[12:00:00.000] INFO (1234): Telegram message sent»
+//   новый:  «[2000-01-01 12:00:00.000] INFO (1234): Telegram message sent»
+// Дата стала частью формата (см. packages/shared/src/logger.ts), но в
+// logs/claudeclaw.log и в .gz-поколениях лежат месяцы строк без даты —
+// если разбирать только новый формат, лента событий на панели опустеет.
+// ANSI по-прежнему срезается: в архивных строках он есть.
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const LOG_LINE_RE =
-  /^\[(\d{2}:\d{2}:\d{2})[.\d]*\]\s+(\w+)\s+\((\d+)\):\s*(.*)$/;
+  /^\[(?:(\d{4}-\d{2}-\d{2})[ T])?(\d{2}:\d{2}:\d{2})[.\d]*\]\s+(\w+)\s+\((\d+)\):\s*(.*)$/;
 
 export type LogLine = {
+  /** ISO-дата, если строка из нового формата; иначе null. */
+  date: string | null;
   time: string;
   level: string;
   pid: number;
@@ -333,10 +326,11 @@ export function parseLogLine(raw: string): LogLine | null {
   const m = clean.match(LOG_LINE_RE);
   if (!m) return null;
   return {
-    time: m[1],
-    level: m[2].toUpperCase(),
-    pid: Number(m[3]),
-    text: m[4].trim(),
+    date: m[1] ?? null,
+    time: m[2],
+    level: m[3].toUpperCase(),
+    pid: Number(m[4]),
+    text: m[5].trim(),
   };
 }
 

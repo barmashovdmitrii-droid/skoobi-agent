@@ -29,8 +29,12 @@ vi.mock('@skoobi/shared/logger', () => ({
 
 import {
   downloadWhatsappMedia,
+  guestMediaStoredBytesLimit,
+  isTransientWhatsappMediaNetworkError,
+  type WhatsappMediaDownloadFailure,
   type WhatsappMediaKind,
 } from './whatsapp-media.js';
+import { logger } from '@skoobi/shared/logger';
 
 const MEDIA_KEY = Buffer.alloc(32, 0x37);
 const ONE_MIB = 1024 * 1024;
@@ -246,6 +250,115 @@ describe('downloadWhatsappMedia streaming limits', () => {
     expect((await fs.stat(result!.path)).size).toBe(MAX_MEDIA_BYTES);
   });
 
+  // Observer enrichment asks for one retry only on network-level failures
+  // The classification lives next to the download so the queue and
+  // the channel stay content-free.
+  describe('failure classification for the observer retry', () => {
+    it('treats undici fetch failures and socket codes as transient, HTTP statuses as final', () => {
+      const fetchFailed = Object.assign(new TypeError('fetch failed'), {
+        cause: Object.assign(new Error('read ECONNRESET'), {
+          code: 'ECONNRESET',
+        }),
+      });
+      expect(isTransientWhatsappMediaNetworkError(fetchFailed)).toBe(true);
+      expect(
+        isTransientWhatsappMediaNetworkError(new TypeError('fetch failed')),
+      ).toBe(true);
+      expect(
+        isTransientWhatsappMediaNetworkError(
+          Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }),
+        ),
+      ).toBe(true);
+      expect(
+        isTransientWhatsappMediaNetworkError(new Error('decrypt failed')),
+      ).toBe(false);
+      expect(isTransientWhatsappMediaNetworkError('fetch failed')).toBe(false);
+    });
+
+    it('reports the classified failure through context.onFailure', async () => {
+      vi.mocked(logger.error).mockClear();
+      const failures: WhatsappMediaDownloadFailure[] = [];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockRejectedValue(
+          Object.assign(new TypeError('fetch failed'), {
+            cause: Object.assign(new Error('ECONNRESET'), {
+              code: 'ECONNRESET',
+            }),
+          }),
+        ),
+      );
+      expect(
+        await downloadWhatsappMedia(
+          messageFor('voice', 10, 'live-reset'),
+          'owner-group',
+          'voice',
+          undefined,
+          { source: 'live', observer: true, onFailure: (f) => failures.push(f) },
+        ),
+      ).toBeNull();
+      expect(failures).toEqual([{ transient: true, errorKind: 'TypeError' }]);
+      // The live ERROR line stays: only the retry decision is new.
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: 'voice' }),
+        'WhatsApp media download failed',
+      );
+
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue({ ok: false, status: 404, body: null }),
+      );
+      expect(
+        await downloadWhatsappMedia(
+          messageFor('voice', 10, 'live-gone'),
+          'owner-group',
+          'voice',
+          undefined,
+          {
+            source: 'live',
+            onFailure: (f) => {
+              failures.push(f);
+              throw new Error('callback bugs must not change the result');
+            },
+          },
+        ),
+      ).toBeNull();
+      expect(failures[1]).toEqual({
+        transient: false,
+        errorKind: 'WhatsappMediaHttpError',
+      });
+    });
+
+    it('logs an over-cap observer declaration at INFO, owner media at WARN', async () => {
+      vi.mocked(logger.info).mockClear();
+      vi.mocked(logger.warn).mockClear();
+      vi.stubGlobal('fetch', vi.fn());
+
+      await downloadWhatsappMedia(
+        messageFor('video', MAX_MEDIA_BYTES + 1, 'observer-big'),
+        'owner-group',
+        'video',
+        undefined,
+        { source: 'live', observer: true },
+      );
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: 'video', cap: MAX_MEDIA_BYTES }),
+        'WhatsApp media exceeds size cap (declared fileLength); skipping download',
+      );
+      expect(logger.warn).not.toHaveBeenCalled();
+
+      await downloadWhatsappMedia(
+        messageFor('video', MAX_MEDIA_BYTES + 1, 'owner-big'),
+        'owner-group',
+        'video',
+      );
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: 'video', cap: MAX_MEDIA_BYTES }),
+        'WhatsApp media exceeds size cap (declared fileLength); skipping download',
+      );
+    });
+  });
+
   it('fast-rejects an over-cap declared length without starting a download', async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
@@ -259,6 +372,75 @@ describe('downloadWhatsappMedia streaming limits', () => {
     expect(result).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it('keeps an expired historical URL out of error logs while preserving live-media errors', async () => {
+    vi.mocked(logger.debug).mockClear();
+    vi.mocked(logger.error).mockClear();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 403,
+      body: null,
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const historical = await downloadWhatsappMedia(
+      messageFor('voice', 10, 'history-expired'),
+      'owner-group',
+      'voice',
+      undefined,
+      { source: 'history' },
+    );
+
+    expect(historical).toBeNull();
+    expect(logger.debug).toHaveBeenCalledWith(
+      { kind: 'voice', status: 403, source: 'history' },
+      'Historical WhatsApp media unavailable',
+    );
+    expect(logger.error).not.toHaveBeenCalled();
+
+    vi.mocked(logger.debug).mockClear();
+    const live = await downloadWhatsappMedia(
+      messageFor('voice', 10, 'live-expired'),
+      'owner-group',
+      'voice',
+    );
+
+    expect(live).toBeNull();
+    expect(logger.debug).not.toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({
+        err: expect.objectContaining({ status: 403 }),
+        msgId: 'live-expired',
+        kind: 'voice',
+      }),
+      'WhatsApp media download failed',
+    );
+  });
+
+  it.each([404, 410])(
+    'treats a historical %i (media gone from the CDN) like an expired URL',
+    async (status) => {
+      vi.mocked(logger.debug).mockClear();
+      vi.mocked(logger.error).mockClear();
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue({ ok: false, status, body: null }),
+      );
+      const historical = await downloadWhatsappMedia(
+        messageFor('voice', 10, `history-gone-${status}`),
+        'owner-group',
+        'voice',
+        undefined,
+        { source: 'history' },
+      );
+      expect(historical).toBeNull();
+      expect(logger.debug).toHaveBeenCalledWith(
+        { kind: 'voice', status, source: 'history' },
+        'Historical WhatsApp media unavailable',
+      );
+      expect(logger.error).not.toHaveBeenCalled();
+    },
+  );
 
   it('rejects a guest-controlled received-directory symlink without writing outside the group', async () => {
     const outside = await fs.mkdtemp(
@@ -286,7 +468,8 @@ describe('downloadWhatsappMedia streaming limits', () => {
     const received = path.join(testState.groupDir, 'received');
     await fs.mkdir(received);
     const existing = await fs.open(path.join(received, 'guest-fill.bin'), 'wx');
-    await existing.truncate(500 * ONE_MIB);
+    // Sparse: just under the limit, so the next 25 MiB reservation cannot fit.
+    await existing.truncate(guestMediaStoredBytesLimit({}) - 10 * ONE_MIB);
     await existing.close();
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
@@ -511,4 +694,27 @@ describe('downloadWhatsappMedia streaming limits', () => {
     expect(produced).toBe(producedAtCancel);
     expect(await receivedEntries()).toEqual([]);
   });
+});
+
+describe('guest media storage limit', () => {
+  const MiB = 1024 * 1024;
+
+  it('defaults to 4 GiB — 512 MiB filled up and blocked all guest media', () => {
+    expect(guestMediaStoredBytesLimit({})).toBe(4096 * MiB);
+  });
+
+  it('accepts an override within sane bounds', () => {
+    expect(
+      guestMediaStoredBytesLimit({ SKOOBI_WA_GUEST_MEDIA_MAX_MB: '1024' }),
+    ).toBe(1024 * MiB);
+  });
+
+  it.each(['10', '999999', 'abc', '1.5', ''])(
+    'ignores the out-of-range or malformed value %j',
+    (value) => {
+      expect(
+        guestMediaStoredBytesLimit({ SKOOBI_WA_GUEST_MEDIA_MAX_MB: value }),
+      ).toBe(4096 * MiB);
+    },
+  );
 });

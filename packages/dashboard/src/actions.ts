@@ -4,6 +4,10 @@ import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
 
+import {
+  nextRunForResumedTask,
+  type ResumableTaskFields,
+} from '@skoobi/core/task-next-run';
 import { logger } from '@skoobi/shared/logger';
 
 import { writeDb } from './db.js';
@@ -32,7 +36,6 @@ const defaultLaunchctlExecutor = execFileAsync as LaunchctlExecutor;
 // env-тумблеры: только эти ключи, только true/false.
 const ENV_TOGGLES: Record<string, string> = {
   image_generation: 'SKOOBI_IMAGE_GENERATION_ENABLED',
-  payments: 'SKOOBI_PAYMENT_ENABLED',
   guest_live: 'SKOOBI_TELEGRAM_GUEST_LIVE_ENABLED',
 };
 
@@ -49,10 +52,24 @@ export type ActionResult = {
 function audit(entry: Record<string, unknown>): void {
   try {
     fs.mkdirSync(path.dirname(ACTIONS_LOG_FILE), { recursive: true });
+    // Журнал содержит полный текст сообщений панель-чата и параметры действий,
+    // то есть настолько же чувствителен, как messages.db (0600). Раньше файл
+    // создавался с umask по умолчанию и оказывался 0644 — читаемым любым
+    // процессом, включая ходы агента с чужим текстом в промпте
+    //. mode в appendFileSync действует только
+    // при создании, поэтому режим ещё и подтверждаем явно.
     fs.appendFileSync(
       ACTIONS_LOG_FILE,
       JSON.stringify({ at: new Date().toISOString(), ...entry }) + '\n',
+      { mode: 0o600 },
     );
+    try {
+      if ((fs.statSync(ACTIONS_LOG_FILE).mode & 0o077) !== 0) {
+        fs.chmodSync(ACTIONS_LOG_FILE, 0o600);
+      }
+    } catch {
+      // права — не повод потерять запись аудита
+    }
   } catch (err) {
     logger.warn({ err }, 'dashboard: audit write failed');
   }
@@ -375,18 +392,50 @@ export async function runAction(
           break;
         }
         const value = req.params.value === true;
-        const info = writeDb()
-          .prepare(
-            `UPDATE scheduled_tasks SET status = ? WHERE id = ? AND status != 'completed'`,
-          )
-          .run(value ? 'paused' : 'active', id);
+        const db = writeDb();
+        // Включение повторяющейся задачи, которую планировщик сам поставил на
+        // паузу (сбой с возможным внешним действием или N сбоев подряд),
+        // заново назначает ей ближайший запуск: там next_run = NULL, а такие
+        // задачи планировщик не берёт, и «включённая» задача молча не шла бы
+        // никогда. Правило то же, что у бота (@skoobi/core/task-next-run).
+        // COALESCE: если next_run уже есть, он не трогается.
+        // Отменённая задача (cancel_task оставляет строку ради истории,
+        // ) — не пауза: кнопка не должна её оживлять, иначе она
+        // запустилась бы сразу по COALESCE(next_run, now).
+        let rearmedNextRun: string | null = null;
+        if (!value) {
+          const row = db
+            .prepare(
+              `SELECT id, schedule_type, schedule_value, next_run, status
+                 FROM scheduled_tasks
+                WHERE id = ? AND status NOT IN ('completed', 'cancelled')`,
+            )
+            .get(id) as ResumableTaskFields | undefined;
+          rearmedNextRun = row ? nextRunForResumedTask(row) : null;
+        }
+        const info = value
+          ? db
+              .prepare(
+                `UPDATE scheduled_tasks SET status = 'paused'
+                  WHERE id = ? AND status NOT IN ('completed', 'cancelled')`,
+              )
+              .run(id)
+          : db
+              .prepare(
+                `UPDATE scheduled_tasks SET status = 'active', next_run = COALESCE(next_run, ?)
+                  WHERE id = ? AND status NOT IN ('completed', 'cancelled')`,
+              )
+              .run(rearmedNextRun, id);
         result =
           info.changes > 0
             ? {
                 ok: true,
                 message: value ? 'Задача на паузе' : 'Задача включена',
               }
-            : { ok: false, message: 'Задача не найдена (или уже завершена)' };
+            : {
+                ok: false,
+                message: 'Задача не найдена (или уже завершена/отменена)',
+              };
         break;
       }
 
@@ -396,9 +445,31 @@ export async function runAction(
           result = { ok: false, message: 'Некорректная задача' };
           break;
         }
+        const db = writeDb();
+        // Завершённую или отменённую задачу (cancel_task оставляет строку
+        // ради истории) оживить нельзя — ни «сейчас», ни ⏸/▶;
+        // прежний ответ «на паузе — включи кнопкой ▶» вёл по кругу, потому
+        // что та кнопка для таких строк отключена.
+        const row = db
+          .prepare(`SELECT status FROM scheduled_tasks WHERE id = ?`)
+          .get(id) as { status: string } | undefined;
+        if (!row) {
+          result = { ok: false, message: 'Задача не найдена' };
+          break;
+        }
+        if (row.status === 'cancelled' || row.status === 'completed') {
+          result = {
+            ok: false,
+            message:
+              row.status === 'cancelled'
+                ? 'Задача отменена — запустить её нельзя, создай заново (schedule_task)'
+                : 'Задача уже завершена — запустить её нельзя, создай заново (schedule_task)',
+          };
+          break;
+        }
         // «Сейчас» не снимает паузу молча (находка ревью): паузная задача
         // осталась бы активной и после разового запуска.
-        const info = writeDb()
+        const info = db
           .prepare(
             `UPDATE scheduled_tasks SET next_run = ? WHERE id = ? AND status = 'active'`,
           )
@@ -408,8 +479,7 @@ export async function runAction(
             ? { ok: true, message: 'Запустится в ближайшую минуту' }
             : {
                 ok: false,
-                message:
-                  'Задача не найдена или на паузе (сначала включи её кнопкой ▶)',
+                message: 'Задача на паузе (сначала включи её кнопкой ▶)',
               };
         break;
       }
