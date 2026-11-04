@@ -17,6 +17,23 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_internal_package_hardlinks_become_independent_equal_executables(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve(); a = root / 'esbuild'; b = root / 'package-esbuild'
+            a.write_bytes(b'fixture executable'); a.chmod(0o700); os.link(a, b)
+            self.assertEqual(m.detach_internal_hardlinks(root), 1)
+            self.assertEqual(a.read_bytes(), b.read_bytes())
+            self.assertEqual(a.stat().st_nlink, 1); self.assertEqual(b.stat().st_nlink, 1)
+            self.assertEqual(a.stat().st_mode & 0o777, 0o700)
+
+    def test_external_hardlink_is_refused_without_touching_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve(); code = root / 'release'; code.mkdir()
+            outside = root / 'outside'; outside.write_bytes(b'outside bytes'); os.link(outside, code / 'alias')
+            before = outside.stat().st_ino
+            with self.assertRaisesRegex(RuntimeError, 'external_build_hardlink'): m.detach_internal_hardlinks(code)
+            self.assertEqual(outside.stat().st_ino, before); self.assertEqual(outside.read_bytes(), b'outside bytes')
+
     def test_native_npm_loads_distinct_empty_isolated_configs(self):
         node = shutil.which('node'); npm = shutil.which('npm')
         if not node or not npm: self.skipTest('native npm and Node required')

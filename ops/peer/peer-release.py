@@ -180,6 +180,42 @@ def build_environment(stage, code, node, tmp, native):
            'PLAYWRIGHT_BROWSERS_PATH': str(code / '.peer-browsers')}
 
 
+def detach_internal_hardlinks(root):
+    """npm/esbuild links its two executables; retain bytes as independent files.
+
+    Never accept a link to a file outside the new release, and never follow a
+    symlink directory. The deployment controller continues to reject hardlinks.
+    """
+    root = deployment.directory(root); groups = {}
+    for current, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = [name for name in dirs if not (Path(current) / name).is_symlink()]
+        for name in files:
+            p = Path(current) / name; s = p.lstat()
+            if stat.S_ISREG(s.st_mode) and s.st_nlink > 1:
+                groups.setdefault((s.st_dev, s.st_ino), []).append(p)
+    # Validate all groups before the first rewrite.
+    for paths in groups.values():
+        for p in paths:
+            s = p.lstat()
+            if s.st_uid != os.getuid() or s.st_nlink != len(paths) or not stat.S_ISREG(s.st_mode):
+                deployment.fail('external_build_hardlink')
+    for paths in groups.values():
+        for p in paths[:-1]:
+            before = p.lstat(); expected = deployment.digest(p)
+            fd, temp = tempfile.mkstemp(prefix='.peer-detach-', dir=p.parent)
+            try:
+                with os.fdopen(fd, 'wb') as output, p.open('rb') as source:
+                    shutil.copyfileobj(source, output); output.flush(); os.fsync(output.fileno())
+                os.chmod(temp, stat.S_IMODE(before.st_mode))
+                after = p.lstat()
+                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) or deployment.digest(temp) != expected:
+                    deployment.fail('build_hardlink_changed')
+                os.replace(temp, p)
+            finally:
+                if os.path.lexists(temp): os.unlink(temp)
+    return len(groups)
+
+
 def build(bundle, stage, node):
     # Destructive-operation test fixtures deliberately accept only OS temp
     # locations. Keep an owned private directory there, never disable the guard.
@@ -248,6 +284,7 @@ def build_native(bundle, stage, node, tmp):
     for p in sorted(code.rglob('__pycache__'), reverse=True):
         if p.is_dir() and not p.is_symlink() and 'node_modules' not in p.parts:
             shutil.rmtree(p)
+    detached = detach_internal_hardlinks(code)
     record = deployment.release_record(code)
     verified = {'schema': 1, 'status': 'verified', 'protocol': 2, 'sourceCommit': receipt['sourceCommit'],
                 'cliVersion': receipt['cliVersion'], 'nodeVersion': version, 'nodeSha256': deployment.digest(node),
@@ -255,7 +292,8 @@ def build_native(bundle, stage, node, tmp):
                 'releaseRecord': record, 'checkReceipts': checks,
                 'checks': {'nativeRuntime': True, 'build': True, 'tests': True,
                            'workerAdapter': True, 'privateStateExcluded': True},
-                'builtAt': time.time(), 'modelCalled': False, 'serviceStarted': False}
+                'builtAt': time.time(), 'modelCalled': False, 'serviceStarted': False,
+                'detachedInternalHardlinkGroups': detached}
     deployment.save(stage / 'release-receipt.private.json', verified, True)
     return {'status': 'verified', 'sourceCommit': receipt['sourceCommit'],
             'checks': len(checks), 'files': record['tree']['files'], 'liveMutated': False}
