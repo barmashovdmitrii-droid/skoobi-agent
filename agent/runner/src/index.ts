@@ -208,6 +208,8 @@ interface ContainerInput {
   operationTraceCapability?: string;
   memoryProvenancePublicKey?: string;
   taskAuthorizationCapability?: string;
+  /** Separate, private game-project authority; never grants Google or desktop access. */
+  gameFactoryCapability?: string;
   codexGuiControlAuthorized?: boolean;
   codexControlRunId?: string;
   credentialProxyTier?: 'owner' | 'guest';
@@ -717,6 +719,10 @@ export function buildClaudeclawMcpEnv(
     CLAUDECLAW_TASK_AUTHORIZATION_CAPABILITY: trustedOwner
       ? containerInput.taskAuthorizationCapability || ''
       : '',
+    CLAUDECLAW_GAME_FACTORY_CAPABILITY:
+      trustedOwner && containerInput.isScheduledTask !== true
+        ? containerInput.gameFactoryCapability || ''
+        : '',
     CLAUDECLAW_SKILLS_DIR:
       process.env.CLAUDECLAW_SKILLS_DIR || '/workspace/skills',
     // Server-side tool lockout (ipc-mcp-stdio registerTool). The SDK also
@@ -1103,7 +1109,7 @@ export function codexPreambleForFreshThread(
  *
  * Проверка 09.10.2026 (MEM-5): cross_channel_owner_context (5 238 зн., один
  * md5 во всех 30/30 ходах владельца — входящих WhatsApp нет) и skoobi_skills
- * (4 141 зн. у Андрея, 5 вариантов на 41 ход) повторялись целиком. Теперь они
+ * повторялись целиком в нескольких ходах. Теперь они
  * стабятся по тем же правилам: только при равном хеше, полностью после
  * компакции.
  */

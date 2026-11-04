@@ -168,6 +168,7 @@ afterEach(() => {
   delete process.env.CLAUDECLAW_PERSONA_ID;
   delete process.env.CLAUDECLAW_SHARED_USER_MEMORY_DIR;
   delete process.env.CLAUDECLAW_TASK_AUTHORIZATION_CAPABILITY;
+  delete process.env.CLAUDECLAW_GAME_FACTORY_CAPABILITY;
   delete process.env.CLAUDECLAW_OPERATION_TRACE_CAPABILITY;
   for (const key of Object.keys(process.env)) {
     if (key.startsWith('CLAUDECLAW_CHAT_HISTORY_')) delete process.env[key];
@@ -2921,5 +2922,37 @@ describe('chat_history', () => {
     expect(denyChatHistoryIfNotOwner(true, false, true)?.isError).toBe(true);
     expect(denyChatHistoryIfNotOwner(false, true, true)?.isError).toBe(true);
     expect(denyChatHistoryIfNotOwner(true, true, false)?.isError).toBe(true);
+  });
+});
+
+
+describe('game factory tool authority', () => {
+  it('exposes configured second-admin factory tools without Google or desktop grants', async () => {
+    process.env.CLAUDECLAW_IS_MAIN = '1';
+    process.env.CLAUDECLAW_IS_TRUSTED_OWNER_RUN = '1';
+    process.env.CLAUDECLAW_GAME_FACTORY_CAPABILITY = 'fixture-capability';
+    delete process.env.CLAUDECLAW_TASK_AUTHORIZATION_CAPABILITY;
+    await import('./ipc-mcp-stdio.js');
+    expect(registeredTools.has('game_factory_status')).toBe(true);
+    expect(registeredTools.has('game_factory_control')).toBe(true);
+    expect(registeredTools.has('codex_desktop_control')).toBe(false);
+  });
+  it('withholds tools when the host did not issue factory authority', async () => {
+    process.env.CLAUDECLAW_IS_MAIN = '1';
+    process.env.CLAUDECLAW_IS_TRUSTED_OWNER_RUN = '1';
+    await import('./ipc-mcp-stdio.js');
+    expect(registeredTools.has('game_factory_status')).toBe(false);
+    expect(registeredTools.has('game_factory_control')).toBe(false);
+  });
+  it('quarantines control while retaining the read surface', async () => {
+    process.env.CLAUDECLAW_IS_MAIN = '1';
+    process.env.CLAUDECLAW_IS_TRUSTED_OWNER_RUN = '1';
+    process.env.CLAUDECLAW_GAME_FACTORY_CAPABILITY = 'fixture-capability';
+    process.env.CLAUDECLAW_DISALLOWED_TOOLS = 'game_factory_control';
+    try {
+      await import('./ipc-mcp-stdio.js');
+      expect(registeredTools.has('game_factory_status')).toBe(true);
+      expect(registeredTools.has('game_factory_control')).toBe(false);
+    } finally { delete process.env.CLAUDECLAW_DISALLOWED_TOOLS; }
   });
 });

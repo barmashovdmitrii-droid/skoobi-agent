@@ -7,7 +7,6 @@ import crypto from 'node:crypto';
 import {Readable} from 'node:stream';
 import {spawn,spawnSync} from 'node:child_process';
 import {once} from 'node:events';
-import {fileURLToPath} from 'node:url';
 import {JobStore,atomicWrite,privateRead,privateDirectory,sha256,validateSnapshot,validateRequest,validateInputs,rpc,captureArtifact,readRpc,acquireProcessLock,acquireFileLock} from './skoobi-peer-core.mjs';
 import {submit,cancel,reconcile,watchOnce,acquireCoordinatorLock,downloadArtifacts,enqueueResult,portableOwnerInstructions} from './skoobi-peer.mjs';
 
@@ -104,17 +103,8 @@ test('the owner persona is replicated without recursive coordinator instructions
   const id='0'.repeat(24),original='Owner personality and durable preferences.\n',block='<!-- skoobi-peer-routing:'+id+' -->\nCoordinator commands only.\n<!-- /skoobi-peer-routing:'+id+' -->\n\n';assert.equal(portableOwnerInstructions(block+original,id),original);assert.equal(portableOwnerInstructions(original,id),original);assert.throws(()=>portableOwnerInstructions(block.split('<!-- /')[0],id));
 });
 
-test('returned documents pass the actual existing IPC workspace validator',t=>{
-  const root=fixture(t),c=config(root,'coordinator'),store=new JobStore(root),r={...request(),notify:true};store.submit(r);
-  fs.mkdirSync(path.join(root,'data/ipc/telegram_main/messages'),{recursive:true,mode:0o700});fs.mkdirSync(path.join(root,'groups/telegram_main'),{recursive:true,mode:0o700});
-  const file=path.join(store.dir(r.id),'report.txt'),bytes=Buffer.from('Synthetic returned document');atomicWrite(file,bytes,true);const a={name:sha256(bytes)+'.txt',sha256:sha256(bytes),kind:'document',bytes:bytes.length,localPath:file};
-  enqueueResult(c,r.id,{title:r.title,state:'succeeded',deliveries:[]},[a]);
-  const outbox=path.join(root,'data/ipc/telegram_main/messages');const sent=fs.readdirSync(outbox).map(n=>JSON.parse(fs.readFileSync(path.join(outbox,n)))).find(x=>x.type==='document');
-  const qa=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..');
-  const code='import {validateIpcSendFilePath} from '+JSON.stringify(path.join(qa,'dist/orchestrator/ipc.js'))+'; const r=validateIpcSendFilePath('+JSON.stringify({sourceGroup:'telegram_main',isMain:false,filePath:sent.filePath,kind:'document'})+');if(!r.allowed)throw Error(r.reason);console.log("PASS");';
-  const checked=spawnSync(process.execPath,['--input-type=module'],{input:code,encoding:'utf8',cwd:qa,env:{...process.env,SKOOBI_TEST_STATE_ROOT:root,CLAUDECLAW_ENV_FILE:path.join(root,'.env')}});
-  assert.equal(checked.status,0,checked.stderr);assert.match(checked.stdout,/PASS/);
-});
+// The core IPC workspace check runs in scripts/peer-coordinator.test.mjs so
+// Vitest resolves current TypeScript sources without requiring a prior build.
 
 function deferred(){let resolve;const promise=new Promise(r=>resolve=r);return{promise,resolve};}
 

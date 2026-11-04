@@ -15,6 +15,104 @@ export interface ArtifactJobCodexConfig {
   prompt: string;
 }
 
+export const ARTIFACT_CODEX_PERMISSION_PROFILE = 'artifact-tools';
+export const ARTIFACT_CODEX_TOOL_POLICY = 'macos-codex-tool-permissions-v1';
+export interface ArtifactJobCodexLaunch {
+  args: string[];
+  env: Record<string, string>;
+  input: string;
+  permissionsProfile: typeof ARTIFACT_CODEX_PERMISSION_PROFILE;
+  toolProfileSha256: string;
+  /** Хост вызывает только после проверки границы на синтетической авторизации. */
+  seedAuth: () => void;
+}
+
+const ARTIFACT_DISABLED_FEATURES = [
+  'apps',
+  'plugins',
+  'hooks',
+  'browser_use',
+  'browser_use_external',
+  'browser_use_full_cdp_access',
+  'computer_use',
+  'in_app_browser',
+  'image_generation',
+  'view_image',
+  'multi_agent',
+  'multi_agent_v2',
+  'memories',
+  'external_agent_memory_import',
+  'code_mode',
+  'code_mode_host',
+  'skill_search',
+  'skill_mcp_dependency_install',
+  'workspace_dependencies',
+  'plugin_discovery_prefetch',
+  'remote_plugin',
+  'multi_env_copy_file',
+  'in_app_local_automation',
+  'auth_elicitation',
+  'daemon_auto_start',
+];
+
+/** Только command sandbox. Контроллер Codex читает auth, его инструменты — нет. */
+export function artifactCodexPermissionConfiguration(
+  workspace: string,
+  home: string,
+  readPaths: string[] = [],
+): string[] {
+  const root = fs.realpathSync(workspace);
+  if (root !== workspace || path.dirname(home) !== path.join(root, 'home'))
+    throw new Error('model_workspace_invalid');
+  const reads = [
+    ...new Set(
+      [
+        '/opt/homebrew/Cellar',
+        '/opt/homebrew/opt',
+        ...readPaths.map((p) => fs.realpathSync(p)),
+      ].filter((p) => fs.existsSync(p)),
+    ),
+  ];
+  if (
+    reads.length > 24 ||
+    reads.some((p) => p === '/' || p === home || p.startsWith(home + path.sep))
+  )
+    throw new Error('model_tool_roots_invalid');
+  return [
+    `default_permissions = ${JSON.stringify(ARTIFACT_CODEX_PERMISSION_PROFILE)}`,
+    'approval_policy = "never"',
+    'notify = []',
+    '[shell_environment_policy]',
+    'inherit = "core"',
+    'ignore_default_excludes = false',
+    '[shell_environment_policy.set]',
+    'OPENSSL_CONF = "/dev/null"',
+    'SSL_CERT_FILE = "/etc/ssl/cert.pem"',
+    '[shell_environment_policy.filters]',
+    ...[
+      'CODEX_*',
+      'OPENAI_*',
+      '*_TOKEN',
+      '*_SECRET',
+      '*_PASSWORD',
+      '*_API_KEY',
+      'HTTP_PROXY',
+      'HTTPS_PROXY',
+      'ALL_PROXY',
+    ].map((key) => `${JSON.stringify(key)} = "exclude"`),
+    `[permissions.${ARTIFACT_CODEX_PERMISSION_PROFILE}.filesystem]`,
+    '":root" = "deny"',
+    '":minimal" = "read"',
+    ...reads.map((p) => `${JSON.stringify(p)} = "read"`),
+    `${JSON.stringify(root)} = "read"`,
+    `${JSON.stringify(path.join(root, 'output'))} = "write"`,
+    `${JSON.stringify(path.join(root, 'scratch'))} = "write"`,
+    `${JSON.stringify(home)} = "deny"`,
+    `[permissions.${ARTIFACT_CODEX_PERMISSION_PROFILE}.network]`,
+    'enabled = false',
+  ];
+}
+
 /** CLI-only: cwd must be the selected instance before provider config is imported. */
 export async function configuredArtifactJobCodex(
   instanceRoot: string,
@@ -94,7 +192,8 @@ export async function configuredArtifactJobCodex(
 export function prepareArtifactJobCodex(
   workspace: string,
   config: ArtifactJobCodexConfig,
-): { args: string[]; env: Record<string, string>; input: string } {
+  readPaths: string[] = [],
+): ArtifactJobCodexLaunch {
   if (
     !/^[a-zA-Z0-9._-]{1,100}$/.test(config.model) ||
     config.prompt.length < 1 ||
@@ -106,18 +205,6 @@ export function prepareArtifactJobCodex(
     throw new Error('model_config_invalid');
   const home = path.join(workspace, 'home', '.codex');
   fs.mkdirSync(home, { mode: 0o700 });
-  const auth = readBoundedRegularFileNoFollowSync(config.authJsonPath, {
-    maxBytes: 128 * 1024,
-    oversize: 'reject',
-    requireSingleLink: true,
-  }).buffer;
-  const value = JSON.parse(auth.toString('utf8'));
-  if (!value || typeof value !== 'object' || Array.isArray(value))
-    throw new Error('model_auth_invalid');
-  fs.writeFileSync(path.join(home, 'auth.json'), auth, {
-    flag: 'wx',
-    mode: 0o600,
-  });
   const lines = [
     `model = ${JSON.stringify(config.model)}`,
     'cli_auth_credentials_store = "file"',
@@ -125,9 +212,10 @@ export function prepareArtifactJobCodex(
     'check_for_update_on_startup = false',
     'project_doc_max_bytes = 0',
     'project_root_markers = []',
+    ...artifactCodexPermissionConfiguration(workspace, home, readPaths),
     '[features]',
-    'apps = false',
-    'plugins = false',
+    ...ARTIFACT_DISABLED_FEATURES.map((name) => `${name} = false`),
+    'skip_host_skill_discovery = true',
     '[history]',
     'persistence = "none"',
   ];
@@ -137,7 +225,9 @@ export function prepareArtifactJobCodex(
     );
   if (config.serviceTier)
     lines.unshift(`service_tier = ${JSON.stringify(config.serviceTier)}`);
-  fs.writeFileSync(path.join(home, 'config.toml'), lines.join('\n') + '\n', {
+  const encoded = lines.join('\n') + '\n';
+  const configPath = path.join(home, 'config.toml');
+  fs.writeFileSync(configPath, encoded, {
     flag: 'wx',
     mode: 0o600,
   });
@@ -148,14 +238,43 @@ export function prepareArtifactJobCodex(
       '--disable',
       'plugins',
       'exec',
-      '--dangerously-bypass-approvals-and-sandbox',
+      '--strict-config',
+      '--ignore-rules',
+      '-c',
+      'approval_policy="never"',
+      '--cd',
+      workspace,
       '--skip-git-repo-check',
       '--ephemeral',
       '--json',
       '-',
     ],
     env: { CODEX_HOME: home },
-    input: `You are running inside an externally enforced artifact-job sandbox. All subprocesses inherit it. Read inputs/; write the requested deliverable under output/. Host authority, other apps, MCP bridges and network destinations beyond the model service are unavailable. Do not seek permissions or modify system configuration. Complete the specified artifact task.\n\n${config.prompt}`,
+    input: `You are a delegated artifact producer. Your local commands use an enforced task-only permission profile; credentials and host files are denied, and commands have no network access. Read inputs/; write the requested deliverable under output/. Other apps, MCP bridges, personal memory and approval escalation are unavailable. Do not seek permissions or modify the runtime configuration. Complete the specified artifact task.\n\n${config.prompt}`,
+    permissionsProfile: ARTIFACT_CODEX_PERMISSION_PROFILE,
+    toolProfileSha256: crypto
+      .createHash('sha256')
+      .update(encoded)
+      .digest('hex'),
+    seedAuth: () => {
+      if (
+        fs.realpathSync(home) !== home ||
+        fs.readFileSync(configPath, 'utf8') !== encoded
+      )
+        throw new Error('model_tool_profile_changed');
+      const auth = readBoundedRegularFileNoFollowSync(config.authJsonPath, {
+        maxBytes: 128 * 1024,
+        oversize: 'reject',
+        requireSingleLink: true,
+      }).buffer;
+      const value = JSON.parse(auth.toString('utf8'));
+      if (!value || typeof value !== 'object' || Array.isArray(value))
+        throw new Error('model_auth_invalid');
+      fs.writeFileSync(path.join(home, 'auth.json'), auth, {
+        flag: 'wx',
+        mode: 0o600,
+      });
+    },
   };
 }
 

@@ -2581,6 +2581,7 @@ export async function runSandboxAgent(
     credentialProxyClientSecret,
     credentialProxyIdentityToken,
     input.taskAuthorizationCapability || '',
+    input.gameFactoryCapability || '',
     input.memoryWriteCapability || '',
     input.operationTraceCapability || '',
     input.codexControlRunId || '',

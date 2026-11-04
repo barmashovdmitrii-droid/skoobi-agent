@@ -8,6 +8,8 @@ import {
 } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { MessageRouter } from './types.js';
+import { factoryPeerStateForEvent, factoryPeerEventIsCurrent } from './game-factory-peer-adapter.js';
+import { recordGameFactoryPeerEvent } from './game-factory-peer-state.js';
 import {
   currentPeerScopeRevisionHash,
   peerCanonicalJson,
@@ -378,6 +380,21 @@ export function writePeerInboxEvent(
   }
   writePrivate(target, signed);
 }
+const authenticatedPeerEvents = new WeakSet<object>();
+export function isAuthenticatedPeerInboxEvent(event: unknown): event is PeerInboxEvent {
+  return Boolean(event && typeof event === 'object' && authenticatedPeerEvents.has(event));
+}
+
+function peerEventConfig(c: PeerBridgeConfig, event: PeerInboxEvent): PeerBridgeConfig {
+  const state = factoryPeerStateForEvent(c, event);
+  return state ? { ...c, ownerJid: state.route.chatJid, ownerGroupFolder: state.route.groupFolder, identityId: state.route.identityId, tenantId: state.route.tenantId } : c;
+}
+
+function peerEventMayRoute(c: PeerBridgeConfig, event: PeerInboxEvent): boolean {
+  try { return factoryPeerStateForEvent(c, event)?.routeAllowed !== false; }
+  catch { return false; }
+}
+
 function authenticate(
   c: PeerBridgeConfig,
   signed: SignedPeerInboxEvent,
@@ -393,6 +410,7 @@ function authenticate(
     )
   )
     return fail();
+  authenticatedPeerEvents.add(event);
   return event;
 }
 function artifactBytes(
@@ -437,6 +455,8 @@ function contextIsCurrent(
   now = stamp(),
 ): boolean {
   try {
+    const factory = factoryPeerStateForEvent(c, event);
+    if (factory) return factoryPeerEventIsCurrent(factory, event, now);
     return (
       Date.parse(event.contextValidity.expiresAt) > Date.parse(now) &&
       event.contextValidity.scopeRevisionHash ===
@@ -460,6 +480,7 @@ function peerTrace(
   c: PeerBridgeConfig,
   event: PeerInboxEvent,
 ): OperationTraceObserver | undefined {
+  try { c = peerEventConfig(c, event); } catch { return undefined; }
   const scope = { tenantId: c.tenantId, chatId: c.ownerJid };
   const fromMessage = event.source?.messageId
     ? findOperationTraceForMessage(
@@ -510,8 +531,11 @@ export function ingestPeerInboxEvent(
   const event = authenticate(c, signed),
     serialized = peerCanonicalJson(event),
     payloadHash = hash(serialized);
+  const routed = peerEventConfig(c, event);
+  const factory = factoryPeerStateForEvent(c, event);
   if (contextIsCurrent(db, c, event))
     for (const artifact of event.artifacts) artifactBytes(c, event, artifact);
+  if (factory) recordGameFactoryPeerEvent(event);
   ensurePeerInboxSchema(db);
   return db.transaction(() => {
     const old = db
@@ -538,7 +562,7 @@ export function ingestPeerInboxEvent(
       event.revision,
       event.eventKind,
       event.resultHash,
-      c.ownerJid,
+      routed.ownerJid,
       payloadHash,
       serialized,
       stamp(),
@@ -714,9 +738,9 @@ export function peerInboxPromptContext(
   chatJid: string,
   c: PeerBridgeConfig,
   now = stamp(),
+  viewer?: { identityId: string; tenantId: string; groupFolder: string },
 ): string {
   try {
-    if (c.ownerJid !== chatJid) return '';
     const cutoff = new Date(
       Date.parse(now) - 7 * 24 * 60 * 60 * 1000,
     ).toISOString();
@@ -731,6 +755,10 @@ export function peerInboxPromptContext(
     const contexts: string[] = [];
     for (const row of rows) {
       const event = JSON.parse(row.payload_json) as PeerInboxEvent;
+      if (!peerEventMayRoute(c, event)) continue;
+      const routed = peerEventConfig(c, event);
+      const factory = factoryPeerStateForEvent(c, event);
+      if (routed.ownerJid !== chatJid || (factory && (!viewer || viewer.identityId !== routed.identityId || viewer.tenantId !== routed.tenantId || viewer.groupFolder !== routed.ownerGroupFolder))) continue;
       const candidate = contextText(
         [event],
         contextIsCurrent(db, c, event, now),
@@ -805,7 +833,7 @@ export interface PeerInboxDeps {
   ownerAvailable: (config: PeerBridgeConfig) => boolean;
   canDeliver?: (config: PeerBridgeConfig) => boolean;
   /** No hostSource/user IDs: result data cannot acquire direct-user authority. */
-  notifyActive: (chatJid: string, text: string) => boolean;
+  notifyActive: (chatJid: string, text: string, actor?: { identityId: string; tenantId: string }) => boolean;
   /** Host-bound transport deadline; an elapsed deadline is unknown, not failure. */
   deliveryTimeoutMs?: number;
 }
@@ -837,12 +865,12 @@ export function createPeerInboxPump(
   // Crash after send may have delivered. Never replay an unacknowledged attempt.
   const interrupted = deps.db
     .prepare(
-      "SELECT DISTINCT e.payload_json FROM peer_result_events e JOIN peer_result_deliveries d ON d.event_id=e.event_id WHERE e.chat_jid=? AND d.state='sending'",
+      "SELECT DISTINCT e.payload_json FROM peer_result_events e JOIN peer_result_deliveries d ON d.event_id=e.event_id WHERE (e.chat_jid=? OR json_extract(e.payload_json,'$.parentTaskId') LIKE 'factory:%') AND d.state='sending'",
     )
     .all(c.ownerJid) as { payload_json: string }[];
   deps.db
     .prepare(
-      "UPDATE peer_result_deliveries SET state='unknown',updated_at=? WHERE state='sending' AND event_id IN(SELECT event_id FROM peer_result_events WHERE chat_jid=?)",
+      "UPDATE peer_result_deliveries SET state='unknown',updated_at=? WHERE state='sending' AND event_id IN(SELECT event_id FROM peer_result_events WHERE chat_jid=? OR json_extract(payload_json,'$.parentTaskId') LIKE 'factory:%')",
     )
     .run(stamp(), c.ownerJid);
   for (const row of interrupted)
@@ -852,7 +880,6 @@ export function createPeerInboxPump(
     if (busy) return;
     busy = true;
     try {
-      if (!deps.ownerAvailable(c)) return;
       const incoming = privateDirectory(path.join(c.root, 'inbox'), true),
         processed = privateDirectory(path.join(c.root, 'processed'), true),
         rejected = privateDirectory(path.join(c.root, 'rejected'), true);
@@ -868,6 +895,9 @@ export function createPeerInboxPump(
             privateRead(source, MAX_EVENT_BYTES + 100).toString('utf8'),
           ) as SignedPeerInboxEvent;
           if (name !== `${signed.eventId}.json`) return fail();
+          // Preserve a disabled route's queue; another valid factory route may
+          // still be processed by this shared bridge tick.
+          if (!deps.ownerAvailable(peerEventConfig(c, authenticate(c, signed)))) continue;
           ingestPeerInboxEvent(deps.db, c, signed);
           fs.renameSync(source, path.join(processed, name));
         } catch {
@@ -881,7 +911,7 @@ export function createPeerInboxPump(
       // invalidate text piped into a still-active run, not only queued sends.
       const recent = deps.db
         .prepare(
-          "SELECT event_id,payload_json,context_notified_at,context_state FROM peer_result_events WHERE chat_jid=? AND context_state='current' ORDER BY received_at DESC LIMIT 50",
+          "SELECT event_id,payload_json,context_notified_at,context_state FROM peer_result_events WHERE (chat_jid=? OR json_extract(payload_json,'$.parentTaskId') LIKE 'factory:%') AND context_state='current' ORDER BY received_at DESC LIMIT 50",
         )
         .all(c.ownerJid) as InboxRow[];
       for (const row of recent) {
@@ -905,13 +935,21 @@ export function createPeerInboxPump(
       }
       const pending = deps.db
         .prepare(
-          `SELECT event_id,payload_json,context_notified_at,context_state FROM peer_result_events e WHERE chat_jid=? AND
+          `SELECT event_id,payload_json,context_notified_at,context_state FROM peer_result_events e WHERE (chat_jid=? OR json_extract(payload_json,'$.parentTaskId') LIKE 'factory:%') AND
         (context_notified_at IS NULL OR EXISTS(SELECT 1 FROM peer_result_deliveries d WHERE d.event_id=e.event_id AND d.state='pending')) ORDER BY received_at LIMIT 12`,
         )
         .all(c.ownerJid) as InboxRow[];
       let sends = 0;
       for (const row of pending) {
         const event = JSON.parse(row.payload_json) as PeerInboxEvent;
+        if (!peerEventMayRoute(c, event)) {
+          deps.db.prepare("UPDATE peer_result_deliveries SET state='suppressed',updated_at=? WHERE event_id=? AND state='pending'").run(stamp(), event.eventId);
+          deps.db.prepare('UPDATE peer_result_events SET context_notified_at=? WHERE event_id=?').run(stamp(), event.eventId);
+          receipt(deps.db, c, event);
+          continue;
+        }
+        const routed = peerEventConfig(c, event);
+        if (!deps.ownerAvailable(routed)) continue;
         if (!isCurrentEvent(deps.db, event)) {
           deps.db.transaction(() => {
             deps.db
@@ -929,10 +967,10 @@ export function createPeerInboxPump(
           continue;
         }
         if (!row.context_notified_at) {
-          deps.notifyActive(
-            c.ownerJid,
-            contextText([event], contextIsCurrent(deps.db, c, event)),
-          );
+          const text = contextText([event], contextIsCurrent(deps.db, c, event));
+          if (factoryPeerStateForEvent(c, event)) {
+            deps.notifyActive(routed.ownerJid, text, { identityId: routed.identityId, tenantId: routed.tenantId });
+          } else deps.notifyActive(routed.ownerJid, text);
           // If idle or stdin is already closed, the durable prompt context is
           // the fallback. Do not repeatedly pipe an old result into later runs.
           deps.db
@@ -948,7 +986,7 @@ export function createPeerInboxPump(
           .all(event.eventId) as { part: number }[];
         for (const { part } of parts) {
           if (sends >= 4) break;
-          if (!deps.ownerAvailable(c) || deps.canDeliver?.(c) === false) break;
+          if (!deps.ownerAvailable(routed) || deps.canDeliver?.(routed) === false || !peerEventMayRoute(c, event)) break;
           if (
             !contextIsCurrent(deps.db, c, event) &&
             !event.coordinatorNotice
@@ -997,7 +1035,7 @@ export function createPeerInboxPump(
                 artifact
                   ? artifact.kind === 'photo'
                     ? deps.router.sendPhoto(
-                        c.ownerJid,
+                        routed.ownerJid,
                         artifact.path,
                         undefined,
                         {
@@ -1006,7 +1044,7 @@ export function createPeerInboxPump(
                         },
                       )
                     : deps.router.sendDocument(
-                        c.ownerJid,
+                        routed.ownerJid,
                         artifact.path,
                         undefined,
                         {
@@ -1015,7 +1053,7 @@ export function createPeerInboxPump(
                         },
                       )
                   : deps.router.route({
-                      chatJid: c.ownerJid,
+                      chatJid: routed.ownerJid,
                       text: notification(event),
                       triggerType: 'extension',
                       meta: { kind: 'peer_result', eventId: event.eventId },

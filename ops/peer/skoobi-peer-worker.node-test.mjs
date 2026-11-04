@@ -181,6 +181,30 @@ test('actual Seatbelt worker confines producer and resumes the same process afte
   const result=await launchContainedPeer({profile,executable:process.execPath,args:['-e',code],workspace,input:'',timeoutMs:20000,signal:new AbortController().signal,maxWorkspaceBytes:1024*1024,contextCheckpoint:{request:r=>{assert.equal(r.query,'synthetic');requests++;return{requestId};},response:id=>{assert.equal(id,requestId);return{fact:'expected'};}}});
   assert.equal(result.success,true,JSON.stringify(result));assert.equal(requests,1);assert.equal(fs.readFileSync(path.join(workspace,'output/answer.txt'),'utf8'),'expected');assert.equal(fs.existsSync(path.join(workspace,'output/.peer-context-request.json')),false);
 });
+test('trusted CLI controller uses direct launch only with exact successful tool-profile evidence',{skip:process.platform!=='darwin'},async t=>{
+  const root=fixture(t),workspace=privateDirectory(path.join(root,'workspace'),true);
+  for(const name of ['inputs','output','scratch','home'])privateDirectory(path.join(workspace,name),true);
+  const home=privateDirectory(path.join(workspace,'home','.codex'),true),configFile=path.join(home,'config.toml');
+  atomicWrite(configFile,'synthetic tool profile',true);
+  const canary=path.join(root,'controller-only.txt'),executable=path.join(root,'synthetic-cli');
+  atomicWrite(canary,'synthetic host value',true);
+  atomicWrite(executable,'#!/bin/sh\n/bin/cat "$HOST_CANARY" > output/controller-observed\nprintf \'%s\\n\' \'{"type":"turn.completed"}\'\n',true);
+  fs.chmodSync(executable,0o700);
+  const codexToolPermissions={policy:'macos-codex-tool-permissions-v1',passed:true,failures:[],executableSha256:sha256(fs.readFileSync(executable)),profileSha256:sha256(fs.readFileSync(configFile))};
+  const options={executable,args:['--disable','apps','--disable','plugins','exec','--strict-config','--ignore-rules','-c','approval_policy="never"','--cd',workspace,'--skip-git-repo-check','--ephemeral','--json','-'],workspace,input:'',env:{CODEX_HOME:home,HOST_CANARY:canary},timeoutMs:3000,signal:new AbortController().signal,maxWorkspaceBytes:1024*1024,codexToolPermissions};
+  await assert.rejects(launchContainedPeer({...options,codexToolPermissions:{...codexToolPermissions,passed:false}}),/attestation_invalid/);
+  await assert.rejects(launchContainedPeer({...options,codexToolPermissions:{...codexToolPermissions,executableSha256:'0'.repeat(64)}}),/attestation_invalid/);
+  await assert.rejects(launchContainedPeer({...options,args:[...options.args,'--dangerously-bypass-approvals-and-sandbox']}),/attestation_invalid/);
+  await assert.rejects(launchContainedPeer({...options,args:[...options.args,'-c','default_permissions=unrestricted']}),/attestation_invalid/);
+  assert.equal(fs.existsSync(path.join(workspace,'output/controller-observed')),false);
+  const result=await launchContainedPeer(options);
+  assert.equal(result.success,true,JSON.stringify(result));
+  // This controller is explicitly trusted. The native permission canaries test
+  // child tools separately; claiming whole-process containment would be false.
+  assert.equal(fs.readFileSync(path.join(workspace,'output/controller-observed'),'utf8'),'synthetic host value');
+  fs.writeFileSync(configFile,'changed');
+  await assert.rejects(launchContainedPeer(options),/attestation_invalid/);
+});
 test('versioned symlink layout permits only the resolved executable directory in real Seatbelt',{skip:process.platform!=='darwin'},async t=>{
   const root=fixture(t),workspace=privateDirectory(path.join(root,'workspace'),true),release=privateDirectory(path.join(root,'release'),true);
   for(const name of ['inputs','output','scratch','home'])privateDirectory(path.join(workspace,name),true);

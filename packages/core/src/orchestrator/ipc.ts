@@ -42,6 +42,9 @@ import {
 import { logger } from './logger.js';
 import { signMemoryWriteRequest } from './memory-provenance.js';
 import { handleMemoryStateWireRequest } from './memory-state-service.js';
+import { handleGameFactoryWireRequest } from './game-factory-authorization.js';
+import { executeGameFactoryRequest } from './game-factory-service.js';
+import { FACTORY_READ_ACTIONS, FactoryError } from './game-factory-contracts.js';
 import { notifyRunIpcActivity } from './run-activity.js';
 import { withIpcOperationTrace } from './runtime-operation-trace.js';
 import { readBoundedRegularFileNoFollowSync } from './safe-file-read.js';
@@ -717,6 +720,9 @@ export function startIpcWatcher(deps: IpcDeps): void {
   const ipcBaseDir = path.join(DATA_DIR, 'ipc');
   fs.mkdirSync(ipcBaseDir, { recursive: true });
 
+  // Factory operations can include bounded I/O; they must not stall all chats.
+  let activeFactoryControls = 0;
+  const factoryFiles = new Set<string>();
   const processIpcFiles = async () => {
     // Scan all group IPC directories (identity determined by directory)
     let groupFolders: string[];
@@ -780,12 +786,40 @@ export function startIpcWatcher(deps: IpcDeps): void {
             const filePath = path.join(memoryDir, file);
             try {
               const data = readIpcEnvelopeJson(filePath);
-              const response =
-                data?.type === 'task_authorize'
-                  ? authorizeTaskOperationRequest(data, sourceGroup)
-                  : data?.type === 'memory_state'
-                    ? handleMemoryStateWireRequest(data, sourceGroup)
-                    : signMemoryWriteRequest(data, sourceGroup);
+              if (data?.type === 'game_factory') {
+                if (factoryFiles.has(filePath)) continue;
+                // Consume once before starting async work. Ambiguous outcomes
+                // are recovered through the caller's durable operationId.
+                factoryFiles.add(filePath);
+                try { fs.unlinkSync(filePath); }
+                catch (error) { factoryFiles.delete(filePath); throw error; }
+                void (async () => {
+                  try {
+                    const response = await handleGameFactoryWireRequest(data, sourceGroup, async (actor, payload) => {
+                      const readOnly = (FACTORY_READ_ACTIONS as readonly string[]).includes(payload.action);
+                      if (!readOnly && activeFactoryControls >= 2) throw new FactoryError('factory_busy_retry_same_operation');
+                      if (!readOnly) activeFactoryControls++;
+                      try {
+                        const result = await executeGameFactoryRequest(actor, payload);
+                        notifyRunIpcActivity(sourceGroup, 'memory');
+                        return result;
+                      } finally { if (!readOnly) activeFactoryControls--; }
+                    });
+                    const safeDirectory = resolveWatcherIpcCategoryDirectory(groupIpcDir, 'memory');
+                    if (!safeDirectory) return;
+                    writeFileAtomicNoFollowSync(path.join(safeDirectory, `${response.request_id}.result.json`), JSON.stringify(response));
+                  } catch {
+                    // No payloads or arbitrary backend exception text in logs.
+                    logger.warn({ sourceGroup }, 'Factory IPC response unavailable; inspect the durable operation before retrying');
+                  } finally { factoryFiles.delete(filePath); }
+                })();
+                continue;
+              }
+              const response = data?.type === 'task_authorize'
+                ? authorizeTaskOperationRequest(data, sourceGroup)
+                : data?.type === 'memory_state'
+                  ? handleMemoryStateWireRequest(data, sourceGroup)
+                  : signMemoryWriteRequest(data, sourceGroup);
               const resultName = `${response.request_id}.result.json`;
               writeFileAtomicNoFollowSync(
                 path.join(memoryDir, resultName),
