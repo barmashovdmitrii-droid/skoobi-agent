@@ -53,13 +53,22 @@ async function answerContextRequests(c,id,remote,host,store,transport){
 }
 
 /** Host-only adapter. The peer cannot choose a tenant, chat, DB, or signing key. */
-export async function peerHostAdapters(c){
+export async function peerHostAdapters(c,id,payload){
   if(!path.isAbsolute(c.bridgeConfigPath||''))throw Error('Peer bridge host configuration is required');
   const base=path.join(c.projectRoot,'packages/core/dist/orchestrator');
   const inbox=await import(pathToFileURL(path.join(base,'peer-inbox.js')));
   const memory=await import(pathToFileURL(path.join(base,'peer-bridge-context.js')));
   const config=inbox.loadPeerBridgeConfig(c.bridgeConfigPath);
   if(config.ownerJid!==c.ownerJid||config.ownerGroupFolder!==c.ownerGroupFolder||config.networkId!==c.networkId||config.projectRoot!==c.projectRoot)throw Error('Peer bridge authority mismatch');
+  if(id){
+    payload=payload||new JobStore(c.stateRoot).payload(id);
+    const factoryModule=path.join(base,'game-factory-peer-adapter.js');
+    if(fs.existsSync(factoryModule)){
+      const factory=await import(pathToFileURL(factoryModule));
+      const host=factory.createGameFactoryPeerHostAdapter(config,id,payload);
+      if(host)return host;
+    }else if(String(payload.contract?.parentTaskId||'').startsWith('factory:'))throw Error('Factory peer adapter unavailable');
+  }
   const request=(id,payload,extra={})=>({taskId:id,revision:payload.contract.revision,projectKey:payload.contract.projectKey,
     query:(payload.contract.goal+'\n'+payload.prompt).slice(0,16000),expiresAt:payload.contract.execution.expiresAt,...extra});
   return{
@@ -104,7 +113,7 @@ async function compatible(c,transport,contract){
   return h;
 }
 
-export async function submitPeerV2(c,options,transport,adapters,reservedId){
+export async function preparePeerV2(c,options,adapters,reservedId){
   const contract=validatePeerContract(options.contract);
   if(contract.revision!==1)throw Error('A new task starts at revision one');
   if(typeof options.prompt!=='string'||!options.prompt.trim()||Buffer.byteLength(options.prompt)>128*1024||typeof options.title!=='string'||!options.title.trim()||options.title.length>200)throw Error('Invalid task description');
@@ -113,18 +122,24 @@ export async function submitPeerV2(c,options,transport,adapters,reservedId){
     const existing=store.payload(reservedId);
     if(contentHash(existing.contract)!==contentHash(contract)||existing.prompt!==options.prompt||existing.title!==options.title||
       existing.notify!==(options.notify!==false)||contentHash(existing.inputs)!==contentHash(validateInputs(options.inputs)))throw Error('Reserved task identity conflict');
-    try{await reconcilePeerV2(c,reservedId,transport,adapters);}catch{}
     return pending(store,reservedId);
   }
   if(store.list().filter(s=>!terminalStates.has(s.state)).length>=MAX_PENDING)throw Error('Peer queue capacity exceeded');
   if(fs.existsSync(path.join(c.stateRoot,'maintenance.json')))throw Error('Peer maintenance: new tasks are paused');
-  const host=adapters||await peerHostAdapters(c),id=reservedId||crypto.randomUUID();
+  const id=reservedId||crypto.randomUUID();
   const payload={schema:2,prompt:options.prompt,title:options.title,notify:options.notify!==false,inputs:validateInputs(options.inputs),contract};
+  const host=adapters||await peerHostAdapters(c,id,payload);
   payload.context=await host.context(id,payload);
   store.submit({id,...payload});
-  // The durable local identity exists before any transport, even hello.
-  try{await reconcilePeerV2(c,id,transport,host);}catch{}
+  // Durable preparation only: the existing coordinator watcher owns transport.
   return pending(store,id);
+}
+
+
+export async function submitPeerV2(c,options,transport,adapters,reservedId){
+  const prepared=await preparePeerV2(c,options,adapters,reservedId);
+  try{await reconcilePeerV2(c,prepared.id,transport,adapters);}catch{}
+  return pending(new JobStore(c.stateRoot),prepared.id);
 }
 
 async function transferArtifacts(c,id,remote,transport,store){
@@ -299,7 +314,7 @@ export async function reconcilePeerV2(c,id,transport,adapters){
   transport=async(...args)=>{try{return await rawTransport(...args);}catch(error){error.code||='PEER_TRANSPORT_UNAVAILABLE';throw error;}};
   let host;
   try{
-    host=adapters||await peerHostAdapters(c);let local=store.state(id),payload=store.payload(id);
+    host=adapters||await peerHostAdapters(c,id);let local=store.state(id),payload=store.payload(id);
     if(local.schema!==2)throw Error('Use the legacy inspection path');
     if(terminalStates.has(local.state)){
       const current=await allContextCurrent(host,id,payload,store);
@@ -402,7 +417,7 @@ export async function revisePeerV2(c,id,options,transport,adapters){
       (!options.prompt||options.prompt===old.prompt)&&(!options.title||options.title===old.title)&&
       (!options.inputs||contentHash(validateInputs(options.inputs))===contentHash(old.inputs)))return inspectPeerV2(c,id);
     if(contract.revision!==s.revision+1||contract.parentTaskId!==old.contract.parentTaskId||contract.projectKey!==old.contract.projectKey)throw Error('Invalid revision lineage');
-    const host=adapters||await peerHostAdapters(c);
+    const host=adapters||await peerHostAdapters(c,id,{...old,contract});
     const next={schema:2,prompt:options.prompt||old.prompt,title:options.title||old.title,notify:old.notify,
       inputs:options.inputs?validateInputs(options.inputs):old.inputs,contract};
     const file=path.join(store.dir(id),'outbound-revision.json');
@@ -422,7 +437,7 @@ export async function revisePeerV2(c,id,options,transport,adapters){
 export async function reviewPeerV2(c,id,options,adapters){
   const store=new JobStore(c.stateRoot),release=acquireFileLock(store.dir(id),'coordinator');
   try{
-    const s=store.state(id),payload=store.payload(id),host=adapters||await peerHostAdapters(c);
+    const s=store.state(id),payload=store.payload(id),host=adapters||await peerHostAdapters(c,id,payload);
     if(!s.assessment||!s.remoteResult||store.wantsCancel(id))throw Error('No current reviewable result');
     const review=validatePeerReview({assessment:s.assessment,payload,remote:s.remoteResult,artifacts:s.localArtifacts||[],
       ...options,contextCurrent:(await allContextCurrent(host,id,payload,store)).valid&&!s.contextInvalidated});
@@ -457,11 +472,11 @@ export async function reworkPeerV2(c,id,options,transport,adapters){
 }
 
 export async function watchPeerV2(c,transport,shouldStop=()=>false,adapters){
-  const store=new JobStore(c.stateRoot);let host;
-  try{host=adapters||await peerHostAdapters(c);}catch{return;}
+  const store=new JobStore(c.stateRoot);
   for(const s of store.list()){
     if(shouldStop())break;
     if(s.schema!==2)continue;
+    let host;try{host=adapters||await peerHostAdapters(c,s.id);}catch{continue;}
     if(terminalStates.has(s.state)){
       try{if(s.assessment&&(!s.resultEventId||!s.remoteResultAcknowledged||s.pendingResultPublication))await reconcilePeerV2(c,s.id,transport,host);else syncPeerDeliveryReceipt(c,s.id,host);}catch{}
       continue;

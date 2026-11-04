@@ -17,14 +17,17 @@ import { readBoundedRegularFileNoFollowSync } from './safe-file-read.js';
 import {
   prepareArtifactJobCodex,
   startArtifactModelProxy,
+  ARTIFACT_CODEX_TOOL_POLICY,
+  type ArtifactJobCodexLaunch,
   type ArtifactJobCodexConfig,
 } from './artifact-job-model.js';
 
 export { configuredArtifactJobCodex } from './artifact-job-model.js';
 
 export const ARTIFACT_JOB_POLICY = 'macos-seatbelt-artifact-v1';
+export { ARTIFACT_CODEX_TOOL_POLICY } from './artifact-job-model.js';
 export interface ArtifactJobAttestation {
-  policy: typeof ARTIFACT_JOB_POLICY;
+  policy: typeof ARTIFACT_JOB_POLICY | typeof ARTIFACT_CODEX_TOOL_POLICY;
   id: string;
   profileSha256: string;
   executableSha256: string;
@@ -176,7 +179,7 @@ export function artifactJobSeatbeltProfile(
 }
 
 async function launched(
-  profile: string,
+  profile: string | null,
   executable: string,
   args: string[],
   workspace: string,
@@ -185,8 +188,8 @@ async function launched(
 ): Promise<{ code: number | null; stdout: string; failed: boolean }> {
   return new Promise((resolve) => {
     const child = spawn(
-      '/usr/bin/sandbox-exec',
-      ['-f', profile, executable, ...args],
+      profile ? '/usr/bin/sandbox-exec' : executable,
+      profile ? ['-f', profile, executable, ...args] : args,
       {
         cwd: workspace,
         detached: true,
@@ -334,7 +337,189 @@ export async function preflightArtifactJobContainment(
   }
 }
 
-/** Entire producer process tree starts inside Seatbelt; no ordinary runner bypass is used. */
+/** Проверяем реальные command permissions закреплённого CLI до копирования auth.
+ * Вложенный sandbox-exec на macOS не работает; сам контроллер Codex доверенный,
+ * а команды модели получают отдельный единственный Seatbelt от Codex. */
+export async function preflightArtifactCodexPermissions(
+  executable: string,
+  workspace: string,
+  launch: ArtifactJobCodexLaunch,
+  hostDirectory = path.dirname(workspace),
+): Promise<{
+  passed: boolean;
+  failures: string[];
+  policy: typeof ARTIFACT_CODEX_TOOL_POLICY;
+  profileSha256: string;
+  executableSha256: string;
+  cliVersion?: string;
+}> {
+  const evidence = {
+    policy: ARTIFACT_CODEX_TOOL_POLICY as typeof ARTIFACT_CODEX_TOOL_POLICY,
+    profileSha256: launch.toolProfileSha256,
+    executableSha256: hash(fs.readFileSync(executable)),
+  };
+  const fail = (reason: string) => ({
+    ...evidence,
+    passed: false,
+    failures: [reason],
+  });
+  if (
+    process.platform !== 'darwin' ||
+    launch.permissionsProfile !== 'artifact-tools'
+  )
+    return fail('tool_permissions_unavailable');
+  const home = launch.env.CODEX_HOME;
+  if (
+    fs.realpathSync(workspace) !== workspace ||
+    fs.realpathSync(home) !== home ||
+    home !== path.join(workspace, 'home', '.codex')
+  )
+    return fail('tool_runtime_mismatch');
+  const auth = path.join(home, 'auth.json'),
+    config = path.join(home, 'config.toml');
+  if (fs.existsSync(auth)) return fail('real_auth_must_not_precede_preflight');
+  if (hash(fs.readFileSync(config)) !== launch.toolProfileSha256)
+    return fail('tool_profile_changed');
+  const hostCanary = path.join(
+    hostDirectory,
+    `codex-probe-${crypto.randomUUID()}`,
+  );
+  if (inside(hostCanary, workspace)) return fail('tool_host_probe_invalid');
+  const socketDirectory = fs.mkdtempSync('/private/tmp/skcp-');
+  fs.chmodSync(socketDirectory, 0o700);
+  const socket = path.join(socketDirectory, 's');
+  const systemTempCanary = path.join(socketDirectory, 'canary');
+  const sentinel = Buffer.from(
+    JSON.stringify({ auth_mode: 'fixture', synthetic: crypto.randomUUID() }),
+  );
+  fs.writeFileSync(auth, sentinel, { flag: 'wx', mode: 0o600 });
+  fs.writeFileSync(hostCanary, sentinel, { flag: 'wx', mode: 0o600 });
+  fs.writeFileSync(systemTempCanary, sentinel, { flag: 'wx', mode: 0o600 });
+  let contacted = false;
+  const unix = net.createServer((client) => {
+    contacted = true;
+    client.destroy();
+  });
+  const tcp = net.createServer((client) => {
+    contacted = true;
+    client.destroy();
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      unix.once('error', reject);
+      unix.listen(socket, resolve);
+    });
+    await new Promise<void>((resolve, reject) => {
+      tcp.once('error', reject);
+      tcp.listen(0, '127.0.0.1', resolve);
+    });
+    const version = await launched(
+      null,
+      executable,
+      ['--version'],
+      workspace,
+      5000,
+      { env: launch.env, input: '' },
+    );
+    const cliVersion = /^codex-cli (\d+\.\d+\.\d+)\s*$/.exec(
+      version.stdout,
+    )?.[1];
+    if (version.code !== 0 || version.failed || !cliVersion)
+      return fail('native_cli_unavailable');
+    // Пустой личный config не отменяет возможный системный MCP. Проверяем
+    // эффективный каталог, не вызывая серверы и не выдавая auth модели.
+    const mcp = await launched(
+      null,
+      executable,
+      ['mcp', 'list', '--json'],
+      workspace,
+      5000,
+      { env: launch.env, input: '' },
+    );
+    const servers = JSON.parse(mcp.stdout);
+    if (
+      mcp.code !== 0 ||
+      mcp.failed ||
+      !Array.isArray(servers) ||
+      servers.length !== 0
+    )
+      return fail('model_mcp_must_be_empty');
+    const python = fs.existsSync('/opt/homebrew/bin/python3')
+      ? fs.realpathSync('/opt/homebrew/bin/python3')
+      : '/usr/bin/python3';
+    const probe = PREFLIGHT.replaceAll(
+      "'/usr/bin/python3'",
+      JSON.stringify(python),
+    )
+      .replace(
+        'async function blocked',
+        `denied('host-read',()=>fs.readFileSync(process.argv[4]));
+denied('shared-temp-read',()=>fs.readFileSync(process.argv[6]));
+denied('runtime-config-read',()=>fs.readFileSync(process.argv[5]));
+denied('runtime-config-write',()=>fs.writeFileSync(process.argv[5],'changed'));
+async function blocked`,
+      )
+      .replace('checks.length===15', 'checks.length===19');
+    const result = await launched(
+      null,
+      executable,
+      [
+        'sandbox',
+        '--include-managed-config',
+        '-P',
+        launch.permissionsProfile,
+        '-C',
+        workspace,
+        '--',
+        process.execPath,
+        '-e',
+        probe,
+        auth,
+        socket,
+        String((tcp.address() as net.AddressInfo).port),
+        hostCanary,
+        config,
+        systemTempCanary,
+      ],
+      workspace,
+      15_000,
+      { env: launch.env, input: '' },
+    );
+    const checks = JSON.parse(result.stdout) as Array<[string, boolean]>;
+    const failures = checks.filter((c) => c[1] !== true).map((c) => c[0]);
+    const passed =
+      result.code === 0 &&
+      !result.failed &&
+      checks.length === 19 &&
+      !contacted &&
+      !fs.existsSync(`${auth}.bridge`) &&
+      fs.readFileSync(auth).equals(sentinel) &&
+      fs.readFileSync(hostCanary).equals(sentinel) &&
+      fs.readFileSync(systemTempCanary).equals(sentinel) &&
+      hash(fs.readFileSync(config)) === launch.toolProfileSha256;
+    return {
+      ...evidence,
+      cliVersion,
+      passed,
+      failures: failures.length
+        ? failures
+        : passed
+          ? []
+          : ['tool_preflight_incomplete'],
+    };
+  } catch {
+    return fail('tool_preflight_incomplete');
+  } finally {
+    unix.close();
+    tcp.close();
+    fs.rmSync(socketDirectory, { recursive: true, force: true });
+    fs.rmSync(auth, { force: true });
+    fs.rmSync(`${auth}.bridge`, { force: true });
+    fs.rmSync(hostCanary, { force: true });
+  }
+}
+
+/** Generic producer: outer Seatbelt. Codex: trusted controller with proven command permissions. */
 export async function runIsolatedArtifactJob(
   options: IsolatedArtifactJobOptions,
 ): Promise<IsolatedArtifactJobResult> {
@@ -443,7 +628,11 @@ export async function runIsolatedArtifactJob(
       );
     if (options.codex) {
       if (options.producer.args.length) throw new Error('artifact_job_invalid');
-      codexLaunch = prepareArtifactJobCodex(workspace, options.codex);
+      codexLaunch = prepareArtifactJobCodex(
+        workspace,
+        options.codex,
+        readPaths,
+      );
       modelProxy = await startArtifactModelProxy();
       const url = `http://127.0.0.1:${modelProxy.port}`;
       Object.assign(codexLaunch.env, {
@@ -455,11 +644,26 @@ export async function runIsolatedArtifactJob(
         no_proxy: '',
       });
     }
-    const profile = artifactJobSeatbeltProfile(workspace, readPaths, modelProxy?.port);
+    const profile = artifactJobSeatbeltProfile(
+      workspace,
+      readPaths,
+      modelProxy?.port,
+    );
     const profilePath = path.join(hostDirectory, `profile-${jobId}.sb`);
     fs.writeFileSync(profilePath, profile, { flag: 'wx', mode: 0o600 });
     try {
-      const isolation = await preflightArtifactJobContainment(profilePath, workspace, hostDirectory);
+      const isolation = codexLaunch
+        ? await preflightArtifactCodexPermissions(
+            executable,
+            workspace,
+            codexLaunch,
+            hostDirectory,
+          )
+        : await preflightArtifactJobContainment(
+            profilePath,
+            workspace,
+            hostDirectory,
+          );
       if (!isolation.passed)
         return {
           status: 'inconclusive',
@@ -469,9 +673,10 @@ export async function runIsolatedArtifactJob(
         };
       fs.rmSync(path.join(workspace, 'output'), { recursive: true });
       fs.mkdirSync(path.join(workspace, 'output'), { mode: 0o700 });
+      codexLaunch?.seedAuth();
       const startedAt = new Date().toISOString();
       const producer = await launched(
-        profilePath,
+        codexLaunch ? null : profilePath,
         executable,
         codexLaunch?.args || options.producer.args,
         workspace,
@@ -507,9 +712,11 @@ export async function runIsolatedArtifactJob(
       attestations.set(token, {
         hostDirectory,
         evidence: {
-          policy: ARTIFACT_JOB_POLICY,
+          policy: codexLaunch
+            ? ARTIFACT_CODEX_TOOL_POLICY
+            : ARTIFACT_JOB_POLICY,
           id: jobId,
-          profileSha256: hash(profile),
+          profileSha256: codexLaunch?.toolProfileSha256 || hash(profile),
           executableSha256: hash(fs.readFileSync(executable)),
           ...(supportExecutableSha256 ? { supportExecutableSha256 } : {}),
           artifactSha256: hash(bytes),

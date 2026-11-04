@@ -149,6 +149,7 @@ describe('container runtime diagnostic redaction', () => {
       'ANTHROPIC_API_KEY=proxy-secret',
       'Authorization: Bearer live-token',
       '"taskAuthorizationCapability":"capability-value"',
+      '"gameFactoryCapability":"factory-private-value"',
       '"codexControlRunId":"00000000-0000-4000-8000-000000000004"',
       'x-skoobi-credential-proxy-identity: signed-identity',
     ].join('\n');
@@ -161,6 +162,7 @@ describe('container runtime diagnostic redaction', () => {
       'abc',
       'proxy-secret',
       'live-token',
+      'factory-private-value',
       'capability-value',
       'signed-identity',
       '00000000-0000-4000-8000-000000000004',
@@ -752,6 +754,7 @@ describe('received-media runtime isolation', () => {
         telegram_message_origin: 'direct' as const,
       },
       taskAuthorizationCapability: 'capability-id.capability-secret',
+      gameFactoryCapability: 'factory-capability-id.factory-capability-secret',
       googleAllowedTools: ['google_sheets_get_values', 'google_sheets_update_values'],
       googleSheetTargetHints,
       provider: 'codex_cli' as const,
@@ -762,6 +765,7 @@ describe('received-media runtime isolation', () => {
       isMain: true,
       credentialProxyTier: 'owner',
       taskAuthorizationCapability: 'capability-id.capability-secret',
+      gameFactoryCapability: 'factory-capability-id.factory-capability-secret',
       googleAllowedTools: [
         'google_sheets_get_values',
         'google_sheets_update_values',
@@ -778,6 +782,7 @@ describe('received-media runtime isolation', () => {
       const restricted = restrictRuntimeInputToAuthorizedTier(guestRun);
       expect(restricted.credentialProxyTier).toBe('guest');
       expect(restricted.taskAuthorizationCapability).toBeUndefined();
+      expect(restricted.gameFactoryCapability).toBeUndefined();
       expect(restricted.googleAllowedTools).toBeUndefined();
       expect(restricted.googleSheetTargetHints).toBeUndefined();
     }

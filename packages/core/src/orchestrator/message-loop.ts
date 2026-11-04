@@ -221,6 +221,16 @@ import {
   TASK_ERROR_RETRY_DELAY_MS,
 } from './task-scheduler.js';
 import {
+  registerGameFactoryCapability,
+  revokeGameFactoryCapability,
+  extendGameFactoryCapabilitiesForChat,
+  type GameFactoryFollowUpSource,
+} from './game-factory-authorization.js';
+import { readGameFactoryActorPolicy, readGameFactoryConfiguration, validateGameFactoryDatabaseLocation } from './game-factory-service.js';
+import { createFactoryHostRunLifecycle } from './game-factory-run-state.js';
+import { runGameFactoryMaintenanceTick } from './game-factory-maintenance.js';
+import { createGameFactoryLegacyNoticePump } from './game-factory-legacy-notices.js';
+import {
   registerTaskAuthorizationCapability,
   revokeTaskAuthorizationCapability,
 } from './task-authorization.js';
@@ -3527,7 +3537,11 @@ const lastPipedTimestamp: Record<string, string> = {};
 // reply to «ау» (what a follow-up turn is working on); it never feeds a cursor.
 const pipedBatchCursors: Record<
   string,
-  Array<{ cursor: string; preview: string }>
+  Array<{
+    cursor: string;
+    preview: string;
+    factorySources?: GameFactoryFollowUpSource[];
+  }>
 > = {};
 // What the active run is doing, for the host's own answer to «ау» while the
 // model is busy. Set by beginActiveRun, dropped by endActiveRun; display only —
@@ -6863,11 +6877,16 @@ async function processGroupMessagesInner(
     currentText: latestMemoryRecallQuery(missedMessages),
   });
   const promptContexts = [...skillContexts.contexts, ...memoryContexts];
-  if (peerBridgeConfig && isMainGroup && peerBridgeConfig.ownerJid === chatJid &&
-      peerBridgeConfig.ownerGroupFolder === group.folder &&
+  const factoryPeerViewer = isMainGroup && promptTenant &&
+    memoryPromptSenderIdentity?.is_owner_sender === true &&
+    memoryPromptSenderIdentity.telegram_message_origin === 'direct'
+      ? { identityId: memoryPromptSenderIdentity.identity_id, tenantId: promptTenant.tenant_id, groupFolder: group.folder }
+      : undefined;
+  if (peerBridgeConfig && isMainGroup && (factoryPeerViewer || (
+      peerBridgeConfig.ownerJid === chatJid && peerBridgeConfig.ownerGroupFolder === group.folder &&
       peerBridgeConfig.identityId === promptSenderIdentity?.identity_id &&
-      peerBridgeConfig.tenantId === promptTenant?.tenant_id) {
-    const peerContext = peerInboxPromptContext(getDb(), chatJid, peerBridgeConfig);
+      peerBridgeConfig.tenantId === promptTenant?.tenant_id))) {
+    const peerContext = peerInboxPromptContext(getDb(), chatJid, peerBridgeConfig, new Date().toISOString(), factoryPeerViewer);
     if (peerContext) promptContexts.push(peerContext);
   }
   const speechQuality = speechQualityForMessages(chatJid, missedMessages);
@@ -9230,6 +9249,11 @@ async function processGroupMessagesInner(
               // pending for a second answer.
               const queued = pipedBatchCursors[chatJid] ?? [];
               const taken = queued.splice(0, Math.max(0, count));
+              for (const batch of taken) {
+                extendGameFactoryCapabilitiesForChat(
+                  group.folder, chatJid, batch.factorySources || [],
+                );
+              }
               const absorbed = taken.at(-1)?.cursor;
               if (!absorbed || absorbed <= targetCursor) return;
               targetCursor = absorbed;
@@ -11593,6 +11617,11 @@ async function runAgentInner(
                   0,
                   output.consumedFollowUps,
                 ) ?? [];
+              for (const batch of consumed) {
+                extendGameFactoryCapabilitiesForChat(
+                  group.folder, chatJid, batch.factorySources || [],
+                );
+              }
               noteActiveRunFollowUpTurn(chatJid, consumed);
               // Reset progress notices for each turn.
               queue.noteFollowUpTurnStarted(chatJid);
@@ -11674,6 +11703,7 @@ async function runAgentInner(
   let memoryWriteCapability = '';
   const ipcTrace = registerIpcOperationTrace(group.folder);
   let taskAuthorizationCapability = '';
+  let gameFactoryCapability = '';
   let codexControlRunId = '';
   const codexControlChatJid = context?.memoryIdentityJid || chatJid;
   const activeMemoryBinding = bindActiveMemoryRunIdentity(
@@ -11719,6 +11749,26 @@ async function runAgentInner(
         homogeneousOwnerBatch: runtimeMemoryWriteAllowed === true,
         googleOperationPolicy: context?.googleOperationPolicy || undefined,
       }) || '';
+    gameFactoryCapability = registerGameFactoryCapability({
+      diagnosticAttemptId: currentOperationTrace()?.attemptId,
+      hostRunLifecycle: createFactoryHostRunLifecycle({
+        readConfiguration: readGameFactoryConfiguration,
+        validateDatabaseLocation: validateGameFactoryDatabaseLocation,
+        onPersistenceError: (phase) => logger.warn({ phase }, 'Game factory host lifecycle persistence unavailable; restart reconciliation remains unknown'),
+      }),
+      groupFolder: group.folder,
+      chatJid,
+      tenantId: context?.tenantId || agentTenant?.tenant_id,
+      isMain,
+      credentialProxyTier: runtimeCredentialProxyTier,
+      senderIdentity: context?.senderIdentity,
+      homogeneousOwnerBatch: runtimeMemoryWriteAllowed === true,
+      currentMessageIds: context?.currentMessageIds,
+      allowControl:
+        runTrust.untrustedContentAttached !== true &&
+        context?.indirectOwnerContent !== true,
+      policy: readGameFactoryActorPolicy(),
+    }) || '';
     if (taskAuthorizationCapability) {
       codexControlRunId = randomUUID();
       activeCodexControlRunIds.set(codexControlChatJid, codexControlRunId);
@@ -11800,6 +11850,7 @@ async function runAgentInner(
       codexGuiControlAuthorized: context?.codexGuiControlAuthorized === true,
       ...(codexControlRunId ? { codexControlRunId } : {}),
       ...(taskAuthorizationCapability ? { taskAuthorizationCapability } : {}),
+      ...(gameFactoryCapability ? { gameFactoryCapability } : {}),
       ...(context?.googleOperationPolicy
         ? {
             googleAllowedTools: context.googleOperationPolicy.allowedTools,
@@ -11962,6 +12013,7 @@ async function runAgentInner(
     if (taskAuthorizationCapability) {
       revokeTaskAuthorizationCapability(taskAuthorizationCapability);
     }
+    if (gameFactoryCapability) revokeGameFactoryCapability(gameFactoryCapability);
     if (
       codexControlRunId &&
       activeCodexControlRunIds.get(codexControlChatJid) === codexControlRunId
@@ -11995,7 +12047,10 @@ export function attachPeerInboxToMessageLoop(config: PeerBridgeConfig, deps: {
     ownerAvailable: c => deps.groups()[c.ownerJid]?.isMain === true && deps.groups()[c.ownerJid]?.folder === c.ownerGroupFolder &&
       deps.tenantIdForChat(c.ownerJid) === c.tenantId,
     canDeliver: c => deps.connected(c.ownerJid),
-    notifyActive: (jid, text) => deps.queue.sendMessage(jid, text),
+    notifyActive: (jid, text, actor) => {
+      if (actor && (activeMemoryRunIdentities.get(jid)?.identityId !== actor.identityId || deps.tenantIdForChat(jid) !== actor.tenantId)) return false;
+      return deps.queue.sendMessage(jid, text);
+    },
   });
 }
 
@@ -12008,6 +12063,28 @@ async function startMessageLoop(router: MessageRouter): Promise<void> {
 
   logger.info(`${ASSISTANT_NAME} running (trigger: @${ASSISTANT_NAME})`);
   let mediaMaintenanceRunning = false;
+  let factoryMaintenanceAt = 0;
+  const factoryNoticeTick = createGameFactoryLegacyNoticePump({
+    router,
+    groups: () => registeredGroups,
+    connected: jid => findChannel(channels, jid)?.isConnected() === true,
+    routeAllowed: route => {
+      const tenant = currentTenantRegistry().resolveTelegramJid(route.chatJid);
+      if (!tenant || tenant.tenant_id !== route.tenantId ||
+          tenant.folder !== route.groupFolder || tenant.chat_id !== route.channelChatId ||
+          telegramAgentHold(route.chatJid)) return false;
+      const ownerAllowlist = loadOwnerAllowlistFromEnv();
+      const identity = createTelegramSenderIdentity({
+        chatId: tenant.chat_id, fromId: route.senderId,
+        botId: tenant.bot_id, ownerAllowlist,
+      });
+      if (!identity.is_owner_sender || identity.identity_id !== route.identityId) return false;
+      if (privateAdminModeEnabled() && !isPrivateAdminTelegramUser({
+        telegramUserId: route.senderId, ownerAllowlist,
+      })) return false;
+      return isSenderAllowed(route.chatJid, route.senderId, loadSenderAllowlist());
+    },
+  });
   let peerInboxTick: (() => Promise<void>) | undefined;
   const peerConfigPath = process.env.SKOOBI_PEER_BRIDGE_CONFIG || readEnvFile(['SKOOBI_PEER_BRIDGE_CONFIG']).SKOOBI_PEER_BRIDGE_CONFIG;
   if (peerConfigPath) {
@@ -12028,6 +12105,14 @@ async function startMessageLoop(router: MessageRouter): Promise<void> {
   while (true) {
     lastMessageLoopTickAt = Date.now();
     try {
+      if (Date.now() - factoryMaintenanceAt >= 30_000) {
+        factoryMaintenanceAt = Date.now();
+        // Observe existing jobs and finish already-requested cancellation only.
+        // No user authority, new generation or second execution queue is minted.
+        void runGameFactoryMaintenanceTick()
+          .then(() => factoryNoticeTick())
+          .catch(() => logger.warn('Game factory maintenance unavailable; recorded execution remains unresolved'));
+      }
       if (peerInboxTick) void peerInboxTick().catch(() => logger.warn('Peer result inbox tick failed; durable events remain available'));
       if (!mediaMaintenanceRunning) {
         mediaMaintenanceRunning = true;
@@ -12350,6 +12435,12 @@ async function startMessageLoop(router: MessageRouter): Promise<void> {
             (pipedBatchCursors[chatJid] ??= []).push({
               cursor: lastPipedTimestamp[chatJid],
               preview: activeRunTaskPreview(messagesToSend),
+              factorySources: pipeBatch
+                .filter((message) => !message.is_from_me && !message.is_bot_message)
+                .map((message) => ({
+                  id: message.id,
+                  senderIdentity: message.sender_identity,
+                })),
             });
             // The run has the held-back pings now; they are no longer in
             // flight. A status send that lands later marks them answered

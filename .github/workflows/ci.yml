@@ -52,6 +52,37 @@ jobs:
       - name: Install browser for artifact acceptance checks
         run: npx playwright install --with-deps chromium
 
+      # Ubuntu restricts user namespaces for downloaded Chromium binaries.
+      # Allow only this installed executable to create its normal sandbox;
+      # keep the machine-wide policy and Chromium sandbox enabled.
+      - name: Allow Chromium sandbox on the Linux CI runner
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          restriction=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [[ -f "$restriction" && "$(cat "$restriction")" == 1 ]]; then
+            profile_path="$RUNNER_TEMP/skoobi-ci-chromium.apparmor"
+            node --input-type=module - "$profile_path" <<'NODE'
+          import fs from 'node:fs';
+          import { chromium } from 'playwright';
+          const executable = fs.realpathSync(chromium.executablePath());
+          if (!/^\/[a-zA-Z0-9_./ -]+$/.test(executable)) {
+            throw new Error('Unexpected Chromium path for an exact AppArmor rule');
+          }
+          fs.writeFileSync(process.argv[2], [
+            'abi <abi/4.0>,',
+            'include <tunables/global>',
+            `profile skoobi-ci-chromium "${executable}" flags=(unconfined) {`,
+            '  userns,',
+            '}',
+            '',
+          ].join('\n'), { mode: 0o600 });
+          NODE
+            sudo install -m 0644 "$profile_path" /etc/apparmor.d/skoobi-ci-chromium
+            sudo apparmor_parser --replace /etc/apparmor.d/skoobi-ci-chromium
+          fi
+
       # Integration subprocesses need the compiled workspace exports.
       - name: Build
         run: npm run build

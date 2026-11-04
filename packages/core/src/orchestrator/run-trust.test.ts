@@ -218,6 +218,7 @@ describe('карантин хода с чужим текстом (S1/S5/S6)', ()
       'register_group',
       'memory_save',
       'skill_propose',
+      'game_factory_control',
       'computer_type',
     ]) {
       expect(blocked).toContain(tool);
@@ -230,6 +231,7 @@ describe('карантин хода с чужим текстом (S1/S5/S6)', ()
     const blocked = quarantinedToolsForRun(trust(true));
     for (const tool of [
       'memory_get',
+      'game_factory_status',
       'memory_search',
       'list_tasks',
       'skill_list',

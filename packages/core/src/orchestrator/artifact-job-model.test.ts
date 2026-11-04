@@ -118,8 +118,8 @@ describe('artifact model service capability', () => {
     expect(await pending).not.toContain('200');
   });
   it('copies only minimal private auth/config and keeps the configured model', () => {
-    const tmp = fs.mkdtempSync(
-      path.join(os.tmpdir(), 'artifact-codex-config-'),
+    const tmp = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'artifact-codex-config-')),
     );
     try {
       fs.mkdirSync(path.join(tmp, 'home'));
@@ -136,6 +136,8 @@ describe('artifact model service capability', () => {
         prompt: 'Create output/artifact.zip from the synthetic inputs.',
       });
       const codexHome = launch.env.CODEX_HOME;
+      expect(fs.existsSync(path.join(codexHome, 'auth.json'))).toBe(false);
+      launch.seedAuth();
       expect(fs.readdirSync(codexHome).sort()).toEqual([
         'auth.json',
         'config.toml',
@@ -146,11 +148,27 @@ describe('artifact model service capability', () => {
       );
       expect(config).toContain('model = "configured-model"');
       expect(config).toContain('web_search = "disabled"');
+      expect(config).toContain('default_permissions = "artifact-tools"');
+      expect(config).toContain(`${JSON.stringify(codexHome)} = "deny"`);
+      expect(config).toContain('approval_policy = "never"');
+      expect(config).toContain('view_image = false');
+      expect(config).toContain('code_mode = false');
+      expect(config).toContain('code_mode_host = true');
+      expect(config).toContain('hooks = false');
+      expect(config).toContain(
+        '[permissions.artifact-tools.network]\nenabled = false',
+      );
       expect(config).not.toContain('mcp_servers');
       expect(fs.statSync(path.join(codexHome, 'auth.json')).mode & 0o777).toBe(
         0o600,
       );
       expect(launch.args).toContain('--ephemeral');
+      expect(launch.args).toContain('--strict-config');
+      expect(launch.args).toContain('--ignore-rules');
+      expect(launch.args).not.toContain(
+        '--dangerously-bypass-approvals-and-sandbox',
+      );
+      expect(launch.args).not.toContain('--sandbox');
       expect(launch.input).toContain('synthetic inputs');
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });

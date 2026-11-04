@@ -247,6 +247,8 @@ export interface ContainerInput {
   memoryProvenancePublicKey?: string;
   /** Host-issued bearer that can request exact, one-use task-operation grants. */
   taskAuthorizationCapability?: string;
+  /** Separate, private game-project authority; never grants Google or desktop access. */
+  gameFactoryCapability?: string;
   /** Exact current direct-owner message explicitly authorized Codex GUI control. */
   codexGuiControlAuthorized?: boolean;
   /** Opaque identifier used only to revoke delayed Codex mutations after stop. */
@@ -434,7 +436,7 @@ export function redactContainerRuntimeDiagnostics(
       '$1[REDACTED]',
     )
     .replace(
-      /("(?:taskAuthorizationCapability|memoryWriteCapability|operationTraceCapability|codexControlRunId|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_CUSTOM_HEADERS)"\s*:\s*")[^"]*(")/gi,
+      /("(?:taskAuthorizationCapability|gameFactoryCapability|memoryWriteCapability|operationTraceCapability|codexControlRunId|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_CUSTOM_HEADERS)"\s*:\s*")[^"]*(")/gi,
       '$1[REDACTED]$2',
     )
     .replace(
@@ -638,6 +640,7 @@ export function restrictRuntimeInputToAuthorizedTier(
     credentialProxyTier: 'guest',
     senderIdentity: directSenderIdentity,
     taskAuthorizationCapability: undefined,
+    gameFactoryCapability: undefined,
     codexGuiControlAuthorized: false,
     codexControlRunId: undefined,
     googleAllowedTools: undefined,
@@ -1237,6 +1240,7 @@ export async function runContainerAgent(
     CREDENTIAL_PROXY_CLIENT_SECRET,
     proxyIdentityToken,
     input.taskAuthorizationCapability || '',
+    input.gameFactoryCapability || '',
     input.memoryWriteCapability || '',
     input.operationTraceCapability || '',
     input.codexControlRunId || '',

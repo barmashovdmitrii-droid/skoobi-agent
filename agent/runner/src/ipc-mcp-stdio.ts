@@ -20,6 +20,7 @@ import {
   verify as cryptoVerify,
 } from 'crypto';
 import { CronExpressionParser } from 'cron-parser';
+import { requestHostGameFactory } from './game-factory-ipc.js';
 import {
   isGoogleHostToolName,
   requestHostGoogleOperation,
@@ -70,6 +71,7 @@ const envMemoryWriteCapability =
   process.env.CLAUDECLAW_MEMORY_WRITE_CAPABILITY || '';
 const envMemoryProvenancePublicKey =
   process.env.CLAUDECLAW_MEMORY_PROVENANCE_PUBLIC_KEY || '';
+const envGameFactoryCapability = process.env.CLAUDECLAW_GAME_FACTORY_CAPABILITY || '';
 const envTaskAuthorizationCapability =
   process.env.CLAUDECLAW_TASK_AUTHORIZATION_CAPABILITY || '';
 const rawCodexControlRunId = process.env.CLAUDECLAW_CODEX_CONTROL_RUN_ID || '';
@@ -3051,6 +3053,25 @@ if (isMain && isTrustedOwnerRun && CHAT_HISTORY_GRANT) {
   );
 }
 
+
+// The separate host capability supports each configured administrator without
+// borrowing the primary owner's Google or desktop authorization.
+if (isMain && isTrustedOwnerRun && envGameFactoryCapability) {
+  const factoryArgs = {
+    operationId: z.string().min(8).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9:_-]*$/),
+    projectId: z.string().min(1).max(128).optional(),
+    expectedRevision: z.number().int().min(0).optional(),
+    args: z.record(z.string(), z.unknown()).optional(),
+  };
+  registerTool('game_factory_status',
+    'Read authorized game projects, current brief/tasks/builds, project context and backend capabilities. Identity comes from the current host run. Read before changes; keep operationId for any retry.',
+    { ...factoryArgs, action: z.enum(['capabilities', 'list', 'inspect', 'context', 'peer_result', 'audio_status']) },
+    async (payload) => requestHostGameFactory({ capability: envGameFactoryCapability, groupFolder, ipcDirectory: MEMORY_IPC_DIR, mode: 'status', payload }));
+  registerTool('game_factory_control',
+    'Change an authorized game project through the host game-factory service. Supply exact action, expectedRevision and stable operationId. Inspect current state first; after timeout reuse the operationId. Shared project decisions never merge personal chat memories. Publication and paid external actions need their own host authorization.',
+    { ...factoryArgs, action: z.string().min(1).max(80) },
+    async (payload) => requestHostGameFactory({ capability: envGameFactoryCapability, groupFolder, ipcDirectory: MEMORY_IPC_DIR, mode: 'control', payload }));
+}
 
 function memoryStateTransportKey(
   secret: Buffer,

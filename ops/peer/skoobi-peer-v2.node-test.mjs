@@ -6,7 +6,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import {JobStore,atomicWrite,privateDirectory,sha256,validateInputs} from './skoobi-peer-core.mjs';
 import {contentHash,PEER_CAPABILITIES} from './skoobi-peer-contract.mjs';
-import {submitPeerV2,reconcilePeerV2,inspectPeerV2,revisePeerV2,reviewPeerV2,reworkPeerV2,watchPeerV2} from './skoobi-peer-v2.mjs';
+import {preparePeerV2,submitPeerV2,reconcilePeerV2,inspectPeerV2,revisePeerV2,reviewPeerV2,reworkPeerV2,watchPeerV2} from './skoobi-peer-v2.mjs';
 import {verifyPeerResult,peerResultDigest,validatePeerReview} from './skoobi-peer-acceptance.mjs';
 
 const stamp=()=>new Date().toISOString();
@@ -196,4 +196,28 @@ test('reserved identity refuses changed notification intent or input bytes',asyn
   await assert.rejects(submitPeerV2(f.c,{...request,notify:true},async()=>{},f.host,r.id));
   const bytes=Buffer.from('different input');
   await assert.rejects(submitPeerV2(f.c,{...request,inputs:[{name:'extra.txt',data:bytes.toString('base64'),sha256:sha256(bytes)}]},async()=>{},f.host,r.id));
+});
+
+
+test('prepare durably reserves one identity without transport and rejects changed retry input',async t=>{
+  const f=fixture(t),id=crypto.randomUUID(),spec=options();
+  const first=await preparePeerV2(f.c,spec,f.host,id);
+  assert.equal(first.id,id);assert.equal(first.accepted,false);assert.equal(f.store.list().length,1);
+  await preparePeerV2(f.c,spec,f.host,id);assert.equal(f.store.list().length,1);
+  await assert.rejects(preparePeerV2(f.c,{...spec,prompt:'changed'},f.host,id),/identity conflict/);
+});
+
+test('watch resolves a durable context adapter separately for every job after restart',async t=>{
+  const f=fixture(t),ids=[crypto.randomUUID(),crypto.randomUUID()];
+  for(const id of ids)await preparePeerV2(f.c,options({contract:contract({parentTaskId:'factory:'+id})}),f.host,id);
+  const base=path.join(f.root,'packages/core/dist/orchestrator');fs.mkdirSync(base,{recursive:true});
+  const config={...f.c,root:f.host.config.root};f.c.bridgeConfigPath=path.join(f.root,'bridge-config.json');
+  const slot='factory_adapter_test_'+crypto.randomBytes(8).toString('hex'),selected=[];
+  globalThis[slot]=id=>{selected.push(id);return f.host;};t.after(()=>delete globalThis[slot]);
+  fs.writeFileSync(path.join(base,'peer-inbox.js'),'export const loadPeerBridgeConfig=()=>('+JSON.stringify(config)+');');
+  fs.writeFileSync(path.join(base,'peer-bridge-context.js'),'export const buildPeerContextForCoordinator=()=>{throw Error("owner context forbidden")};');
+  fs.writeFileSync(path.join(base,'game-factory-peer-adapter.js'),'export const createGameFactoryPeerHostAdapter=(_c,id)=>globalThis['+JSON.stringify(slot)+'](id);');
+  await watchPeerV2(f.c,async(_c,method,p)=>method==='hello'?hello():completion(p.id));
+  assert.deepEqual(selected.sort(),ids.sort());
+  for(const id of ids)assert.equal(f.store.state(id).assessment.status,'passed');
 });

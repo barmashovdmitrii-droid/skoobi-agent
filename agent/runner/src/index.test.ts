@@ -116,6 +116,19 @@ describe('task continuity context wiring', () => {
 });
 
 describe('buildClaudeclawMcpEnv owner-only gates', () => {
+  it('keeps factory authority separate from Google and out of guest, scheduled and SDK environments', () => {
+    const base = { prompt: 'test', groupFolder: 'factory-test', chatJid: 'tg:fixture', isMain: true, credentialProxyTier: 'owner' as const, gameFactoryCapability: 'factory-test-capability' };
+    const direct = buildClaudeclawMcpEnv(base, undefined);
+    expect(direct.CLAUDECLAW_GAME_FACTORY_CAPABILITY).toBe('factory-test-capability');
+    expect(direct.CLAUDECLAW_TASK_AUTHORIZATION_CAPABILITY).toBe('');
+    expect(direct.CLAUDECLAW_IS_DIRECT_OWNER_RUN).toBe('0');
+    expect(direct.CLAUDECLAW_CODEX_GUI_CONTROL_AUTHORIZED).toBe('0');
+    for (const input of [{ ...base, credentialProxyTier: 'guest' as const }, { ...base, isMain: false }, { ...base, isScheduledTask: true }]) {
+      expect(buildClaudeclawMcpEnv(input, undefined).CLAUDECLAW_GAME_FACTORY_CAPABILITY).toBe('');
+    }
+    expect(buildSdkEnv({ CLAUDECLAW_GAME_FACTORY_CAPABILITY: 'private-capability' })).not.toHaveProperty('CLAUDECLAW_GAME_FACTORY_CAPABILITY');
+  });
+
   it('never forwards host Google OAuth and gates helper/public tools on owner tier', () => {
     const codexControlRunId = '00000000-0000-4000-8000-000000000001';
     const previousHelper = process.env.HELPER_SECRET;
@@ -1509,7 +1522,7 @@ describe('elideUnchangedStandingBlocks', () => {
   // был одинаков во всех 30/30 ходах владельца (5 238 зн., один md5 — входящих
   // WhatsApp нет), а стаб ставится только при равном хеше и сбрасывается после
   // компакции, так что свежая история по-прежнему доходит целиком. То же для
-  // skoobi_skills (4 141 зн. в каждом ходе Андрея).
+  // skoobi_skills repeated in each conversation turn.
   it('replaces only the blocks the thread already has, keeps the rest', () => {
     const { blocks } = elideUnchangedStandingBlocks(prompt, undefined);
     const again = elideUnchangedStandingBlocks(prompt, blocks);
@@ -1815,14 +1828,14 @@ describe('persistCodexThread', () => {
         persistCodexThread({
           idFile,
           metaFile,
-          threadId: '01a0e648-9b36-7861-83fb-84edb7767618',
+          threadId: '00000000-0000-7000-8000-000000000099',
           meta,
           sharesChatThread: true,
         }),
       ).toBe(true);
       expect(renamed).toEqual([metaFile, idFile]);
       expect(fs.readFileSync(idFile, 'utf-8')).toBe(
-        '01a0e648-9b36-7861-83fb-84edb7767618',
+        '00000000-0000-7000-8000-000000000099',
       );
       expect(JSON.parse(fs.readFileSync(metaFile, 'utf-8'))).toEqual(meta);
       // No temp files left behind.

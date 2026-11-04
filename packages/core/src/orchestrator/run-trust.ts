@@ -118,6 +118,7 @@ export const UNTRUSTED_CONTENT_QUARANTINED_TOOLS: readonly string[] = [
   'skill_propose',
   // запуск задач в Codex Desktop — тоже действие вовне
   'codex_desktop_control',
+  'game_factory_control',
   // управление маком
   'computer_click',
   'computer_key',

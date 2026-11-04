@@ -14,6 +14,7 @@ import {
 import { trustedDocumentRuntime } from './document-trust.js';
 import {
   ARTIFACT_JOB_POLICY,
+  ARTIFACT_CODEX_TOOL_POLICY,
   consumeArtifactJobAttestation,
   type ArtifactJobAttestation,
 } from './artifact-job.js';
@@ -1052,7 +1053,9 @@ export function verifyArtifactAcceptanceReceipt(options: {
     const p = receipt.payload;
     if (
       !p.producerIsolation ||
-      p.producerIsolation.policy !== ARTIFACT_JOB_POLICY ||
+      ![ARTIFACT_JOB_POLICY, ARTIFACT_CODEX_TOOL_POLICY].includes(
+        p.producerIsolation.policy,
+      ) ||
       p.producerIsolation.artifactSha256 !== p.artifact.sha256 ||
       p.producerIsolation.requirementsSha256 !== p.requirementsSha256 ||
       !Array.isArray(p.producerIsolation.writableRoots) ||
