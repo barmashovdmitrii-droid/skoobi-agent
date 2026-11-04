@@ -26,6 +26,7 @@ export const FACTORY_READ_ACTIONS = [
   'inspect',
   'context',
   'peer_result',
+  'audio_status',
 ] as const;
 
 export type FactoryBackend =
@@ -76,6 +77,7 @@ export interface FactoryConfiguration {
     reasoningEffort: string;
   };
   legacy?: { configurationPath: string };
+  audio?: { configurationPath: string };
 }
 
 export interface FactoryBrief {
@@ -235,6 +237,8 @@ export interface FactoryRelease {
 }
 
 export interface FactoryAsset {
+  /** Ревизия исходного задания; исторический audio result не принимается за новый. */
+  originBriefRevision?: number;
   id: string;
   file: FactoryFile;
   relativePath: string;

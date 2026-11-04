@@ -1,9 +1,10 @@
 import fs from 'fs';
 import http from 'http';
+import net from 'net';
 import os from 'os';
 import path from 'path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { captureFactoryManifestAsync } from './game-factory-artifacts.js';
 import { verifyFactoryHtml5Build } from './game-factory-html5-check.js';
@@ -82,6 +83,75 @@ describe('factory exact-build offline HTML5 smoke', () => {
       result.checks.find((check) => check.id === 'manifest_after')?.result,
     ).toBe('pass');
   });
+
+  it.runIf(hasBrowser)(
+    'survives a reset on a rejected CONNECT socket while checking the build',
+    async () => {
+      const original = http.createServer;
+      let finishReset: (error?: unknown) => void;
+      const reset = new Promise<unknown>((resolve) => {
+        finishReset = resolve;
+      });
+      let client: net.Socket | undefined;
+      const spy = vi
+        .spyOn(http, 'createServer')
+        .mockImplementation((...args: any[]) => {
+          const server = Reflect.apply(original, http, args) as http.Server;
+          server.once('listening', () => {
+            const address = server.address();
+            if (!address || typeof address === 'string')
+              return finishReset(new Error('missing port'));
+            server.on('connect', (request, socket) => {
+              if (request.url !== 'fixture.invalid:443') return;
+              // Fault-inject Node's actual raw socket event after CONNECT has been
+              // rejected, avoiding platform-dependent TCP reset scheduling.
+              try {
+                socket.emit(
+                  'error',
+                  Object.assign(new Error('read ECONNRESET'), {
+                    code: 'ECONNRESET',
+                  }),
+                );
+                expect(socket.destroyed).toBe(true);
+                finishReset();
+              } catch (error) {
+                finishReset(error);
+              } finally {
+                client?.destroy();
+              }
+            });
+            client = net.createConnection(
+              { host: '127.0.0.1', port: address.port },
+              () => {
+                client!.write(
+                  'CONNECT fixture.invalid:443 HTTP/1.1\r\nHost: fixture.invalid:443\r\n\r\n',
+                );
+              },
+            );
+            client.on('error', finishReset);
+          });
+          return server;
+        });
+      const timer = setTimeout(
+        () => finishReset(new Error('reset probe timed out')),
+        5_000,
+      );
+      try {
+        const [result, resetError] = await Promise.all([
+          verifyFactoryHtml5Build(await request()),
+          reset,
+        ]);
+        expect(resetError).toBeUndefined();
+        expect(result.status, JSON.stringify(result)).toBe('passed');
+        expect(result.runs).toHaveLength(2);
+      } finally {
+        clearTimeout(timer);
+        client?.destroy();
+        spy.mockRestore();
+      }
+    },
+    30_000,
+  );
 
   it.runIf(hasBrowser)(
     'observes actual canvas bytes in desktop and mobile emulation with honest audio scope',

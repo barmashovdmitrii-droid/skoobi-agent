@@ -517,6 +517,8 @@ export async function verifyFactoryHtml5Build(
       }
     });
     server.on('connect', (_request, socket) => {
+      // CONNECT hands us the raw socket; a browser reset must only close it.
+      socket.on('error', () => socket.destroy());
       socket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
     });
     await new Promise<void>((resolve, reject) => {

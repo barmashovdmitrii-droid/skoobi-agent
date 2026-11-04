@@ -39,6 +39,11 @@ import {
   type FactoryLegacyObservation,
 } from './game-factory-legacy.js';
 import {
+  reserveFactoryAudioJob, submitPersistedFactoryAudio, observePersistedFactoryAudio,
+  importPersistedFactoryAudio, type FactoryAudioImportReceipt,
+} from './game-factory-audio-state.js';
+import type { FactoryAudioObservation } from './game-factory-audio.js';
+import {
   bindGameFactoryPeerJob,
   preparePersistedGameFactoryPeerJob,
 } from './game-factory-peer-state.js';
@@ -177,6 +182,7 @@ const configSchema = z
       .object({ configurationPath: text(4096) })
       .strict()
       .optional(),
+    audio: z.object({ configurationPath: text(4096) }).strict().optional(),
   })
   .strict();
 const READ = new Set<string>(FACTORY_READ_ACTIONS);
@@ -216,6 +222,9 @@ const MUTATIONS = new Set([
   'legacy_cancel',
   'legacy_import',
   'peer_import',
+  'audio_dispatch',
+  'audio_refresh',
+  'audio_import',
 ]);
 const SECRET =
   /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|парол[ья])\s*[:=]\s*\S+|\bBearer\s+[A-Za-z0-9._~+\/-]{8,}|\bsk-[A-Za-z0-9_-]{12,}|-----BEGIN\s+(?:OPENSSH|RSA|EC|PRIVATE)\s+KEY-----/iu;
@@ -418,6 +427,8 @@ export interface FactoryServiceDependencies {
   importPeerResult?: (
     input: Parameters<typeof importFactoryPeerResult>[0],
   ) => Awaited<ReturnType<typeof importFactoryPeerResult>>;
+  observeAudio?: (actor: FactoryActor, jobId: string, poll: boolean) => FactoryAudioObservation;
+  importAudio?: (input: Parameters<typeof importPersistedFactoryAudio>[0]) => FactoryAudioImportReceipt;
 }
 
 export class GameFactoryService {
@@ -483,6 +494,7 @@ export class GameFactoryService {
         execution: 'existing_agent_and_peer_operations',
         publication: 'prepare_only',
         paidGeneration: 'disabled_without_separate_budget_authorization',
+        audio: this.config.audio ? 'configured_requires_exact_host_grant' : 'unavailable_not_configured',
         desktop: 'installation_is_not_verification',
         publicationAccounts: (this.config.accounts ?? [])
           .filter((a) => a.actorAliases.includes(policy.alias))
@@ -496,6 +508,12 @@ export class GameFactoryService {
     if (READ.has(request.action)) {
       if (!request.projectId) throw new FactoryError('project_required');
       const project = this.store.read(actor, request.projectId);
+      if (request.action === 'audio_status') {
+        const input = parse(z.object({jobId:z.string().uuid()}).strict(), args);
+        if (!this.deps.observeAudio || !project.operations.some((o) => o.kind === 'asset' && o.externalId === input.jobId && o.evidence === 'host_observed'))
+          throw new FactoryError('audio_binding_unavailable');
+        return this.deps.observeAudio(actor, input.jobId, false);
+      }
       if (request.action === 'peer_result') {
         const input = parse(
           z.object({ jobId: z.string().uuid() }).strict(),
@@ -712,6 +730,55 @@ export class GameFactoryService {
         return current;
       };
       switch (request.action) {
+        case 'audio_dispatch': {
+          const input = parse(z.object({token:text(100),grantId:text(128),prompt:text(500).min(15)}).strict(), args);
+          const current = lease(input.token);
+          if (!this.config.audio || !policy.backends.includes('agent') || current.backend !== 'agent') throw new FactoryError('audio_backend_not_allowed');
+          const task = project.tasks.find((t) => t.id === current.taskId)!;
+          const jobId = randomUUID();
+          reserveFactoryAudioJob({db:this.store.db,config:this.config,actor,project,task,jobId,grantId:input.grantId,prompt:input.prompt,now});
+          const operation = {id:`op-${randomUUID()}`,kind:'asset' as const,externalId:jobId,taskId:task.id,
+            briefRevision:project.brief.revision,state:'linked' as const,evidence:'host_observed' as const,
+            tracking:'reference_only' as const,observedAt:now,detail:'Audio budget reserved; provider submission not yet confirmed.'};
+          project.operations.push(operation);task.operationIds.push(operation.id);
+          return {audioJobId:jobId,operation,paidGenerationAccepted:false};
+        }
+        case 'audio_refresh': {
+          const input = parse(z.object({jobId:z.string().uuid()}).strict(),args);
+          const operation = project.operations.find((o) => o.kind === 'asset' && o.externalId === input.jobId && o.evidence === 'host_observed');
+          if (!operation || !this.deps.observeAudio) throw new FactoryError('audio_binding_unavailable');
+          const observed = this.deps.observeAudio(actor,input.jobId,true);
+          operation.state = observed.state === 'completed' ? 'completed' : observed.state === 'failed' ? 'failed'
+            : ['accepted','processing'].includes(observed.state) ? 'running' : 'unknown';
+          operation.observedAt=now;operation.detail=JSON.stringify(observed);
+          return {operation,observation:observed,assetAccepted:false};
+        }
+        case 'audio_import': {
+          const input = parse(z.object({jobId:z.string().uuid()}).strict(),args);
+          const operation = project.operations.find((o) => o.kind === 'asset' && o.externalId === input.jobId && o.evidence === 'host_observed');
+          if (!operation || !this.deps.importAudio || !this.deps.ensureDirectory) throw new FactoryError('audio_binding_unavailable');
+          const destinationRoot=this.deps.ensureDirectory({root:this.config.workspaceRoot,relativePath:`${project.id}/assets/audio-${input.jobId}`});
+          const receipt=this.deps.importAudio({actor,jobId:input.jobId,destinationRoot});
+          if (receipt.tracks.length !== 2) throw new FactoryError('audio_tracks_invalid');
+          const assets=receipt.tracks.map((track) => {
+            const relativePath=path.relative(project.workspace,path.join(track.root,track.file.path));
+            assertInside(path.join(project.workspace,relativePath),project.workspace);
+            const existing=project.assets.find((a) => a.relativePath === relativePath);
+            if (existing) {
+              if (existing.file.sha256 !== track.file.sha256) throw new FactoryError('audio_asset_changed');
+              return existing;
+            }
+            const asset={id:`asset-${randomUUID()}`,kind:'audio' as const,file:track.file,relativePath,
+              originBriefRevision:receipt.originBriefRevision,
+              provenance:JSON.stringify({provider:receipt.provider,model:receipt.model,modelVersion:receipt.modelVersion,
+                jobId:receipt.jobId,role:track.role,requestSha256:receipt.requestSha256,promptSha256:receipt.promptSha256,
+                receiptSha256:receipt.receiptSha256,cost:receipt.cost}),rights:'Provider commercial rights require independent confirmation.',
+              provider:receipt.provider,externalId:receipt.jobId,state:'candidate' as const,source:source()};
+            project.assets.push(asset);return asset;
+          });
+          return {assets,providerCost:receipt.cost,rights:receipt.rights,assetAccepted:false,
+            requirementsCurrent:receipt.originBriefRevision === project.brief.revision};
+        }
         case 'share': {
           const input = parse(
             z
@@ -2270,6 +2337,8 @@ export class GameFactoryService {
           const asset = project.assets.find((a) => a.id === input.assetId);
           if (!asset || !this.deps.capture)
             throw new FactoryError('asset_unavailable');
+          if (input.state === 'accepted' && asset.originBriefRevision !== undefined && asset.originBriefRevision !== project.brief.revision)
+            throw new FactoryError('asset_requirements_stale');
           const file = path.resolve(project.workspace, asset.relativePath);
           assertInside(file, project.workspace);
           const observed = this.deps.capture({
@@ -2357,7 +2426,9 @@ type FactoryIoKind =
   | 'legacy_observe'
   | 'legacy_import'
   | 'peer_inspect'
-  | 'peer_import';
+  | 'peer_import'
+  | 'audio_observe'
+  | 'audio_import';
 class FactoryIoPreparation extends Error {
   constructor(
     readonly kind: FactoryIoKind,
@@ -2464,6 +2535,8 @@ async function executeGameFactoryRequestInner(
             'peer_import',
             input,
           ),
+        observeAudio: (actor, jobId, poll) => io<FactoryAudioObservation>('audio_observe', {actor,jobId,poll}),
+        importAudio: (input) => io<FactoryAudioImportReceipt>('audio_import', input),
         verifyHtml5: (input) =>
           io<FactoryHtml5CheckReceipt>('html5_check', input),
         verifyFeedback: (current, input) =>
@@ -2486,6 +2559,17 @@ async function executeGameFactoryRequestInner(
         observeRun: (runId) =>
           observeFactoryHostRun(db, runId, getGameFactoryRunState(runId)),
       }).execute(actor, request);
+      if (
+        request.action === 'audio_dispatch' && result && typeof result === 'object'
+        && 'audioJobId' in result && typeof result.audioJobId === 'string'
+      ) {
+        const observation=await submitPersistedFactoryAudio(actor,result.audioJobId);
+        // Receipt уже сохранён независимо; поздняя поправка не получает ответ старой задачи как новый.
+        verifyFactoryCurrentSource(actor,getDb());
+        return {...result,observation,
+          paidGenerationAccepted:observation.state === 'unknown' ? null : !['not_submitted'].includes(observation.state),
+          requiresRefresh:true,assetAccepted:false};
+      }
       if (
         ['peer_dispatch', 'peer_refresh'].includes(request.action) &&
         result &&
@@ -2525,7 +2609,12 @@ async function executeGameFactoryRequestInner(
     // Транзакция уже отменена. Долгий обход файлов не держит SQLite lock и
     // выполняется дочерним процессом, не блокируя event loop Скуби.
     const result =
-      pending.kind === 'directory'
+      pending.kind === 'audio_observe'
+        ? await observePersistedFactoryAudio((pending.input as {actor:FactoryActor}).actor,
+            (pending.input as {jobId:string}).jobId,(pending.input as {poll:boolean}).poll)
+        : pending.kind === 'audio_import'
+          ? await importPersistedFactoryAudio(pending.input as Parameters<typeof importPersistedFactoryAudio>[0])
+          : pending.kind === 'directory'
         ? await ensureFactoryPrivateDirectoryAsync(
             pending.input as Parameters<
               typeof ensureFactoryPrivateDirectory

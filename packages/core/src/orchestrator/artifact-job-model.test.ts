@@ -152,7 +152,8 @@ describe('artifact model service capability', () => {
       expect(config).toContain(`${JSON.stringify(codexHome)} = "deny"`);
       expect(config).toContain('approval_policy = "never"');
       expect(config).toContain('view_image = false');
-      expect(config).toContain('code_mode_host = false');
+      expect(config).toContain('code_mode = false');
+      expect(config).toContain('code_mode_host = true');
       expect(config).toContain('hooks = false');
       expect(config).toContain(
         '[permissions.artifact-tools.network]\nenabled = false',

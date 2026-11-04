@@ -83,6 +83,17 @@ export function ensureGameFactorySchema(db: Database.Database): void {
       notice_json TEXT,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS factory_audio_bindings (
+      job_id TEXT PRIMARY KEY,
+      grant_id TEXT NOT NULL UNIQUE,
+      project_id TEXT NOT NULL REFERENCES factory_projects(id),
+      actor_key TEXT NOT NULL,
+      binding_json TEXT NOT NULL,
+      provider_job_id TEXT,
+      observation_json TEXT,
+      prepared_json TEXT,
+      updated_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS factory_check_receipts (
       id TEXT PRIMARY KEY,
       project_id TEXT NOT NULL REFERENCES factory_projects(id),

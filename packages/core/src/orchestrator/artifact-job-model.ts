@@ -44,7 +44,6 @@ const ARTIFACT_DISABLED_FEATURES = [
   'memories',
   'external_agent_memory_import',
   'code_mode',
-  'code_mode_host',
   'skill_search',
   'skill_mcp_dependency_install',
   'workspace_dependencies',
@@ -238,6 +237,10 @@ export function prepareArtifactJobCodex(
     ...artifactCodexPermissionConfiguration(workspace, home, readPaths),
     '[features]',
     ...ARTIFACT_DISABLED_FEATURES.map((name) => `${name} = false`),
+    // Some model tool catalogs route exec/apply_patch through functions.exec
+    // even with code_mode=false. The local V8 host brokers those existing
+    // sandboxed tools; it does not grant filesystem, network or MCP access.
+    'code_mode_host = true',
     'skip_host_skill_discovery = true',
     '[history]',
     'persistence = "none"',

@@ -3065,7 +3065,7 @@ if (isMain && isTrustedOwnerRun && envGameFactoryCapability) {
   };
   registerTool('game_factory_status',
     'Read authorized game projects, current brief/tasks/builds, project context and backend capabilities. Identity comes from the current host run. Read before changes; keep operationId for any retry.',
-    { ...factoryArgs, action: z.enum(['capabilities', 'list', 'inspect', 'context', 'peer_result']) },
+    { ...factoryArgs, action: z.enum(['capabilities', 'list', 'inspect', 'context', 'peer_result', 'audio_status']) },
     async (payload) => requestHostGameFactory({ capability: envGameFactoryCapability, groupFolder, ipcDirectory: MEMORY_IPC_DIR, mode: 'status', payload }));
   registerTool('game_factory_control',
     'Change an authorized game project through the host game-factory service. Supply exact action, expectedRevision and stable operationId. Inspect current state first; after timeout reuse the operationId. Shared project decisions never merge personal chat memories. Publication and paid external actions need their own host authorization.',
