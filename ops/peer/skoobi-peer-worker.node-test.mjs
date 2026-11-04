@@ -7,9 +7,9 @@ import crypto from 'node:crypto';
 import {spawn,spawnSync} from 'node:child_process';
 import {once} from 'node:events';
 import {fileURLToPath} from 'node:url';
-import {JobStore,privateDirectory,atomicWrite,privateJson,contentHash,validatePeerContract,validatePeerContext,acquireProcessLock,readMaintenanceGate,readGuiSlot,allocateGuiSlot,peerStorageBytes,rpc,sha256} from './skoobi-peer-core.mjs';
+import {JobStore,privateDirectory,privateRead,atomicWrite,privateJson,contentHash,validatePeerContract,validatePeerContext,acquireProcessLock,readMaintenanceGate,readGuiSlot,allocateGuiSlot,peerStorageBytes,rpc,sha256} from './skoobi-peer-core.mjs';
 import {executePeerJob,collectPeerResult,createWorkerOutputState,choosePeerJob} from './skoobi-peer-worker.mjs';
-import {createNativeOutputState,boundedWorkspaceUsage,launchContainedPeer,reapInterruptedExecutions,peerBundledSearchTool} from './skoobi-peer-runtime.mjs';
+import {createNativeOutputState,boundedWorkspaceUsage,launchContainedPeer,reapInterruptedExecutions,peerBundledSearchTool,peerExecutableSha256} from './skoobi-peer-runtime.mjs';
 import {verifyPeerResult} from './skoobi-peer-acceptance.mjs';
 
 function fixture(t){const p=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'skoobi-peer-v2-worker-')));fs.chmodSync(p,0o700);t.after(()=>fs.rmSync(p,{recursive:true,force:true}));return p;}
@@ -189,7 +189,8 @@ test('trusted CLI controller uses direct launch only with exact successful tool-
   const canary=path.join(root,'controller-only.txt'),executable=path.join(root,'synthetic-cli');
   atomicWrite(canary,'synthetic host value',true);
   atomicWrite(executable,'#!/bin/sh\n/bin/cat "$HOST_CANARY" > output/controller-observed\nprintf \'%s\\n\' \'{"type":"turn.completed"}\'\n',true);
-  fs.chmodSync(executable,0o700);
+  // Vendor binaries normally allow group/other read+execute; they are not secrets.
+  fs.chmodSync(executable,0o755);
   const codexToolPermissions={policy:'macos-codex-tool-permissions-v1',passed:true,failures:[],executableSha256:sha256(fs.readFileSync(executable)),profileSha256:sha256(fs.readFileSync(configFile))};
   const options={executable,args:['--disable','apps','--disable','plugins','exec','--strict-config','--ignore-rules','-c','approval_policy="never"','--cd',workspace,'--skip-git-repo-check','--ephemeral','--json','-'],workspace,input:'',env:{CODEX_HOME:home,HOST_CANARY:canary},timeoutMs:3000,signal:new AbortController().signal,maxWorkspaceBytes:1024*1024,codexToolPermissions};
   await assert.rejects(launchContainedPeer({...options,codexToolPermissions:{...codexToolPermissions,passed:false}}),/attestation_invalid/);
@@ -237,4 +238,40 @@ test('pinned bundled rg works through versioned symlinks inside Seatbelt without
   assert.equal(allowed.status,0,allowed.stderr);assert.equal(allowed.stdout,'1:needle synthetic line\n');
   const denied=spawnSync('/usr/bin/sandbox-exec',['-f',profile,tool.executable,'--fixed-strings','--no-config','needle',path.join(root,'private.txt')],{cwd:workspace,env,encoding:'utf8'});
   assert.notEqual(denied.status,0);assert.equal(denied.stdout,'');
+});
+
+test('trusted executable hash accepts owned0755 without weakening secret-file permissions',t=>{
+  const root=fixture(t),file=path.join(root,'vendor-cli');
+  fs.writeFileSync(file,'synthetic public executable');
+  for(const mode of [0o700,0o755]){fs.chmodSync(file,mode);assert.equal(peerExecutableSha256(file),sha256(fs.readFileSync(file)));}
+  assert.throws(()=>privateRead(file),/Unsafe peer file/);
+  const secret=path.join(root,'config.toml');atomicWrite(secret,'synthetic private config',true);
+  assert.equal(privateRead(secret).toString(),'synthetic private config');
+  assert.throws(()=>peerExecutableSha256(secret),/trusted_executable_invalid/);
+});
+test('trusted executable hash rejects writable, nonexecutable, special and unbounded files',t=>{
+  const root=fixture(t),file=path.join(root,'vendor-cli');fs.writeFileSync(file,'synthetic');
+  for(const mode of [0o775,0o757,0o644,0o4755]){fs.chmodSync(file,mode);assert.throws(()=>peerExecutableSha256(file),/trusted_executable_invalid/,mode.toString(8));}
+  fs.chmodSync(file,0o755);fs.truncateSync(file,384*1024*1024+1);assert.throws(()=>peerExecutableSha256(file),/trusted_executable_invalid/);
+  fs.truncateSync(file,0);assert.throws(()=>peerExecutableSha256(file),/trusted_executable_invalid/);
+  assert.throws(()=>peerExecutableSha256(root),/trusted_executable_invalid/);
+});
+test('trusted executable hash rejects links and noncanonical parent paths',t=>{
+  const root=fixture(t),dir=path.join(root,'bin');fs.mkdirSync(dir,{mode:0o700});const file=path.join(dir,'vendor-cli');fs.writeFileSync(file,'synthetic',{mode:0o755});
+  const link=path.join(root,'linked-cli');fs.symlinkSync(file,link);assert.throws(()=>peerExecutableSha256(link),/trusted_executable_invalid/);
+  const alias=path.join(root,'alias');fs.symlinkSync(dir,alias);assert.throws(()=>peerExecutableSha256(path.join(alias,'vendor-cli')),/trusted_executable_invalid/);
+  assert.throws(()=>peerExecutableSha256(dir+'/../bin/vendor-cli'),/trusted_executable_invalid/);
+  fs.linkSync(file,path.join(root,'hardlink'));assert.throws(()=>peerExecutableSha256(file),/trusted_executable_invalid/);
+});
+test('trusted executable hash rejects a different owner before reading bytes',t=>{
+  const root=fixture(t),file=path.join(root,'vendor-cli');fs.writeFileSync(file,'synthetic',{mode:0o755});const original=fs.fstatSync;
+  t.mock.method(fs,'fstatSync',function(...args){const stat=original.apply(this,args);return new Proxy(stat,{get(target,key){return key==='uid'?target.uid+1n:Reflect.get(target,key);}});});
+  assert.throws(()=>peerExecutableSha256(file),/trusted_executable_invalid/);
+});
+test('trusted executable hash rejects growth, replacement and mode changes during a bounded read',async t=>{
+  for(const change of ['growth','replacement','mode'])await t.test(change,t=>{
+    const root=fixture(t),file=path.join(root,'vendor-cli');fs.writeFileSync(file,'synthetic',{mode:0o755});const original=fs.readSync;let changed=false;
+    t.mock.method(fs,'readSync',function(...args){const n=original.apply(this,args);if(!changed){changed=true;if(change==='growth')fs.appendFileSync(file,'extra');else if(change==='mode')fs.chmodSync(file,0o777);else{fs.renameSync(file,file+'.old');fs.writeFileSync(file,'synthetic',{mode:0o755});}}return n;});
+    assert.throws(()=>peerExecutableSha256(file),/trusted_executable_invalid/);assert.equal(changed,true);
+  });
 });

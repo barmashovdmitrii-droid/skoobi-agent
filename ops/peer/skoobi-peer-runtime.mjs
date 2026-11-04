@@ -108,6 +108,30 @@ export async function reapInterruptedExecutions(store){
   }
 }
 
+/** Public vendor executables may be 0755; secret/config files still use privateRead. */
+export function peerExecutableSha256(executable){
+  let fd;
+  try{
+    if(typeof executable!=='string'||!path.isAbsolute(executable)||path.normalize(executable)!==executable||fs.realpathSync(executable)!==executable)throw Error('invalid_path');
+    fd=fs.openSync(executable,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
+    const before=fs.fstatSync(fd,{bigint:true});
+    if(!before.isFile()||before.uid!==BigInt(process.getuid())||before.nlink!==1n||before.mode&0o022n||!(before.mode&0o100n)||before.mode&0o7000n||before.size<1n||before.size>384n*1024n*1024n)throw Error('invalid_executable');
+    const digest=crypto.createHash('sha256'),size=Number(before.size),buffer=Buffer.allocUnsafe(Math.min(size,1024*1024));
+    let offset=0;
+    while(offset<size){
+      const read=fs.readSync(fd,buffer,0,Math.min(buffer.length,size-offset),offset);
+      if(read===0)throw Error('short_read');
+      digest.update(buffer.subarray(0,read));offset+=read;
+    }
+    if(fs.readSync(fd,buffer,0,1,size)!==0)throw Error('file_grew');
+    const after=fs.fstatSync(fd,{bigint:true}),named=fs.lstatSync(executable,{bigint:true});
+    const stable=stat=>stat.isFile()&&['dev','ino','uid','gid','mode','nlink','size','mtimeNs','ctimeNs'].every(key=>stat[key]===before[key]);
+    if(!stable(after)||!stable(named)||fs.realpathSync(executable)!==executable)throw Error('file_changed');
+    return digest.digest('hex');
+  }catch{throw Error('trusted_executable_invalid');}
+  finally{if(fd!==undefined)fs.closeSync(fd);}
+}
+
 export async function launchContainedPeer({profile,executable,args,workspace,input,env={},timeoutMs,signal,onProgress=()=>{},onProcess=()=>{},onProcessExit=()=>{},maxWorkspaceBytes,maxResidentBytes=2*1024*1024*1024,contextCheckpoint,codexToolPermissions}){
   if(process.platform!=='darwin')throw Error('isolation_platform_unsupported');
   // Only the trusted host supplies this evidence after the actual CLI canaries.
@@ -117,7 +141,7 @@ export async function launchContainedPeer({profile,executable,args,workspace,inp
     const home=path.join(workspace,'home','.codex');
     const fixedArgs=['--disable','apps','--disable','plugins','exec','--strict-config','--ignore-rules','-c','approval_policy="never"','--cd',workspace,'--skip-git-repo-check','--ephemeral','--json','-'];
     if(codexToolPermissions.policy!=='macos-codex-tool-permissions-v1'||codexToolPermissions.passed!==true||codexToolPermissions.failures?.length!==0||
-      codexToolPermissions.executableSha256!==sha256(privateRead(executable,384*1024*1024))||
+      codexToolPermissions.executableSha256!==peerExecutableSha256(executable)||
       env.CODEX_HOME!==home||codexToolPermissions.profileSha256!==sha256(privateRead(path.join(home,'config.toml'),64*1024))||
       JSON.stringify(args)!==JSON.stringify(fixedArgs))throw Error('tool_permissions_attestation_invalid');
   }
