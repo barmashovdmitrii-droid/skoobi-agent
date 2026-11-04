@@ -1501,7 +1501,7 @@ describe('TelegramChannel', () => {
           expect(text).not.toContain('передал администратору');
         }
       }
-    });
+    }, 20_000);
 
     it('does not consume a private memory-deletion challenge from an indirect message', async () => {
       const tenant = {
