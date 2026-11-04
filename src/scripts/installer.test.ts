@@ -8,6 +8,9 @@ import { fileURLToPath } from 'node:url';
 import { readEnvFile } from '@skoobi/shared/env';
 import Database from 'better-sqlite3';
 
+// Installer integration cases launch several Git and shell subprocesses.
+vi.setConfig({ testTimeout: 20_000 });
+
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   '..',
