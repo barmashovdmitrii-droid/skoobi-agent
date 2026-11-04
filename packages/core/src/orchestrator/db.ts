@@ -11,11 +11,14 @@ import {
 import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
 import { scheduledBotReplyId } from './continuation-context.js';
 import { createEventStoreSchema } from './event-store.js';
+import { ensureOperationTraceSchema } from './operation-trace-store.js';
+import { ensureMediaIntakeSchema } from './media-intake-store.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { createProviderCircuitSchema } from './provider-circuit-breaker.js';
 import { ensureMemoryStateSchema } from './memory-state-store.js';
 import { createQuotaSchema } from './quota.js';
+import { ensureMemorySemanticSchema } from './memory-semantic-store.js';
 import {
   CalendarEventLink,
   NewMessage,
@@ -551,6 +554,10 @@ export function createSchema(
   `);
 
   createEventStoreSchema(database);
+  // Optional diagnostics are additive and fail open; no content is copied from
+  // the legacy event store and schema creation never recovers running work.
+  ensureOperationTraceSchema(database);
+  ensureMediaIntakeSchema(database);
   createProviderCircuitSchema(database);
 
   // Run plugin DB schema (plugins register on import before DB init)
@@ -741,6 +748,10 @@ export function createSchema(
   });
   // Additive tables only: historical notes and conversations stay intact.
   ensureMemoryStateSchema(database);
+  try { ensureMemorySemanticSchema(database); } catch {
+    // An unavailable optional index must leave existing memory/answers usable.
+    logger.warn('Local semantic memory index unavailable; lexical fallback remains active');
+  }
 }
 
 export function initDatabase(pluginDbSchema: string[] = []): void {

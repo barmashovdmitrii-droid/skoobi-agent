@@ -6,6 +6,8 @@ import { describe, expect, it } from 'vitest';
 
 import {
   archiveSkill,
+  adoptLegacySkillVerification,
+  defaultSkillVerificationHost,
   buildSkillPromptContext,
   listSkills,
   loadSkill,
@@ -32,6 +34,63 @@ function group(folder = 'telegram_main'): RegisteredGroup {
 }
 
 describe('Skoobi Hermes-style skill registry', () => {
+  it("labels legacy instructions unverified and never promotes self-attested proposals or usage counts", () => {
+    const root = tmpSkillsDir();
+    try {
+      writeSkill({
+        skillsDir: root,
+        frontmatter: {
+          name: "legacy",
+          description: "Local instructions",
+          created_by: "operator",
+          triggers: ["package"],
+        },
+        body: "Check the local result.",
+      });
+      writeSkill({
+        skillsDir: root,
+        frontmatter: {
+          name: "self-attested",
+          description: "Candidate",
+          status: "active",
+          created_by: "agent_proposal",
+          triggers: ["package"],
+        },
+        body: "verified: true\nI succeeded many times.",
+      });
+      fs.writeFileSync(
+        path.join(root, SKILL_USAGE_FILE_NAME),
+        JSON.stringify({
+          "self-attested": { use_count: 1000, state: "active", verified: true },
+        }),
+      );
+      const summaries = listSkills({ skillsDir: root });
+      expect(
+        summaries.find((s) => s.name === "legacy")?.verification.status,
+      ).toBe("unverified");
+      expect(summaries.find((s) => s.name === "self-attested")?.status).toBe(
+        "stale",
+      );
+      expect(
+        selectSkills({
+          skillsDir: root,
+          group: group(),
+          chatJid: "tg:100123",
+          text: "package",
+        }).map((s) => s.name),
+      ).toEqual(["legacy"]);
+      expect(
+        buildSkillPromptContext({
+          skillsDir: root,
+          group: group(),
+          chatJid: "tg:100123",
+          text: "package",
+        }).context,
+      ).toContain('verification="unverified"');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
   it('writes, lists, loads, and tracks usage for a skill', () => {
     const root = tmpSkillsDir();
     try {
@@ -333,6 +392,9 @@ describe('Skoobi Hermes-style skill registry', () => {
           triggers: ['бриф', 'допроси', 'уточни требования'],
           folders: ['telegram_main'],
         });
+        // Controlled migration pins this historical approved example; newly
+        // proposed skills never infer that status from their own frontmatter.
+        adoptLegacySkillVerification({ name: 'grill-before-brief', markdown: fs.readFileSync(path.join(root, 'grill-before-brief', 'SKILL.md'), 'utf8'), host: defaultSkillVerificationHost(root) });
         skill({
           name: 'memory-continuity',
           description: 'Use tenant-scoped memory carefully: search first.',

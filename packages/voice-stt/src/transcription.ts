@@ -7,11 +7,23 @@
  * cloud fallback in this module.
  */
 
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import { promises as fs } from 'fs';
 import { tmpdir } from 'os';
 import { basename, join } from 'path';
+import {
+  TRANSCRIPTION_TEXT_MAX_BYTES,
+  type LocalTranscriptionResult,
+  type TranscriptionPassEvidence,
+} from '@skoobi/shared/transcription-result';
+import { assessTranscription, classifyTranscriptionError, failedTranscription, hasSuspectCaptionTail } from './transcription-quality.js';
+import {
+  startOperationTraceStage,
+  type OperationTraceDetails,
+  type OperationTraceObserver,
+  type OperationTraceReason,
+} from '@skoobi/shared/operation-trace';
 
 import {
   basenameOnly,
@@ -88,6 +100,12 @@ export interface WhisperCandidate {
 interface ExecOptions {
   timeout: number;
   maxBuffer?: number;
+  signal?: AbortSignal;
+}
+
+export interface LocalTranscriptionControl {
+  signal: AbortSignal;
+  deadlineAtMs: number;
 }
 
 export type LocalExecFile = (
@@ -232,6 +250,15 @@ export function parseWhisperJson(jsonText: string): ParsedWhisperJson | null {
     return null;
   }
   if (!isRecord(document)) return null;
+  if (
+    typeof document.text !== 'string' &&
+    (!Array.isArray(document.transcription) ||
+      (document.transcription.length > 0 &&
+        !document.transcription.some(
+          (segment) => isRecord(segment) && typeof segment.text === 'string',
+        )))
+  )
+    return null;
 
   const result = isRecord(document.result) ? document.result : null;
   const detectedLanguage = nullableLanguage(result?.language);
@@ -430,7 +457,8 @@ export type RetryReason =
   | 'missing_language_probability'
   | 'low_language_probability'
   | 'missing_mean_token_log_probability'
-  | 'low_mean_token_log_probability';
+  | 'low_mean_token_log_probability'
+  | 'suspect_caption_tail';
 
 export function retryReasonForAutoCandidate(
   candidate: WhisperCandidate,
@@ -473,6 +501,8 @@ export function retryReasonForAutoCandidate(
   if (candidate.meanTokenLogProbability < config.retryMeanTokenLogProbability) {
     return 'low_mean_token_log_probability';
   }
+  if (hasSuspectCaptionTail(candidate.transcript))
+    return 'suspect_caption_tail';
   return null;
 }
 
@@ -524,6 +554,8 @@ async function defaultExecFile(
   args: readonly string[],
   options: ExecOptions,
 ): Promise<{ stdout: string; stderr: string }> {
+  if (options.signal)
+    return runControlledLocalProcess(executable, args, options);
   const result = await execFileAsync(executable, [...args], {
     timeout: options.timeout,
     maxBuffer: options.maxBuffer,
@@ -533,6 +565,151 @@ async function defaultExecFile(
     stdout: String(result.stdout || ''),
     stderr: String(result.stderr || ''),
   };
+}
+
+/** A controlled call owns one POSIX process group, including local wrappers.
+ * Cancellation waits for direct-child close and cannot lose the group KILL
+ * escalation merely because a wrapper exits before its descendants.
+ */
+export function runControlledLocalProcess(
+  executable: string,
+  args: readonly string[],
+  options: ExecOptions,
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const aborted = () =>
+      Object.assign(new Error('Local process aborted'), { code: 'ABORT_ERR' });
+    if (options.signal?.aborted) {
+      reject(aborted());
+      return;
+    }
+    let processError: Error | undefined;
+    let stopError: Error | undefined;
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let closed = false;
+    let settled = false;
+    let groupKillSettled = false;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const ownProcessGroup = process.platform !== 'win32';
+    const child = spawn(executable, [...args], {
+      detached: ownProcessGroup,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const signalOwnedProcess = (signal: NodeJS.Signals) => {
+      try {
+        if (ownProcessGroup && child.pid) process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH')
+          processError ??= error as Error;
+      }
+    };
+    const groupExists = () => {
+      if (!ownProcessGroup || !child.pid) return false;
+      try {
+        process.kill(-child.pid, 0);
+        return true;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+      }
+    };
+    const complete = () => {
+      if (settled || !closed || (stopError && !groupKillSettled)) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      options.signal?.removeEventListener('abort', abort);
+      const output = {
+        stdout: Buffer.concat(stdout).toString('utf8'),
+        stderr: Buffer.concat(stderr).toString('utf8'),
+      };
+      const error = stopError || processError;
+      if (error) reject(Object.assign(error, output));
+      else resolve(output);
+    };
+    const stop = (error: Error) => {
+      if (stopError) return;
+      stopError = error;
+      signalOwnedProcess('SIGTERM');
+      killTimer = setTimeout(() => {
+        signalOwnedProcess('SIGKILL');
+        groupKillSettled = true;
+        complete();
+      }, 2000);
+    };
+    const maxBuffer = options.maxBuffer ?? 1024 * 1024;
+    const capture = (
+      chunks: Buffer[],
+      bytes: number,
+      chunk: Buffer,
+    ): number => {
+      if (bytes + chunk.length > maxBuffer) {
+        if (bytes < maxBuffer)
+          chunks.push(chunk.subarray(0, maxBuffer - bytes));
+        stop(
+          Object.assign(new Error('Local process output exceeded limit'), {
+            code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+          }),
+        );
+        return maxBuffer;
+      }
+      chunks.push(chunk);
+      return bytes + chunk.length;
+    };
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdoutBytes = capture(stdout, stdoutBytes, chunk);
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderrBytes = capture(stderr, stderrBytes, chunk);
+    });
+    const abort = () => stop(aborted());
+    const timer = setTimeout(
+      () =>
+        stop(
+          Object.assign(new Error('Local process timed out'), {
+            code: 'ETIMEDOUT',
+          }),
+        ),
+      Math.max(1, options.timeout),
+    );
+    child.on('error', (error) => {
+      processError = error;
+    });
+    child.once('close', (code, signal) => {
+      closed = true;
+      if (!processError && (code !== 0 || signal))
+        processError = Object.assign(new Error('Local process failed'), {
+          code,
+          signal,
+        });
+      if (!stopError && groupExists())
+        stop(
+          Object.assign(new Error('Local wrapper left running descendants'), {
+            code: 'EINCOMPLETE',
+          }),
+        );
+      if (stopError && !groupExists()) groupKillSettled = true;
+      complete();
+    });
+    options.signal?.addEventListener('abort', abort, { once: true });
+    if (options.signal?.aborted) abort();
+  });
+}
+
+function controlledTimeout(
+  timeout: number,
+  control?: LocalTranscriptionControl,
+): number {
+  if (!control) return timeout;
+  if (control.signal.aborted || control.deadlineAtMs <= Date.now()) {
+    throw Object.assign(new Error('Local transcription cancelled'), {
+      code: 'ABORT_ERR',
+    });
+  }
+  return Math.max(1, Math.min(timeout, control.deadlineAtMs - Date.now()));
 }
 
 async function readInitialPrompt(
@@ -666,23 +843,165 @@ async function runWhisperPass(
   language: string,
   passIndex: number,
   initialPrompt: string,
+  trace?: OperationTraceObserver,
+  retryReason?: OperationTraceReason,
+  control?: LocalTranscriptionControl,
+  capture?: (pass: TranscriptionPassEvidence) => void,
 ): Promise<WhisperCandidate> {
-  const outputPrefix = join(privateTmpDir, `pass-${passIndex}-${language}`);
-  const args = buildWhisperArgs({
-    model: config.whisperModel,
-    audioPath: wavPath,
-    outputPrefix,
-    language,
-    threads: config.whisperThreads,
-    noGpu: config.whisperNoGpu,
-    initialPrompt,
-  });
-  const { stderr } = await execLocal(config.whisperBin, args, {
-    timeout: config.whisperTimeoutMs,
-    maxBuffer: CHILD_MAX_BUFFER_BYTES,
-  });
-  const json = await fs.readFile(`${outputPrefix}.json`, 'utf8');
-  return candidateFromWhisperOutput(language, json, stderr);
+  const span = startOperationTraceStage(
+    trace,
+    passIndex === 1 ? 'stt' : 'stt_recheck',
+    {
+      passIndex,
+      language: traceLanguage(language),
+      ...(retryReason ? { reason: retryReason } : {}),
+    },
+  );
+  try {
+    const outputPrefix = join(privateTmpDir, `pass-${passIndex}-${language}`);
+    const args = buildWhisperArgs({
+      model: config.whisperModel,
+      audioPath: wavPath,
+      outputPrefix,
+      language,
+      threads: config.whisperThreads,
+      noGpu: config.whisperNoGpu,
+      initialPrompt,
+    });
+    const { stderr } = await execLocal(config.whisperBin, args, {
+      timeout: controlledTimeout(config.whisperTimeoutMs, control),
+      maxBuffer: CHILD_MAX_BUFFER_BYTES,
+      ...(control ? { signal: control.signal } : {}),
+    });
+    const json = await fs
+      .readFile(`${outputPrefix}.json`, 'utf8')
+      .catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT')
+          throw Object.assign(
+            new Error('Local transcription output unavailable'),
+            { code: 'STT_OUTPUT_UNAVAILABLE' },
+          );
+        throw error;
+      });
+    const candidate = candidateFromWhisperOutput(language, json, stderr);
+    let originalText: string | null = null;
+    try {
+      const document = JSON.parse(json);
+      if (isRecord(document)) {
+        originalText =
+          typeof document.text === 'string'
+            ? document.text
+            : Array.isArray(document.transcription)
+              ? document.transcription
+                  .flatMap((segment) =>
+                    isRecord(segment) && typeof segment.text === 'string'
+                      ? [segment.text]
+                      : [],
+                  )
+                  .join(' ')
+              : null;
+      }
+    } catch {
+      /* invalid JSON is retained as a rejected candidate, not speech */
+    }
+    if (
+      originalText !== null &&
+      Buffer.byteLength(originalText) > TRANSCRIPTION_TEXT_MAX_BYTES
+    )
+      throw Object.assign(
+        new Error('Local transcription output exceeded limit'),
+        { code: 'STT_OUTPUT_TOO_LARGE' },
+      );
+    capture?.({
+      index: passIndex,
+      requestedLanguage: language,
+      detectedLanguage: candidate.detectedLanguage,
+      languageProbability: candidate.languageProbability,
+      meanTokenLogProbability: candidate.meanTokenLogProbability,
+      text: originalText,
+      valid: candidate.valid,
+      invalidReason: candidate.invalidReason,
+      outcome: 'completed',
+    });
+    span.finish(candidate.valid ? 'succeeded' : 'failed', {
+      ...traceCandidateDetails(candidate),
+      ...(candidate.invalidReason
+        ? { reason: traceInvalidReason(candidate.invalidReason) }
+        : {}),
+    });
+    return candidate;
+  } catch (err) {
+    capture?.({
+      index: passIndex,
+      requestedLanguage: language,
+      detectedLanguage: null,
+      languageProbability: null,
+      meanTokenLogProbability: null,
+      text: null,
+      valid: false,
+      invalidReason: null,
+      outcome: 'technical_error',
+      errorCode: classifyTranscriptionError(
+        err,
+        'whisper',
+        control?.signal.aborted,
+      ).code,
+    });
+    span.finish('failed', {
+      reason: safeProcessFailure(err).timedOut
+        ? 'process_timeout'
+        : 'process_failure',
+    });
+    throw err;
+  }
+}
+
+function traceLanguage(
+  language: string | null,
+): OperationTraceDetails['language'] {
+  return language === 'auto' ||
+    language === 'ru' ||
+    language === 'kk' ||
+    language === 'en'
+    ? language
+    : 'other';
+}
+
+function traceInvalidReason(
+  reason: NonNullable<WhisperCandidate['invalidReason']>,
+): OperationTraceReason {
+  return reason === 'artifact' ? 'caption_artifact' : reason;
+}
+
+function traceRetryReason(
+  reason: RetryReason,
+  candidate: WhisperCandidate,
+): OperationTraceReason {
+  if (reason === 'invalid_transcript')
+    return candidate.invalidReason
+      ? traceInvalidReason(candidate.invalidReason)
+      : 'recheck_uncertain';
+  if (reason === 'low_mean_token_log_probability') return 'low_mean_logprob';
+  if (reason === 'missing_mean_token_log_probability')
+    return 'missing_mean_logprob';
+  if (reason === 'suspect_caption_tail') return 'recheck_uncertain';
+  return reason;
+}
+
+function traceCandidateDetails(
+  candidate: WhisperCandidate,
+): OperationTraceDetails {
+  return {
+    language: traceLanguage(
+      candidate.detectedLanguage || candidate.requestedLanguage,
+    ),
+    ...(candidate.languageProbability !== null
+      ? { languageProbability: candidate.languageProbability }
+      : {}),
+    ...(candidate.meanTokenLogProbability !== null
+      ? { meanLogProbability: candidate.meanTokenLogProbability }
+      : {}),
+  };
 }
 
 function roundMetric(value: number | null, digits: number): number | null {
@@ -694,13 +1013,21 @@ async function transcribeUnserialized(
   langOverride: string | undefined,
   config: LocalTranscriptionConfig,
   execLocal: LocalExecFile,
-): Promise<string | null> {
+  trace?: OperationTraceObserver,
+  control?: LocalTranscriptionControl,
+): Promise<LocalTranscriptionResult> {
+  const processing = startOperationTraceStage(trace, 'stt_preprocess');
   if (!config.whisperModel) {
+    processing.finish('skipped', { reason: 'unavailable' });
     logger.error(
       { failureCode: 'missing_local_model' },
       'Local voice transcription disabled',
     );
-    return null;
+    return failedTranscription({
+      stage: 'configuration',
+      code: 'missing_model',
+      retryable: false,
+    });
   }
 
   const startedAt = performance.now();
@@ -710,31 +1037,53 @@ async function transcribeUnserialized(
     'temporary_directory';
   let passCount = 0;
   let retryReason: RetryReason | null = null;
+  const passes: TranscriptionPassEvidence[] = [];
 
   try {
+    controlledTimeout(FFMPEG_TIMEOUT_MS, control);
     privateTmpDir = await fs.mkdtemp(join(tmpdir(), 'skoobi-voice-stt-'));
     await fs.chmod(privateTmpDir, 0o700);
     const wavPath = join(privateTmpDir, 'audio.wav');
 
     stage = 'ffmpeg';
-    await execLocal(
-      config.ffmpegBin,
-      [
-        '-y',
-        '-i',
-        audioPath,
-        '-ar',
-        '16000',
-        '-ac',
-        '1',
-        '-loglevel',
-        'error',
-        wavPath,
-      ],
-      { timeout: FFMPEG_TIMEOUT_MS, maxBuffer: CHILD_MAX_BUFFER_BYTES },
-    );
+    const ffmpeg = startOperationTraceStage(trace, 'ffmpeg');
+    try {
+      await execLocal(
+        config.ffmpegBin,
+        [
+          '-y',
+          '-i',
+          audioPath,
+          '-ar',
+          '16000',
+          '-ac',
+          '1',
+          '-loglevel',
+          'error',
+          wavPath,
+        ],
+        {
+          timeout: controlledTimeout(FFMPEG_TIMEOUT_MS, control),
+          maxBuffer: CHILD_MAX_BUFFER_BYTES,
+          ...(control ? { signal: control.signal } : {}),
+        },
+      );
+      ffmpeg.finish('succeeded');
+    } catch (err) {
+      ffmpeg.finish('failed', {
+        reason: safeProcessFailure(err).timedOut
+          ? 'process_timeout'
+          : 'process_failure',
+      });
+      throw err;
+    }
     audioDuration = await wavDurationSeconds(wavPath);
     const initialPrompt = await readInitialPrompt(config);
+    processing.finish('succeeded', {
+      ...(audioDuration !== null
+        ? { audioDurationMs: Math.round(audioDuration * 1000) }
+        : {}),
+    });
     const requestedLanguage = normalizeLanguage(
       langOverride || config.whisperLang || 'auto',
     );
@@ -750,6 +1099,10 @@ async function transcribeUnserialized(
         requestedLanguage,
         ++passCount,
         initialPrompt,
+        trace,
+        undefined,
+        control,
+        (pass) => passes.push(pass),
       ),
     );
 
@@ -757,6 +1110,7 @@ async function transcribeUnserialized(
       retryReason = retryReasonForAutoCandidate(candidates[0], config);
       if (retryReason) {
         for (const retryLanguage of ['ru', 'kk'] as const) {
+          controlledTimeout(config.whisperTimeoutMs, control);
           passCount += 1;
           try {
             candidates.push(
@@ -768,6 +1122,10 @@ async function transcribeUnserialized(
                 retryLanguage,
                 passCount,
                 initialPrompt,
+                trace,
+                traceRetryReason(retryReason, candidates[0]),
+                control,
+                (pass) => passes.push(pass),
               ),
             );
           } catch (err) {
@@ -788,6 +1146,7 @@ async function transcribeUnserialized(
       }
     }
 
+    if (control) controlledTimeout(1, control);
     const selected = selectBestCandidate(candidates);
     const invalidReason = selected
       ? null
@@ -829,8 +1188,33 @@ async function transcribeUnserialized(
         }).catch(() => undefined);
       }
     }
-    return transcript;
+    return assessTranscription({
+      passes,
+      selectedPassIndex: selected
+        ? (passes.find(
+            (pass) =>
+              pass.valid &&
+              pass.requestedLanguage === selected.requestedLanguage,
+          )?.index ?? null)
+        : null,
+      recheckReason: retryReason,
+      retryLanguageProbability: config.retryLanguageProbability,
+      retryMeanTokenLogProbability: config.retryMeanTokenLogProbability,
+      metrics: {
+        queueWaitMs: 0,
+        processingMs: processingDurationMs,
+        audioDurationMs: audioDuration === null ? null : audioDuration * 1000,
+      },
+    });
   } catch (err) {
+    processing.finish('failed', {
+      reason:
+        stage === 'temporary_directory'
+          ? 'storage_failure'
+          : safeProcessFailure(err).timedOut
+            ? 'process_timeout'
+            : 'process_failure',
+    });
     const processingDurationMs = performance.now() - startedAt;
     const stderrSnippet =
       stage === 'ffmpeg' ? childStderrSnippet(err) : undefined;
@@ -847,7 +1231,16 @@ async function transcribeUnserialized(
       },
       'Local audio transcription failed',
     );
-    return null;
+    return failedTranscription(
+      classifyTranscriptionError(err, stage, control?.signal.aborted),
+      passes,
+      {
+        queueWaitMs: 0,
+        processingMs: processingDurationMs,
+        audioDurationMs: audioDuration === null ? null : audioDuration * 1000,
+      },
+      retryReason,
+    );
   } finally {
     if (privateTmpDir) {
       await fs
@@ -862,31 +1255,110 @@ async function transcribeUnserialized(
  * serialized. A rejection cannot poison the tail; the next queued call runs.
  * Exported for deterministic local-only unit testing.
  */
-export function createSerializedLocalTranscriber(
+export function createSerializedLocalTranscribers(
   configProvider: () => LocalTranscriptionConfig,
   execLocal: LocalExecFile = defaultExecFile,
-): (audioPath: string, langOverride?: string) => Promise<string | null> {
+) {
   let tail: Promise<void> = Promise.resolve();
-  return (audioPath: string, langOverride?: string) => {
+  const detailed = (
+    audioPath: string,
+    langOverride?: string,
+    trace?: OperationTraceObserver,
+    control?: LocalTranscriptionControl,
+  ): Promise<LocalTranscriptionResult> => {
+    const queuedAt = performance.now();
+    const queued = startOperationTraceStage(trace, 'stt_queue');
     const previous = tail;
     let release!: () => void;
     tail = new Promise<void>((resolve) => {
       release = resolve;
     });
-    return previous
-      .then(() =>
-        transcribeUnserialized(
-          audioPath,
-          langOverride,
-          configProvider(),
-          execLocal,
-        ),
-      )
+    let began = false;
+    const scheduled = previous
+      .then(async () => {
+        began = true;
+        if (
+          control &&
+          (control.signal.aborted || control.deadlineAtMs <= Date.now())
+        ) {
+          queued.finish('cancelled', { reason: 'cancelled' });
+          return failedTranscription(
+            { stage: 'queue', code: 'aborted', retryable: false },
+            [],
+            {
+              queueWaitMs: Math.max(0, performance.now() - queuedAt),
+              processingMs: 0,
+              audioDurationMs: null,
+            },
+          );
+        }
+        queued.finish('succeeded', {
+          queueWaitMs: Math.max(0, Math.round(performance.now() - queuedAt)),
+        });
+        const queueWaitMs = Math.max(0, performance.now() - queuedAt);
+        let result: LocalTranscriptionResult;
+        try {
+          result = await transcribeUnserialized(
+            audioPath,
+            langOverride,
+            configProvider(),
+            execLocal,
+            trace,
+            control,
+          );
+        } catch (error) {
+          result = failedTranscription(
+            classifyTranscriptionError(
+              error,
+              'configuration',
+              control?.signal.aborted,
+            ),
+          );
+        }
+        result.metrics.queueWaitMs = queueWaitMs;
+        return result;
+      })
       .finally(release);
+    if (!control) return scheduled;
+    return new Promise<LocalTranscriptionResult>((resolve, reject) => {
+      const abortQueued = () => {
+        if (began) return; // active work settles only after actual child close.
+        queued.finish('cancelled', { reason: 'cancelled' });
+        resolve(
+          failedTranscription(
+            { stage: 'queue', code: 'aborted', retryable: false },
+            [],
+            {
+              queueWaitMs: Math.max(0, performance.now() - queuedAt),
+              processingMs: 0,
+              audioDurationMs: null,
+            },
+          ),
+        );
+      };
+      control.signal.addEventListener('abort', abortQueued, { once: true });
+      if (control.signal.aborted) abortQueued();
+      void scheduled
+        .then(resolve, reject)
+        .finally(() =>
+          control.signal.removeEventListener('abort', abortQueued),
+        );
+    });
   };
+  const legacy = async (
+    ...args: Parameters<typeof detailed>
+  ): Promise<string | null> => (await detailed(...args)).text;
+  return { detailed, legacy };
 }
 
-const defaultLocalTranscriber = createSerializedLocalTranscriber(
+export function createSerializedLocalTranscriber(
+  configProvider: () => LocalTranscriptionConfig,
+  execLocal: LocalExecFile = defaultExecFile,
+) {
+  return createSerializedLocalTranscribers(configProvider, execLocal).legacy;
+}
+
+const defaultLocalTranscribers = createSerializedLocalTranscribers(
   resolveLocalTranscriptionConfig,
 );
 
@@ -899,6 +1371,27 @@ const defaultLocalTranscriber = createSerializedLocalTranscriber(
 export function transcribeAudioFile(
   audioPath: string,
   langOverride?: string,
+  trace?: OperationTraceObserver,
+  control?: LocalTranscriptionControl,
 ): Promise<string | null> {
-  return defaultLocalTranscriber(audioPath, langOverride);
+  return defaultLocalTranscribers.legacy(
+    audioPath,
+    langOverride,
+    trace,
+    control,
+  );
+}
+
+export function transcribeAudioFileDetailed(
+  audioPath: string,
+  langOverride?: string,
+  trace?: OperationTraceObserver,
+  control?: LocalTranscriptionControl,
+): Promise<LocalTranscriptionResult> {
+  return defaultLocalTranscribers.detailed(
+    audioPath,
+    langOverride,
+    trace,
+    control,
+  );
 }

@@ -21,6 +21,16 @@ import { createAssistantMentionPattern } from '@skoobi/shared/assistant-name';
 import { readEnvFile } from '@skoobi/shared/env';
 import { logger } from '@skoobi/shared/logger';
 import { hashShort } from '@skoobi/shared/log-sanitize';
+import {
+  MediaIntakePersistenceError,
+  type MediaIntakeAdapter,
+  type MediaIntakeKind,
+} from '@skoobi/shared/media-intake';
+import { MediaIntakeWorker, MediaIntakeWorkError } from './media-intake-worker.js';
+import {
+  startOperationTraceStage,
+  type OperationTraceObserver,
+} from '@skoobi/shared/operation-trace';
 import { tombstoneMarkdownTreeNoFollowSync } from '@skoobi/shared/safe-child-write';
 import {
   isValidGroupFolder,
@@ -50,7 +60,7 @@ import type {
   OnInboundMessage,
   OnTelegramCallbackQuery,
 } from '@skoobi/shared/channel-types';
-import { transcribeAudioFile } from '@skoobi/voice-stt';
+import { transcribeAudioFile, transcribeAudioFileDetailed } from '@skoobi/voice-stt';
 import { downloadTelegramPhoto } from './photo-telegram.js';
 import {
   pinLastMedia,
@@ -247,6 +257,12 @@ export interface TelegramChannelOpts {
   ownerAllowlist?: () => OwnerAllowlistConfig;
   onTelegramCallbackQuery?: OnTelegramCallbackQuery;
   onPlanPurchase?: TelegramPlanPurchase;
+  /** Host-scoped observations only; never an authorization decision. */
+  operationTrace?: (
+    chatJid: string,
+    messageId: string,
+  ) => OperationTraceObserver | undefined;
+  mediaIntake?: (botId?: string) => MediaIntakeAdapter | undefined;
   host: TelegramChannelHost;
   botId?: string;
   personaId?: string;
@@ -2524,6 +2540,8 @@ function telegramProgressAbortSignal(signal: AbortSignal): NonNullable<Parameter
 }
 
 export class TelegramChannel implements Channel {
+  private mediaIntakeAdapter?: MediaIntakeAdapter;
+  private mediaIntakeWorker?: MediaIntakeWorker;
   name = 'telegram';
 
   private bot: Bot | null = null;
@@ -3165,8 +3183,10 @@ export class TelegramChannel implements Channel {
     group: TelegramRegisteredGroup,
     kind: TelegramInboundKind,
     details: Partial<TelegramInboxEntry> = {},
+    trace?: OperationTraceObserver,
   ): void {
     const chatJid = this.chatJidForChat(ctx.chat.id);
+    const span = startOperationTraceStage(trace, 'inbox');
     try {
       appendTelegramInboxEntry(group.folder, {
         received_at: new Date().toISOString(),
@@ -3180,11 +3200,90 @@ export class TelegramChannel implements Channel {
         telegram_message_origin: telegramMessageOriginForContext(ctx),
         ...details,
       });
+      span.finish('succeeded');
     } catch (err) {
+      span.finish('failed', { reason: 'storage_failure' });
       logger.warn(
         { err, chatJid, folder: group.folder, kind },
         'Failed to record Telegram durable inbox entry',
       );
+    }
+  }
+
+  private traceInboundMessage(ctx: any): OperationTraceObserver | undefined {
+    try {
+      const trace = this.opts.operationTrace?.(
+        this.chatJidForChat(ctx.chat.id),
+        ctx.message.message_id.toString(),
+      );
+      startOperationTraceStage(trace, 'received').finish('succeeded');
+      return trace;
+    } catch {
+      // Optional diagnostics must never reject a valid inbound message.
+      return undefined;
+    }
+  }
+
+  private acceptMediaIntake(
+    ctx: any,
+    kind: MediaIntakeKind,
+    trace?: OperationTraceObserver,
+  ): boolean {
+    if (!this.mediaIntakeAdapter) return false;
+    const accepted = startOperationTraceStage(trace, 'accepted');
+    try {
+      const media = ctx.message[kind];
+      const senderName = telegramSenderName(ctx);
+      const chatJid = this.chatJidForChat(ctx.chat.id);
+      const result = this.mediaIntakeAdapter.accept({
+        message: {
+          id: ctx.message.message_id.toString(),
+          chat_jid: chatJid,
+          sender: ctx.from?.id?.toString() || '',
+          sender_name: senderName,
+          timestamp: telegramMessageTimestamp(ctx),
+          sender_identity: this.senderIdentityForContext(ctx, senderName),
+          telegram_update_id: telegramUpdateId(ctx),
+        },
+        media: {
+          kind,
+          fileId: media.file_id,
+          fileUniqueId: media.file_unique_id,
+          fileName: media.file_name,
+          mimeType: media.mime_type,
+          declaredBytes: media.file_size,
+          durationSeconds: media.duration,
+        },
+        caption: ctx.message.caption,
+        isGroup: ctx.chat.type === 'group' || ctx.chat.type === 'supergroup',
+      });
+      accepted.finish(
+        result.kind === 'rejected' && result.reason !== 'capacity'
+          ? 'skipped'
+          : 'succeeded',
+      );
+      if (result.kind === 'accepted' || result.kind === 'duplicate') {
+        try {
+          this.opts.onChatMetadata(
+            chatJid,
+            telegramMessageTimestamp(ctx),
+            undefined,
+            'telegram',
+            ctx.chat.type === 'group' || ctx.chat.type === 'supergroup',
+          );
+        } catch {
+          logger.warn(
+            { code: 'metadata_unavailable' },
+            'Accepted media chat metadata unavailable',
+          );
+        }
+        void this.mediaIntakeWorker?.wake();
+      }
+      return true;
+    } catch {
+      accepted.finish('failed', { reason: 'storage_failure' });
+      // Continuing polling would acknowledge an update that was never saved.
+      throw new MediaIntakePersistenceError();
     }
   }
 
@@ -3862,6 +3961,37 @@ export class TelegramChannel implements Channel {
   }
 
   async connect(): Promise<void> {
+    await this.mediaIntakeWorker?.stop();
+    this.mediaIntakeWorker = undefined;
+    this.mediaIntakeAdapter = undefined;
+    if (this.opts.mediaIntake) {
+      const adapter = this.opts.mediaIntake(this.opts.botId);
+      if (!adapter) throw new MediaIntakePersistenceError();
+      this.mediaIntakeAdapter = adapter;
+      this.mediaIntakeWorker = new MediaIntakeWorker({
+        adapter,
+        groupDirectory: (job) => resolveGroupFolderPath(job.scope.groupFolder),
+        operationTrace: (job) =>
+          this.opts.operationTrace?.(job.scope.chatJid, job.input.message.id),
+        download: async (job, control) => {
+          const result = await downloadTelegramAudio(
+            this.botToken,
+            job.input.media.fileId,
+            job.scope.groupFolder,
+            job.input.media.kind,
+            control.trace,
+            { ...control, maxAttempts: 1 },
+          );
+          if (!result) throw new MediaIntakeWorkError('transport_failure');
+        },
+        transcribe: (sourcePath, control) =>
+          transcribeAudioFile(sourcePath, undefined, control.trace, control),
+        transcribeDetailed: (sourcePath, control) =>
+          transcribeAudioFileDetailed(sourcePath, undefined, control.trace, control),
+        onError: (code) =>
+          logger.warn({ code }, 'Media intake worker unavailable'),
+      });
+    }
     this.bot = new Bot(this.botToken, {
       client: {
         baseFetchConfig: { agent: https.globalAgent, compress: true },
@@ -4815,12 +4945,19 @@ export class TelegramChannel implements Channel {
       const decision = this.allowRegisteredInbound(ctx, group, 'media');
       if (!decision.accept) return;
 
+      const trace = this.traceInboundMessage(ctx);
       const fileId = ctx.message.voice?.file_id;
-      this.recordTelegramInbox(ctx, group, 'voice', {
-        deferred: !decision.processNow,
-        file_id: fileId,
-        file_unique_id: ctx.message.voice?.file_unique_id,
-      });
+      this.recordTelegramInbox(
+        ctx,
+        group,
+        'voice',
+        {
+          deferred: !decision.processNow,
+          file_id: fileId,
+          file_unique_id: ctx.message.voice?.file_unique_id,
+        },
+        trace,
+      );
       if (!fileId) {
         storeNonText(ctx, '[Voice message]', {
           skipAccessCheck: true,
@@ -4828,6 +4965,7 @@ export class TelegramChannel implements Channel {
         });
         return;
       }
+      if (this.acceptMediaIntake(ctx, 'voice', trace)) return;
 
       // Download once, keep the exact saved file for the media manifest, then
       // pass that same local path through the channel-agnostic STT pipeline.
@@ -4837,9 +4975,12 @@ export class TelegramChannel implements Channel {
         fileId,
         group.folder,
         'voice',
+        trace,
       );
       const transcriptResult = savedPath
-        ? await transcribeAudioFile(savedPath).catch(() => null)
+        ? await transcribeAudioFile(savedPath, undefined, trace).catch(
+            () => null,
+          )
         : null;
 
       const transcript = transcriptResult || '';
@@ -4870,14 +5011,21 @@ export class TelegramChannel implements Channel {
       const decision = this.allowRegisteredInbound(ctx, group, 'media');
       if (!decision.accept) return;
 
+      const trace = this.traceInboundMessage(ctx);
       const fileId = ctx.message.audio?.file_id;
-      this.recordTelegramInbox(ctx, group, 'audio', {
-        caption: ctx.message.caption,
-        deferred: !decision.processNow,
-        file_id: fileId,
-        file_unique_id: ctx.message.audio?.file_unique_id,
-        file_name: ctx.message.audio?.file_name,
-      });
+      this.recordTelegramInbox(
+        ctx,
+        group,
+        'audio',
+        {
+          caption: ctx.message.caption,
+          deferred: !decision.processNow,
+          file_id: fileId,
+          file_unique_id: ctx.message.audio?.file_unique_id,
+          file_name: ctx.message.audio?.file_name,
+        },
+        trace,
+      );
       if (!fileId) {
         storeNonText(ctx, '[Audio]', {
           skipAccessCheck: true,
@@ -4885,6 +5033,7 @@ export class TelegramChannel implements Channel {
         });
         return;
       }
+      if (this.acceptMediaIntake(ctx, 'audio', trace)) return;
       const audioTooBig = telegramOversizePlaceholder(
         'Audio',
         ctx.message.audio?.file_size,
@@ -4902,9 +5051,12 @@ export class TelegramChannel implements Channel {
         fileId,
         group.folder,
         'audio',
+        trace,
       );
       const transcriptResult = savedPath
-        ? await transcribeAudioFile(savedPath).catch(() => null)
+        ? await transcribeAudioFile(savedPath, undefined, trace).catch(
+            () => null,
+          )
         : null;
 
       const transcript = transcriptResult || '';
@@ -5000,6 +5152,7 @@ export class TelegramChannel implements Channel {
 
     // Handle errors gracefully
     this.bot.catch((err) => {
+      if (err.error instanceof MediaIntakePersistenceError) throw err;
       logger.error({ err: err.message }, 'Telegram bot error');
     });
 
@@ -5019,6 +5172,7 @@ export class TelegramChannel implements Channel {
       const startResult = this.bot!.start({
         onStart: (botInfo) => {
           onStartFired = true;
+          this.mediaIntakeWorker?.start();
           logger.info(
             { username: botInfo.username, id: botInfo.id },
             'Telegram bot connected',
@@ -5289,6 +5443,7 @@ export class TelegramChannel implements Channel {
   }
 
   async disconnect(): Promise<void> {
+    await this.mediaIntakeWorker?.stop();
     // Clear any in-flight typing refresh loops before stopping the bot, or
     // they'll keep firing API calls into a torn-down client.
     for (const timer of this.typingIntervals.values()) clearInterval(timer);

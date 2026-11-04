@@ -1,5 +1,7 @@
 import { createHash } from 'crypto';
 import type Database from 'better-sqlite3';
+import { parseProjectValueDetail, type ProjectValueDetail } from './project-insights.js';
+import { parseEditorialFeedbackDetail, type EditorialFeedbackDetail, type EditorialFeedbackDetailInput, type EditorialArtifactEvidence } from './editorial-feedback.js';
 
 /** All scope/source fields come from the authenticated host, never tool arguments. */
 export interface MemoryStateScope {
@@ -17,6 +19,8 @@ export interface MemoryStateSource {
   explicitForget?: boolean;
   /** Host-only: this source is the current direct input, not a historical quote. */
   currentDirectInput?: boolean;
+  /** Host-only proof from exact same-chat assistant message bytes. */
+  editorialArtifactEvidence?: EditorialArtifactEvidence;
 }
 export interface StoredMemoryStateSource {
   kind: MemoryStateSource['kind'];
@@ -57,6 +61,7 @@ export type MemoryStateOperation = MutationBase &
         value: string;
         factType?: MemoryFactType;
         validUntil?: string | null;
+        detail?: ProjectValueDetail | EditorialFeedbackDetailInput;
       }
     | {
         kind: 'forget';
@@ -84,6 +89,7 @@ export type MemoryStateRecord =
       value: string;
       factType: MemoryFactType;
       validUntil: string | null;
+      detail?: ProjectValueDetail | EditorialFeedbackDetail;
     });
 export interface MemoryStateTombstone {
   kind: 'fact' | 'project';
@@ -246,6 +252,25 @@ function cardView(card: MemoryProjectCard): MemoryProjectCard {
     return fail('credential_content');
   return result;
 }
+function factDetail(
+  operation: Extract<MemoryStateOperation, { kind: 'fact_upsert' }>,
+  source: MemoryStateSource,
+): ProjectValueDetail | EditorialFeedbackDetail | undefined {
+  if (operation.detail === undefined) return;
+  if (operation.projectKey === null) return fail('detail_requires_project');
+  const detail =
+    operation.detail.kind === 'project_value'
+      ? ['fact', 'decision'].includes(operation.factType ?? 'fact')
+        ? parseProjectValueDetail(operation.detail, source.kind)
+        : undefined
+      : operation.factType === 'preference'
+        ? parseEditorialFeedbackDetail(operation.detail, source)
+        : undefined;
+  if (!detail) return fail('invalid_fact_detail');
+  if (SECRET.test(JSON.stringify(detail))) return fail('credential_content');
+  return detail;
+}
+
 function target(op: MemoryStateOperation): {
   kind: 'project' | 'fact';
   projectKey: string | null;
@@ -405,6 +430,7 @@ export function mutateMemoryState(
             value: text(op.value, 4000),
             factType: op.factType ?? 'fact',
             validUntil: op.validUntil == null ? null : date(op.validUntil),
+            ...(op.detail === undefined ? {} : {detail:factDetail(op,source)}),
           }
         : null;
   if (

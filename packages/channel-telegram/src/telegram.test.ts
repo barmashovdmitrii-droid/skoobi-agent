@@ -2,6 +2,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import type { OperationTraceObserver } from '@skoobi/shared/operation-trace';
+import { MediaIntakePersistenceError, type MediaIntakeAdapter } from '@skoobi/shared/media-intake';
 
 // --- Mocks ---
 
@@ -2593,16 +2595,262 @@ describe('TelegramChannel', () => {
         'voice-file-id',
         'test-group',
         'voice',
+        undefined,
       );
       expect(transcribeAudioFile).toHaveBeenCalledTimes(1);
-      // No language argument: the common voice-stt default is auto-detection.
+      // The undefined override preserves the common auto-detection default.
       expect(transcribeAudioFile).toHaveBeenCalledWith(
         '/tmp/claudeclaw-telegram-test-groups/test-group/received/voice.oga',
+        undefined,
+        undefined,
       );
       expect(opts.onMessage).toHaveBeenCalledWith(
         'tg:100200300',
         expect.objectContaining({ content: '[Voice: Привет из голосового]' }),
       );
+    });
+
+    it('creates the host trace before voice download and shares it through STT', async () => {
+      const observations: unknown[] = [];
+      const trace: OperationTraceObserver = {
+        operationIds: ['00000000-0000-4000-8000-000000000001'],
+        startStage(stage, details) {
+          observations.push({ stage, details });
+          return {
+            finish(outcome, finalDetails) {
+              observations.push({ stage, outcome, details: finalDetails });
+            },
+          };
+        },
+      };
+      const operationTrace = vi.fn(() => trace);
+      const opts = createTestOpts({ operationTrace });
+      vi.mocked(downloadTelegramAudio).mockImplementationOnce(async (...args) => {
+        expect(operationTrace).toHaveBeenCalledWith('tg:100200300', '1');
+        expect(args[4]).toBe(trace);
+        expect(observations).toContainEqual({
+          stage: 'inbox',
+          outcome: 'succeeded',
+          details: {},
+        });
+        return '/tmp/claudeclaw-telegram-test-groups/test-group/received/voice.oga';
+      });
+      vi.mocked(transcribeAudioFile).mockResolvedValueOnce(
+        'Synthetic private transcript',
+      );
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+      await triggerMediaMessage(
+        'message:voice',
+        createMediaCtx({ extra: { voice: { file_id: 'private-file-id' } } }),
+      );
+      expect(operationTrace).toHaveBeenCalledTimes(1);
+      expect(transcribeAudioFile).toHaveBeenCalledWith(
+        expect.any(String),
+        undefined,
+        trace,
+      );
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          content: '[Voice: Synthetic private transcript]',
+        }),
+      );
+      // The host owns materialization: the channel cannot infer whether the
+      // callback stored, dropped or otherwise handled this message.
+      expect(observations).not.toContainEqual(
+        expect.objectContaining({ stage: 'materialize' }),
+      );
+      const diagnostic = JSON.stringify(observations);
+      for (const privateValue of [
+        'test-token',
+        'private-file-id',
+        'Synthetic private transcript',
+        'tg:100200300',
+        '/tmp/',
+      ]) {
+        expect(diagnostic).not.toContain(privateValue);
+      }
+    });
+
+    it.each(['factory', 'start', 'finish'] as const)(
+      'keeps accepting voice when trace %s throws',
+      async (failure) => {
+        const trace: OperationTraceObserver = {
+          operationIds: [],
+          startStage() {
+            if (failure === 'start') throw new Error('private diagnostic failure');
+            return {
+              finish() {
+                throw new Error('private diagnostic failure');
+              },
+            };
+          },
+        };
+        const opts = createTestOpts({
+          operationTrace() {
+            if (failure === 'factory')
+              throw new Error('private diagnostic failure');
+            return trace;
+          },
+        });
+        vi.mocked(downloadTelegramAudio).mockResolvedValueOnce('/tmp/voice.oga');
+        vi.mocked(transcribeAudioFile).mockResolvedValueOnce('Synthetic text');
+        const channel = new TelegramChannel('test-token', opts);
+        await channel.connect();
+        await expect(
+          triggerMediaMessage(
+            'message:voice',
+            createMediaCtx({ extra: { voice: { file_id: 'fixture-id' } } }),
+          ),
+        ).resolves.toBeUndefined();
+        expect(opts.onMessage).toHaveBeenCalledWith(
+          'tg:100200300',
+          expect.objectContaining({ content: '[Voice: Synthetic text]' }),
+        );
+        expect(JSON.stringify(loggerMock.error.mock.calls)).not.toContain(
+          'private diagnostic failure',
+        );
+      },
+    );
+
+    it('durably captures forwarded media even when the advisory inbox fails, without an early agent input', async () => {
+      const accept = vi.fn<MediaIntakeAdapter['accept']>((input) => ({
+        kind: 'accepted',
+        job: {
+          id: '00000000-0000-4000-8000-000000000001',
+          revision: 1,
+          scope: {
+            botId: 'fixture',
+            tenantId: 'fixture',
+            chatJid: input.message.chat_jid,
+            groupFolder: 'test-group',
+          },
+          input,
+          ingestionCursor: 'i:0000000000000001',
+          acceptedAtMs: Date.now(),
+          deadlineAtMs: Date.now() + 60_000,
+          stage: 'accepted',
+          downloadAttempts: 0,
+          transcriptionAttempts: 0,
+        },
+      }));
+      const adapter: MediaIntakeAdapter = {
+        accept,
+        listReady: () => [],
+        claim: () => undefined,
+        beginAttempt: () => undefined,
+        prepareDownload: () => undefined,
+        checkpointDownload: () => undefined,
+        checkpointTranscription: () => undefined,
+        materialize: () => ({ kind: 'stale' }),
+        failAttempt: () => {},
+        release: () => {},
+        terminate: () => {},
+        isCurrent: () => false,
+      };
+      const events: string[] = [];
+      const opts = createTestOpts({
+        mediaIntake: () => adapter,
+        operationTrace: () => ({
+          operationIds: [],
+          startStage(stage) {
+            return {
+              finish(outcome) {
+                events.push(`${stage}:${outcome}`);
+              },
+            };
+          },
+        }),
+      });
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+      try {
+        vi.spyOn(fs, 'appendFileSync').mockImplementation(() => {
+          throw new Error('Synthetic advisory inbox failure');
+        });
+        await triggerMediaMessage(
+          'message:voice',
+          createMediaCtx({
+            extra: {
+              forward_origin: {
+                type: 'hidden_user',
+                sender_user_name: 'Synthetic source',
+                date: 1,
+              },
+              voice: {
+                file_id: 'fixture-file',
+                file_unique_id: 'fixture-unique',
+                duration: 2,
+              },
+            },
+          }),
+        );
+        expect(accept).toHaveBeenCalledWith(
+          expect.objectContaining({
+            message: expect.objectContaining({
+              id: '1',
+              sender_identity: expect.objectContaining({
+                telegram_message_origin: 'forwarded',
+              }),
+            }),
+            media: expect.objectContaining({
+              kind: 'voice',
+              fileId: 'fixture-file',
+              fileUniqueId: 'fixture-unique',
+              durationSeconds: 2,
+            }),
+          }),
+        );
+        expect(opts.onMessage).not.toHaveBeenCalled();
+        expect(downloadTelegramAudio).not.toHaveBeenCalled();
+        expect(transcribeAudioFile).not.toHaveBeenCalled();
+        expect(events).toContain('inbox:failed');
+        expect(events).toContain('accepted:succeeded');
+      } finally {
+        await channel.disconnect();
+      }
+    });
+
+    it.each(['throws', 'missing'] as const)(
+      'does not fall back when configured intake factory %s',
+      async (mode) => {
+        const opts = createTestOpts({
+          mediaIntake() {
+            if (mode === 'throws') throw new MediaIntakePersistenceError();
+            return undefined;
+          },
+        });
+        await expect(
+          new TelegramChannel('test-token', opts).connect(),
+        ).rejects.toBeInstanceOf(MediaIntakePersistenceError);
+        expect(downloadTelegramAudio).not.toHaveBeenCalled();
+      },
+    );
+
+    it('propagates a durable accept failure through the polling error handler', async () => {
+      const adapter = {
+        accept() {
+          throw new MediaIntakePersistenceError();
+        },
+        listReady: () => [],
+      } as unknown as MediaIntakeAdapter;
+      const opts = createTestOpts({ mediaIntake: () => adapter });
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+      try {
+        const failure = await triggerMediaMessage(
+          'message:voice',
+          createMediaCtx({ extra: { voice: { file_id: 'fixture-file' } } }),
+        ).catch((error) => error);
+        expect(failure).toBeInstanceOf(MediaIntakePersistenceError);
+        const pollingError = { error: failure, message: 'fixture' };
+        expect(() => currentBot().errorHandler(pollingError)).toThrow();
+        expect(opts.onMessage).not.toHaveBeenCalled();
+        expect(downloadTelegramAudio).not.toHaveBeenCalled();
+      } finally {
+        await channel.disconnect();
+      }
     });
 
     it('stores audio with placeholder', async () => {
@@ -2645,10 +2893,13 @@ describe('TelegramChannel', () => {
         'audio-file-id',
         'test-group',
         'audio',
+        undefined,
       );
       expect(transcribeAudioFile).toHaveBeenCalledTimes(1);
       expect(transcribeAudioFile).toHaveBeenCalledWith(
         '/tmp/claudeclaw-telegram-test-groups/test-group/received/audio.mp3',
+        undefined,
+        undefined,
       );
       expect(opts.onMessage).toHaveBeenCalledWith(
         'tg:100200300',

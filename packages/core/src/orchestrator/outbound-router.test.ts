@@ -14,6 +14,41 @@ function mockChannel(name: string, jidPrefix: string): Channel {
 }
 
 describe('MessageRouter', () => {
+  it('sends the verified immutable snapshot and cleans it even after a transport failure', async () => {
+    const channel = mockChannel('telegram', 'tg:');
+    channel.sendDocument = vi.fn().mockRejectedValue(new Error('send outcome unknown'));
+    const cleanup = vi.fn();
+    const policy = vi.fn().mockResolvedValue({ required: true, status: 'passed', code: 'checks_passed',
+      snapshotPath: '/synthetic-host/snapshot.zip', cleanup });
+    const router = createMessageRouter([channel], { artifactAcceptance: policy });
+    expect(await router.sendDocument('tg:123', '/synthetic-workspace/artifact.zip', 'Result')).toBe(false);
+    expect(channel.sendDocument).toHaveBeenCalledExactlyOnceWith('tg:123', '/synthetic-host/snapshot.zip', 'Result');
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('blocks only required unverified artifacts and cannot take a model-supplied pass in metadata', async () => {
+    const channel = mockChannel('telegram', 'tg:');
+    channel.sendDocument = vi.fn();
+    const policy = vi.fn().mockResolvedValue({ required: true, status: 'stale', code: 'artifact_changed' });
+    const router = createMessageRouter([channel], { artifactAcceptance: policy });
+    const observed = vi.fn(); router.addPostHook(observed);
+    expect(await router.sendDocument('tg:123', '/synthetic/artifact.zip', 'Result', { meta: { verified: true, status: 'passed' } })).toBe(false);
+    expect(channel.sendDocument).not.toHaveBeenCalled();
+    expect(observed).not.toHaveBeenCalled();
+    await router.route({ chatJid: 'tg:123', text: 'Ordinary reply', triggerType: 'agent-response' });
+    expect(channel.sendMessage).toHaveBeenCalledOnce();
+    policy.mockResolvedValue({ required: false, status: 'not_required', code: 'contract_missing' });
+    expect(await router.sendDocument('tg:123', '/synthetic/ordinary.pdf')).toBe(true);
+    expect(channel.sendDocument).toHaveBeenCalledExactlyOnceWith('tg:123', '/synthetic/ordinary.pdf', undefined);
+  });
+
+  it('does not silently skip a required check when the host verifier is unavailable', async () => {
+    const channel = mockChannel('telegram', 'tg:');
+    channel.sendDocument = vi.fn();
+    const router = createMessageRouter([channel], { artifactAcceptance: async () => { throw new Error('Unavailable'); } });
+    expect(await router.sendDocument('tg:123', '/synthetic/artifact.zip')).toBe(false);
+    expect(channel.sendDocument).not.toHaveBeenCalled();
+  });
   it('drains only the explicitly finished progress turn before sending its final', async () => {
     const channel = mockChannel('telegram', 'tg:');
     const calls: string[] = [];

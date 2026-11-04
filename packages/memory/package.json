@@ -2,7 +2,7 @@
   "name": "@skoobi/memory",
   "version": "0.0.0",
   "private": true,
-  "description": "Skoobi brick: file-based memory — group/shared-user context loaders, curator digest, legacy user-memory migration",
+  "description": "Skoobi brick: file-based memory \u2014 group/shared-user context loaders, curator digest, legacy user-memory migration",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -26,6 +26,10 @@
     "./user-memory-migration": {
       "types": "./dist/user-memory-migration.d.ts",
       "default": "./dist/user-memory-migration.js"
+    },
+    "./semantic-retrieval": {
+      "types": "./dist/semantic-retrieval.d.ts",
+      "default": "./dist/semantic-retrieval.js"
     }
   },
   "scripts": {

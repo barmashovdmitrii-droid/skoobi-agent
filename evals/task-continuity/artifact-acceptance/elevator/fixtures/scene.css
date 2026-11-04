@@ -1,0 +1,73 @@
+body {
+  margin: 2rem auto;
+  max-width: 42rem;
+  font: 16px system-ui;
+  color: #20252b;
+}
+#world {
+  position: relative;
+  width: 340px;
+  height: 270px;
+  background: #edf0f4;
+  outline: 2px solid #41566f;
+}
+#shaft {
+  position: absolute;
+  left: 145px;
+  top: 30px;
+  width: 60px;
+  height: 210px;
+  background: #9ca9b8;
+}
+.platform {
+  position: absolute;
+  height: 10px;
+  background: #394b61;
+}
+.lower {
+  left: 10px;
+  top: 225px;
+  width: 135px;
+}
+.upper {
+  left: 205px;
+  top: 65px;
+  width: 125px;
+}
+#bridge {
+  position: absolute;
+  left: 120px;
+  top: 225px;
+  width: 50px;
+  height: 5px;
+  background: #b6733f;
+}
+#cabin {
+  position: absolute;
+  left: 150px;
+  top: 40px;
+  width: 45px;
+  height: 25px;
+  border: 3px solid #d78b12;
+  box-sizing: border-box;
+}
+#player {
+  position: absolute;
+  left: 30px;
+  top: 200px;
+  width: 20px;
+  height: 25px;
+  background: #257241;
+}
+#destination {
+  position: absolute;
+  left: 286px;
+  top: 45px;
+  width: 25px;
+  height: 20px;
+  border: 2px dashed #397152;
+}
+button {
+  padding: 0.7rem;
+  margin-right: 0.5rem;
+}

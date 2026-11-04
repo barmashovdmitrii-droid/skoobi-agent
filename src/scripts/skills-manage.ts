@@ -3,11 +3,20 @@ import path from 'path';
 
 import {
   archiveSkill,
+  approveVerifiedSkill,
+  adoptLegacySkillVerification,
   defaultSkillsDir,
+  defaultSkillVerificationHost,
   isSafeSkillName,
   listSkills,
   SKILL_FILE_NAME,
   SKILL_PROPOSALS_DIR_NAME,
+  registerSkillVerification,
+  reproduceSkill,
+  inspectSkillVerification,
+  invalidateSkillVerification,
+  readSkillVerificationSource,
+  type SkillVerificationContract,
 } from '../orchestrator/skill-registry.js';
 
 type Args = {
@@ -18,6 +27,7 @@ type Args = {
   yes: boolean;
   json: boolean;
   help: boolean;
+  contract?: string;
 };
 
 function usage(): string {
@@ -29,7 +39,12 @@ function usage(): string {
     'Actions:',
     '  list                 List active/draft skills',
     '  proposals            List draft proposals',
-    '  approve <name>       Move .proposals/<name>/SKILL.md to active data/skills/<name>/SKILL.md',
+    '  approve <name>       Activate the exact reviewed draft only with current host verification',
+    '  verification <name>  Show evidence status; usage counts and frontmatter are not proof',
+    '  verify-register <name> --contract <file>  Register an operator-reviewed synthetic reproduction contract',
+    '  verify <name>        Reproduce both declared examples and check actual outputs',
+    '  fail <name>          Invalidate the current proof after a host-observed failure',
+    '  adopt-legacy <name>  Pin an explicitly reviewed historical active skill as unverified; refuses new proposals',
     '  archive <name>       Archive an active non-pinned skill',
     '',
     'Options:',
@@ -38,6 +53,10 @@ function usage(): string {
     '  --yes               Confirm mutating actions',
     '  --json              Print JSON result',
     '  --help              Show help',
+    '',
+    'verify uses the shipped isolated-job controller; unavailable containment is inconclusive.',
+    'Unisolated runs and trust labels cannot establish proof; no CLI flag promotes the boundary.',
+    'Generalize the draft manually before registration. Example contents stay private and are never added to the skill.',
   ].join('\n');
 }
 
@@ -64,6 +83,7 @@ function parseArgs(argv: string[]): Args {
       args.root = path.resolve(next());
       args.skillsDir = defaultSkillsDir(path.join(args.root, 'data'));
     } else if (arg === '--skills-dir') args.skillsDir = path.resolve(next());
+    else if (arg === '--contract') args.contract = path.resolve(next());
     else if (arg === '--yes' || arg === '-y') args.yes = true;
     else if (arg === '--json') args.json = true;
     else if (arg === '--help' || arg === '-h') args.help = true;
@@ -99,22 +119,11 @@ function approveProposal(args: Args): { approved: boolean; path?: string } {
   if (!args.yes) {
     throw new Error('approve is mutating; rerun with --yes after review');
   }
-  const proposalDir = path.join(proposalsDir(args.skillsDir), args.name);
-  const proposalFile = path.join(proposalDir, SKILL_FILE_NAME);
-  if (!fs.existsSync(proposalFile)) {
-    throw new Error(`Proposal not found: ${args.name}`);
-  }
-  const activeDir = path.join(args.skillsDir, args.name);
-  const activeFile = path.join(activeDir, SKILL_FILE_NAME);
-  if (fs.existsSync(activeFile)) {
-    throw new Error(`Active skill already exists: ${args.name}`);
-  }
-  fs.mkdirSync(activeDir, { recursive: true, mode: 0o700 });
-  let content = fs.readFileSync(proposalFile, 'utf8');
-  content = content.replace(/^status:\s*draft$/m, 'status: active');
-  fs.writeFileSync(activeFile, content, { mode: 0o600 });
-  fs.rmSync(proposalDir, { recursive: true, force: true });
-  return { approved: true, path: activeFile };
+  return approveVerifiedSkill({
+    name: args.name,
+    skillsDir: args.skillsDir,
+    host: defaultSkillVerificationHost(args.skillsDir, args.root),
+  });
 }
 
 try {
@@ -133,9 +142,11 @@ try {
         includeDraft: true,
       }).map((skill) => ({
         name: skill.name,
+        version: skill.version,
         status: skill.status,
         createdBy: skill.createdBy,
         pinned: skill.pinned,
+        verification: skill.verification,
       })),
       proposals: listProposalNames(args.skillsDir),
     };
@@ -143,6 +154,54 @@ try {
     result = { proposals: listProposalNames(args.skillsDir) };
   } else if (args.action === 'approve') {
     result = approveProposal(args);
+  } else if (
+    [
+      'verify-register',
+      'verify',
+      'verification',
+      'fail',
+      'adopt-legacy',
+    ].includes(args.action)
+  ) {
+    if (!args.name || !isSafeSkillName(args.name))
+      throw new Error('A safe skill name is required');
+    if (args.action !== 'verification' && !args.yes)
+      throw new Error(
+        'Mutating skill verification requires --yes after review',
+      );
+    const host = defaultSkillVerificationHost(args.skillsDir, args.root);
+    const markdown = readSkillVerificationSource(
+      args.skillsDir,
+      args.name,
+      args.action === 'verify-register' ||
+        args.action === 'verify' ||
+        !fs.existsSync(path.join(args.skillsDir, args.name, SKILL_FILE_NAME)),
+    );
+    if (args.action === 'adopt-legacy') {
+      adoptLegacySkillVerification({ name: args.name, markdown, host });
+      result = { status: 'legacy_adopted', verified: false };
+    } else if (args.action === 'verify-register') {
+      if (!args.contract || fs.statSync(args.contract).size > 32_768)
+        throw new Error('A bounded host-reviewed contract is required');
+      const contract = JSON.parse(
+        fs.readFileSync(args.contract, 'utf8'),
+      ) as SkillVerificationContract;
+      if (contract.name !== args.name)
+        throw new Error('Skill contract name mismatch');
+      registerSkillVerification({ contract, markdown, host });
+      result = { status: 'registered', verified: false };
+    } else if (args.action === 'verify') {
+      result = await reproduceSkill({ name: args.name, markdown, host });
+    } else if (args.action === 'verification') {
+      result = inspectSkillVerification({ name: args.name, markdown, host });
+    } else {
+      invalidateSkillVerification({
+        name: args.name,
+        host,
+        reason: 'observed_failure',
+      });
+      result = { status: 'failed', code: 'observed_failure' };
+    }
   } else if (args.action === 'archive') {
     if (!args.name) throw new Error('archive requires a skill name');
     if (!args.yes) {

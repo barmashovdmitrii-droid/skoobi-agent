@@ -2582,6 +2582,7 @@ export async function runSandboxAgent(
     credentialProxyIdentityToken,
     input.taskAuthorizationCapability || '',
     input.memoryWriteCapability || '',
+    input.operationTraceCapability || '',
     input.codexControlRunId || '',
     trustedOwner ? secrets.HELPER_SECRET || '' : '',
   ];

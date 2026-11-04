@@ -120,7 +120,7 @@ directly in a shell command.
 Download both assets from the tagged release:
 
 ```bash
-VERSION=v2.1.1
+VERSION=v2.2.0
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh"
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh.sha256"
 ```
@@ -303,6 +303,19 @@ resolve to the exact supplied commit, builds in a private staging directory,
 and does not replace the active release unless the build succeeds.
 If `--no-start` is supplied, an existing managed service is stopped before
 the release swap and deliberately left stopped.
+
+### Upgrading from 2.1.x to 2.2.0
+
+Use the normal checksum-verified release installer and keep the normal private
+instance backup. The update adds durable media intake and bounded operation
+tracing without changing the selected speech model. Existing structured memory
+and optional accounting records are retained.
+
+Local semantic search requires [explicit model setup](local-memory-search.md).
+The [artifact verification pilot](../evals/task-continuity/artifact-acceptance/README.md)
+requires separate host contracts and checker tools; an ordinary full-access run
+cannot self-certify isolation. These optional setups are not performed silently
+by the service or installer.
 
 ### Upgrading from 2.0.0 to 2.1.1
 

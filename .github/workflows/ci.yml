@@ -49,6 +49,9 @@ jobs:
       - name: Install agent runner dependencies
         run: npm ci --prefix agent/runner
 
+      - name: Install browser for artifact acceptance checks
+        run: npx playwright install --with-deps chromium
+
       # Integration subprocesses need the compiled workspace exports.
       - name: Build
         run: npm run build

@@ -131,6 +131,7 @@ function setBaseEnv() {
   delete process.env.CLAUDECLAW_IS_DIRECT_OWNER_RUN;
   delete process.env.CLAUDECLAW_CODEX_GUI_CONTROL_AUTHORIZED;
   delete process.env.CLAUDECLAW_CODEX_CONTROL_RUN_ID;
+  delete process.env.CLAUDECLAW_OPERATION_TRACE_CAPABILITY;
   // HELPER_SECRET present so that, absent the gate, callHelper would attempt a
   // real fetch — letting the test prove the gate short-circuits before that.
   process.env.HELPER_SECRET = 'test-secret';
@@ -167,9 +168,36 @@ afterEach(() => {
   delete process.env.CLAUDECLAW_PERSONA_ID;
   delete process.env.CLAUDECLAW_SHARED_USER_MEMORY_DIR;
   delete process.env.CLAUDECLAW_TASK_AUTHORIZATION_CAPABILITY;
+  delete process.env.CLAUDECLAW_OPERATION_TRACE_CAPABILITY;
   for (const key of Object.keys(process.env)) {
     if (key.startsWith('CLAUDECLAW_CHAT_HISTORY_')) delete process.env[key];
   }
+});
+
+describe('host diagnostic IPC correlation', () => {
+  it('forwards only the environment binding and does not add delivery authority', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ipc-trace-test-'));
+    try {
+      process.env.CLAUDECLAW_IPC_DIR = dir;
+      process.env.CLAUDECLAW_IS_MAIN = '0';
+      process.env.CLAUDECLAW_OPERATION_TRACE_CAPABILITY = 'a'.repeat(43);
+      await import('./ipc-mcp-stdio.js');
+      const response = await registeredTools.get('send_message')!({
+        text: 'Synthetic trace message',
+        operationTraceCapability: 'forged',
+      });
+      const files = fs.readdirSync(path.join(dir, 'messages'));
+      expect(files).toHaveLength(1);
+      const envelope = JSON.parse(
+        fs.readFileSync(path.join(dir, 'messages', files[0]), 'utf8'),
+      );
+      expect(envelope.operationTraceCapability).toBe('a'.repeat(43));
+      expect(envelope.ownerAuthorizationGrant).toBeUndefined();
+      expect(JSON.stringify(response)).not.toContain('a'.repeat(43));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('task tool descriptions match what the host does (check 09.10, SR-3 + INT-3)', () => {
@@ -2129,6 +2157,31 @@ describe('send_photo/send_document sensitive-file blocklist (finding #35)', () =
 });
 
 describe('skill_* tools', () => {
+  it("does not let model-written frontmatter substitute for protected host evidence", async () => {
+    const root = fs.mkdtempSync(
+      path.join(os.tmpdir(), "skoobi-skill-evidence-"),
+    );
+    try {
+      process.env.CLAUDECLAW_SKILLS_DIR = root;
+      fs.mkdirSync(path.join(root, "candidate"));
+      fs.writeFileSync(
+        path.join(root, "candidate", "SKILL.md"),
+        "---\nname: candidate\nstatus: active\ncreated_by: agent_proposal\nverified: true\n---\nUnverified candidate body.",
+      );
+      await import("./ipc-mcp-stdio.js");
+      const listed = (await registeredTools.get("skill_list")!({})) as {
+        content: { text: string }[];
+      };
+      expect(listed.content[0].text).toContain("host_check_required");
+      const viewed = (await registeredTools.get("skill_view")!({
+        name: "candidate",
+      })) as { isError?: boolean; content: { text: string }[] };
+      expect(viewed.isError).toBe(true);
+      expect(viewed.content[0].text).not.toContain("Unverified candidate body");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
   it('lists and views active skills without loading drafts by default', async () => {
     const root = fs.mkdtempSync(
       path.join(os.tmpdir(), 'skoobi-runner-skills-'),

@@ -885,6 +885,55 @@ describe('runCodexExecTurn (fake codex binary)', () => {
     send_document: 'Document queued for delivery: /tmp/answer.pdf',
   };
 
+  it('streams sanitized tool observations before completion without changing the turn result', async () => {
+    const marker = path.join(dir, 'fixture-action');
+    const observed = path.join(dir, 'fixture-observed');
+    writeFakeCodex(`${argValue}
+      const fs = require('fs'); process.stdin.resume();
+      const item = { id: 'synthetic-sensitive-id', type: 'command_execution', command: 'synthetic-private-command' };
+      console.log(JSON.stringify({ type: 'item.started', item }));
+      const wait = setInterval(() => {
+        if (!fs.existsSync(${JSON.stringify(observed)})) return;
+        clearInterval(wait);
+        fs.writeFileSync(${JSON.stringify(marker)}, 'done');
+        console.log(JSON.stringify({ type: 'item.completed', item: { ...item, exit_code: 0, status: 'completed', aggregated_output: 'synthetic-private-output' } }));
+        fs.writeFileSync(val('--output-last-message'), 'Fixture answer');
+        console.log(JSON.stringify({ type: 'turn.completed' }));
+        process.exit(0);
+      }, 10);
+    `);
+    const observations: Array<{ phase: string; callId: string; startedObserved: boolean }> = [];
+    let startPrecededFixtureAction = false;
+    const result = await runCodexExecTurn({
+      config: baseConfig(), cwd: dir, prompt: 'fixture', log: () => {},
+      onToolObservation: event => {
+        if (event.phase === 'started') {
+          startPrecededFixtureAction = !fs.existsSync(marker);
+          fs.writeFileSync(observed, 'observed');
+        }
+        observations.push(event);
+      },
+    });
+    expect(result.status).toBe('success');
+    expect(result.text).toBe('Fixture answer');
+    expect(startPrecededFixtureAction).toBe(true);
+    expect(observations.map(event => event.phase)).toEqual(['started', 'finished']);
+    expect(observations[0].callId).toBe(observations[1].callId);
+    expect(JSON.stringify(observations)).not.toContain('synthetic');
+  });
+
+  it('keeps successful CLI execution independent of a failed tool observer', async () => {
+    writeFakeCodex(`${argValue}
+      const fs = require('fs'); process.stdin.resume();
+      console.log(JSON.stringify({ type: 'item.completed', item: { id: 'fixture', type: 'command_execution', exit_code: 0 } }));
+      fs.writeFileSync(val('--output-last-message'), 'Still works');
+      console.log(JSON.stringify({ type: 'turn.completed' })); process.exit(0);
+    `);
+    const result = await runCodexExecTurn({ config: baseConfig(), cwd: dir, prompt: 'fixture', log: () => {}, onToolObservation: () => { throw new Error('diagnostics unavailable'); } });
+    expect(result.status).toBe('success');
+    expect(result.text).toBe('Still works');
+  });
+
   it('stops a turn that is still only thinking when a newer message arrives', async () => {
     writeFakeCodex(`${argValue}
       process.stdin.resume();

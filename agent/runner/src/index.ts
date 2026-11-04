@@ -53,6 +53,7 @@ import {
   type CodexTurnResult,
   type CodexTurnTelemetry,
 } from './codex-exec.js';
+import type { CodexToolObservation } from './codex-tool-observation.js';
 import {
   applyLinkCheck,
   createLinkCheckRun,
@@ -204,6 +205,7 @@ interface ContainerInput {
   agentConfig?: AgentConfig;
   tenantId?: string;
   memoryWriteCapability?: string;
+  operationTraceCapability?: string;
   memoryProvenancePublicKey?: string;
   taskAuthorizationCapability?: string;
   codexGuiControlAuthorized?: boolean;
@@ -243,6 +245,8 @@ interface ContainerInput {
 }
 
 interface ContainerOutput {
+  /** Heartbeat-only CLI observation, never a verified user outcome. */
+  toolObservation?: CodexToolObservation;
   /**
    * Промежуточная реплика модели внутри хода. Едет ТОЛЬКО на кадре heartbeat и
    * никогда в result: непустой result планировщик задач принимает за результат
@@ -706,6 +710,8 @@ export function buildClaudeclawMcpEnv(
     CLAUDECLAW_SHARED_USER_MEMORY_DIR: sharedUserMemoryDir || '',
     CLAUDECLAW_MEMORY_WRITE_CAPABILITY:
       containerInput.memoryWriteCapability || '',
+    CLAUDECLAW_OPERATION_TRACE_CAPABILITY:
+      containerInput.operationTraceCapability || '',
     CLAUDECLAW_MEMORY_PROVENANCE_PUBLIC_KEY:
       containerInput.memoryProvenancePublicKey || '',
     CLAUDECLAW_TASK_AUTHORIZATION_CAPABILITY: trustedOwner
@@ -3334,6 +3340,9 @@ export async function runCodexProviderLoop(
           : {}),
         onActivity: () => {
           lastEventAt = Date.now();
+        },
+        onToolObservation: (toolObservation: CodexToolObservation) => {
+          writeOutput({ status: 'heartbeat', result: null, toolObservation });
         },
         onInFlight: (count: number) => {
           itemsInFlight = count;

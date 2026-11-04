@@ -1,0 +1,3 @@
+# Generated PDF fixtures require exact bytes (xref offsets and hashes).
+evals/document-reconciliation/fixtures/*.pdf binary
+evals/document-reconciliation/fixtures/*.xlsx binary

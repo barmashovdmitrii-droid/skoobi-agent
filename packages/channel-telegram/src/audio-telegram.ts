@@ -9,6 +9,11 @@ import https from 'https';
 
 import { logger } from '@skoobi/shared/logger';
 import { resolveGroupFolderPath } from '@skoobi/shared/group-folder';
+import {
+  startOperationTraceStage,
+  type OperationTraceObserver,
+  type OperationTraceSpan,
+} from '@skoobi/shared/operation-trace';
 
 // A hung Telegram CDN socket (half-open, no FIN/RST) would otherwise stall the
 // awaiting grammY handler forever, freezing the bot's whole sequential update
@@ -16,6 +21,16 @@ import { resolveGroupFolderPath } from '@skoobi/shared/group-folder';
 // can never become a full-bot outage. (finding #9)
 const TELEGRAM_DOWNLOAD_TIMEOUT_MS = 30_000;
 const TELEGRAM_METADATA_TIMEOUT_MS = 15_000;
+const TELEGRAM_DOWNLOAD_WALL_MS = 60_000;
+
+export interface TelegramAudioDownloadControl {
+  destinationPath: string;
+  signal: AbortSignal;
+  deadlineAtMs: number;
+  maxBytes: number;
+  /** Durable worker reserves each attempt itself. */
+  maxAttempts: 1;
+}
 
 // Telegram's CDN routinely drops one of two concurrent fetches of the same file
 // (transcription + save) with a bare TCP reset. A single retry recovers it, so a
@@ -131,6 +146,83 @@ function downloadUrl(url: string, dest: string): Promise<void> {
   });
 }
 
+/** Controlled worker transfer: unique .part file, bounded bytes and real abort. */
+function downloadControlledUrl(
+  url: string,
+  dest: string,
+  signal: AbortSignal,
+  maxBytes: number,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(telegramTransportError('Download aborted', 'ABORT_ERR'));
+      return;
+    }
+    const file = createWriteStream(dest, { flags: 'wx', mode: 0o600 });
+    let response: import('http').IncomingMessage | undefined;
+    let failure: Error | undefined;
+    let finished = false;
+    let owned = false;
+    let bytes = 0;
+    const fail = (error: Error) => {
+      if (failure || finished) return;
+      failure = error;
+      req.destroy();
+      response?.destroy();
+      file.destroy();
+    };
+    const abort = () =>
+      fail(telegramTransportError('Download aborted', 'ABORT_ERR'));
+    const req = https.get(url, (res) => {
+      response = res;
+      if (res.statusCode !== 200) {
+        fail(
+          telegramTransportError(
+            'Download rejected',
+            `HTTP_${res.statusCode || 'UNKNOWN'}`,
+          ),
+        );
+        return;
+      }
+      res.on('error', fail);
+      res.on('data', (chunk: Buffer) => {
+        bytes += chunk.length;
+        if (bytes > maxBytes)
+          fail(telegramTransportError('Download too large', 'ETOOBIG'));
+      });
+      res.setTimeout(TELEGRAM_DOWNLOAD_TIMEOUT_MS, () =>
+        fail(telegramTransportError('Download timed out', 'ETIMEDOUT')),
+      );
+      res.pipe(file);
+    });
+    req.on('error', fail);
+    req.setTimeout(TELEGRAM_DOWNLOAD_TIMEOUT_MS, () =>
+      fail(telegramTransportError('Download timed out', 'ETIMEDOUT')),
+    );
+    file.on('error', fail);
+    file.on('open', () => {
+      owned = true;
+    });
+    file.on('finish', () => {
+      finished = true;
+    });
+    file.on('close', () => {
+      signal.removeEventListener('abort', abort);
+      // close is the local write boundary; never unlink a still-open writer.
+      if (failure && owned)
+        void fs
+          .unlink(dest)
+          .catch(() => {})
+          .then(() => reject(failure));
+      else if (failure) reject(failure);
+      else if (finished) resolve();
+      else reject(telegramTransportError('Download incomplete', 'ECONNRESET'));
+    });
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+  });
+}
+
 /**
  * Downloads a Telegram voice/audio file to <group>/received/<timestamp>-<kind>-<fileId>.<ext>.
  * Returns the absolute host path the agent can Read, or null on error.
@@ -142,8 +234,31 @@ export async function downloadTelegramAudio(
   fileId: string,
   groupFolder: string,
   kind: 'voice' | 'audio' = 'voice',
+  trace?: OperationTraceObserver,
+  control?: TelegramAudioDownloadControl,
 ): Promise<string | null> {
+  const metadataSpan = startOperationTraceStage(trace, 'get_file');
+  let downloadSpan: OperationTraceSpan | undefined;
+  let failureStage: 'network' | 'storage' = 'network';
+  const controller = control ? new AbortController() : undefined;
+  const abort = () => controller?.abort();
+  control?.signal.addEventListener('abort', abort, { once: true });
+  if (control?.signal.aborted) abort();
+  const wallTimer = control
+    ? setTimeout(
+        abort,
+        Math.max(
+          0,
+          Math.min(
+            TELEGRAM_DOWNLOAD_WALL_MS,
+            control.deadlineAtMs - Date.now(),
+          ),
+        ),
+      )
+    : undefined;
   try {
+    if (controller?.signal.aborted)
+      throw telegramTransportError('Download aborted', 'ABORT_ERR');
     const infoUrl = `https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`;
     const fileInfo = await new Promise<any>((resolve, reject) => {
       let settled = false;
@@ -158,7 +273,11 @@ export async function downloadTelegramAudio(
         // can't stall the bot's update loop. (findings #9, #31)
         res.on('error', fail);
         let data = '';
-        res.on('data', (chunk) => (data += chunk));
+        res.on('data', (chunk) => {
+          data += chunk;
+          if (control && Buffer.byteLength(data) > 64 * 1024)
+            fail(telegramTransportError('Metadata too large', 'ETOOBIG'));
+        });
         res.on('end', () => {
           if (settled) return;
           settled = true;
@@ -183,16 +302,33 @@ export async function downloadTelegramAudio(
         );
       });
       req.on('error', fail);
+      if (controller) {
+        const abortMetadata = () =>
+          req.destroy(telegramTransportError('Metadata aborted', 'ABORT_ERR'));
+        controller.signal.addEventListener('abort', abortMetadata, {
+          once: true,
+        });
+        req.once('close', () =>
+          controller.signal.removeEventListener('abort', abortMetadata),
+        );
+        if (controller.signal.aborted) abortMetadata();
+      }
     });
 
     if (!fileInfo.ok || !fileInfo.result?.file_path) {
+      metadataSpan.finish('failed', { reason: 'invalid_response' });
       logger.warn(
         { stage: 'getFile', failureCode: 'invalid_response', kind },
         'Failed to get Telegram audio info',
       );
       return null;
     }
+    metadataSpan.finish('succeeded');
 
+    failureStage = 'storage';
+    downloadSpan = startOperationTraceStage(trace, 'download', {
+      passIndex: 1,
+    });
     const groupDir = resolveGroupFolderPath(groupFolder);
     const receivedDir = path.join(groupDir, 'received');
     await fs.mkdir(receivedDir, { recursive: true });
@@ -201,31 +337,55 @@ export async function downloadTelegramAudio(
     let ext = path.extname(remotePath);
     if (!ext) ext = kind === 'voice' ? '.oga' : '.mp3';
     const ts = new Date().toISOString().replace(/[:.]/g, '-');
-    const dest = path.join(
-      receivedDir,
-      `${ts}-${kind}-${safeTelegramAudioFileTag(fileId)}${ext}`,
-    );
+    const dest =
+      control?.destinationPath ??
+      path.join(
+        receivedDir,
+        `${ts}-${kind}-${safeTelegramAudioFileTag(fileId)}${ext}`,
+      );
 
     const dlUrl = `https://api.telegram.org/file/bot${botToken}/${remotePath}`;
+    failureStage = 'network';
     try {
-      await downloadUrl(dlUrl, dest);
+      if (control && controller)
+        await downloadControlledUrl(
+          dlUrl,
+          dest,
+          controller.signal,
+          control.maxBytes,
+        );
+      else await downloadUrl(dlUrl, dest);
     } catch (err) {
-      if (!isTransientNetErr(err)) throw err;
+      downloadSpan.finish('failed', { reason: 'network_failure' });
+      if (control?.maxAttempts === 1 || !isTransientNetErr(err)) throw err;
       logger.warn(
         { ...safeTelegramAudioLogFields('download', 1, err), kind },
         'Telegram audio download transient error, retrying once',
       );
+      downloadSpan = startOperationTraceStage(trace, 'download', {
+        passIndex: 2,
+        reason: 'retry',
+      });
       await downloadUrl(dlUrl, dest);
     }
 
+    failureStage = 'storage';
     const stat = await fs.stat(dest);
+    downloadSpan.finish('succeeded', { bytes: stat.size });
     logger.info({ kind, bytes: stat.size }, 'Saved Telegram audio');
     return dest;
   } catch (err) {
+    const reason =
+      failureStage === 'storage' ? 'storage_failure' : 'network_failure';
+    metadataSpan.finish('failed', { reason });
+    downloadSpan?.finish('failed', { reason });
     logger.error(
       { ...safeTelegramAudioLogFields('download_audio', 1, err), kind },
       'Telegram audio download failed',
     );
     return null;
+  } finally {
+    clearTimeout(wallTimer);
+    control?.signal.removeEventListener('abort', abort);
   }
 }
