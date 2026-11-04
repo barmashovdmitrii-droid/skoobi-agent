@@ -2,6 +2,14 @@
 
 All notable public changes to Skoobi Agent are documented here.
 
+## 2.1.1
+
+- Fixed structured memory writes from Telegram messages whose durable cursor
+  includes sub-millisecond precision. Source timestamps are normalized without
+  changing the original message cursor.
+- Preserved message-ID ordering for corrections received in the same
+  millisecond, and rejected invalid source timestamps.
+
 ## 2.1.0
 
 - Added scoped project cards, versioned decisions, source quotations, expiry,

@@ -120,7 +120,7 @@ directly in a shell command.
 Download both assets from the tagged release:
 
 ```bash
-VERSION=v2.1.0
+VERSION=v2.1.1
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh"
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh.sha256"
 ```
@@ -304,7 +304,7 @@ and does not replace the active release unless the build succeeds.
 If `--no-start` is supplied, an existing managed service is stopped before
 the release swap and deliberately left stopped.
 
-### Upgrading from 2.0.0 to 2.1.0
+### Upgrading from 2.0.0 to 2.1.1
 
 Use the normal checksum-verified release installer. Existing instance data
 and optional accounting records are preserved. Structured memory adds new
