@@ -114,7 +114,7 @@ export interface IsolatedArtifactJobResult extends ArtifactAcceptanceRun {
   containmentFailures?: string[];
 }
 
-function profileFor(
+export function artifactJobSeatbeltProfile(
   workspace: string,
   readPaths: string[],
   proxyPort?: number,
@@ -267,7 +267,7 @@ async function blocked(name, address) { await new Promise(resolve=> { const clie
 (async()=>{await blocked('unix-socket',{path:socket});await blocked('local-port',{host:'127.0.0.1',port:Number(port)});process.stdout.write(JSON.stringify(checks));process.exit(checks.length===15&&checks.every(x=>x[1])?0:5)})().catch(()=>process.exit(6));
 `;
 
-async function preflight(
+export async function preflightArtifactJobContainment(
   profile: string,
   workspace: string,
   hostDirectory: string,
@@ -455,11 +455,11 @@ export async function runIsolatedArtifactJob(
         no_proxy: '',
       });
     }
-    const profile = profileFor(workspace, readPaths, modelProxy?.port);
+    const profile = artifactJobSeatbeltProfile(workspace, readPaths, modelProxy?.port);
     const profilePath = path.join(hostDirectory, `profile-${jobId}.sb`);
     fs.writeFileSync(profilePath, profile, { flag: 'wx', mode: 0o600 });
     try {
-      const isolation = await preflight(profilePath, workspace, hostDirectory);
+      const isolation = await preflightArtifactJobContainment(profilePath, workspace, hostDirectory);
       if (!isolation.passed)
         return {
           status: 'inconclusive',

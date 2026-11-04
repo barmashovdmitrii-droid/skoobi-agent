@@ -2,6 +2,23 @@
 
 All notable public changes to Skoobi Agent are documented here.
 
+## 2.3.0
+
+- Added an optional coordinated macOS worker with durable task identities,
+  explicit requirements, revision acknowledgements, cancellation, bounded
+  execution and independent host acceptance of exact returned files.
+- Added scoped, expiring structured-memory exports and supplemental context.
+  Corrections and forgetting invalidate old results; worker memory proposals
+  remain read-only data for the main assistant to review.
+- Routed peer progress and results through the main service's signed durable
+  inbox. Receipts distinguish confirmed API delivery, disabled notifications
+  and unknown outcomes; uncertain sends are not automatically replayed.
+- Added staged worker deployment, native build receipts, crash recovery and
+  rollback. The optional MacBook worker uses a reviewed macOS arm64 CLI pin;
+  the generic installer and global CLI selection remain unchanged.
+- Kept private credentials, local configuration, conversations, host identities,
+  generated results and private Git history outside the public source update.
+
 ## 2.2.0
 
 - Added bounded operation timelines linking admitted messages, queued work,

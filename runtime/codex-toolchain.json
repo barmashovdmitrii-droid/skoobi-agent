@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "version": "0.166.0",
+  "platform": "darwin",
+  "arch": "arm64",
+  "destination": "node_modules/.skoobi-codex-0.166.0",
+  "binary": "node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex",
+  "binarySha256": "39acf979729dd290f9a24ee38b2914e036c91b65952872e28ae2a6b88a7db7c1",
+  "launcher": "node_modules/.bin/codex",
+  "wrapperSha256": "e14fc83739c13c1074b12bd1acce4010c893c7f6fbfc1593b4a31d74cabb57af",
+  "packages": [
+    {
+      "directory": "node_modules/@openai/codex",
+      "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.166.0.tgz",
+      "integrity": "sha512-2Szlp1l1cz5TX1ccpX4Zok3DZrot9xeZe0km+6/1v8JmqxADwyJxKBJah4dBymkwtS25j/u6dipJusTOI97Z8Q=="
+    },
+    {
+      "directory": "node_modules/@openai/codex-darwin-arm64",
+      "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.166.0-darwin-arm64.tgz",
+      "integrity": "sha512-5fWH6qqUInACcRADIewjlnRxDb4QLe0uriwehiZz0+viuAAB8I+WWefqw4xwHvyKaxeiGX4uK56+vrgfvFk3FQ=="
+    }
+  ]
+}

@@ -21,6 +21,11 @@ export const OPERATION_TRACE_STAGES = [
   'response',
   'delivery',
   'artifact_acceptance',
+  'peer_accepted',
+  'peer_progress',
+  'peer_result',
+  'peer_assessment',
+  'peer_delivery',
 ] as const;
 export type OperationTraceStage = (typeof OPERATION_TRACE_STAGES)[number];
 export const OPERATION_TRACE_OUTCOMES = [

@@ -19,6 +19,7 @@ import {
 import { getOrCreateOperationTrace, pruneOperationTraces, queueOperationTrace, recoverDeadOwnerOperationTraces } from './operation-trace-store.js';
 import { defaultArtifactAcceptanceHost } from './artifact-acceptance.js';
 import { createArtifactAcceptanceDeliveryPolicy } from './artifact-acceptance-policy.js';
+import { createPeerInboxPump, loadPeerBridgeConfig, peerInboxPromptContext, type PeerBridgeConfig } from './peer-inbox.js';
 import {
   bindOperationTraceInputs,
   createToolTraceRecorder,
@@ -6862,6 +6863,13 @@ async function processGroupMessagesInner(
     currentText: latestMemoryRecallQuery(missedMessages),
   });
   const promptContexts = [...skillContexts.contexts, ...memoryContexts];
+  if (peerBridgeConfig && isMainGroup && peerBridgeConfig.ownerJid === chatJid &&
+      peerBridgeConfig.ownerGroupFolder === group.folder &&
+      peerBridgeConfig.identityId === promptSenderIdentity?.identity_id &&
+      peerBridgeConfig.tenantId === promptTenant?.tenant_id) {
+    const peerContext = peerInboxPromptContext(getDb(), chatJid, peerBridgeConfig);
+    if (peerContext) promptContexts.push(peerContext);
+  }
   const speechQuality = speechQualityForMessages(chatJid, missedMessages);
   if (speechQuality) promptContexts.push(speechQuality);
   const trustedOwnerContextRequest =
@@ -11967,6 +11975,30 @@ async function runAgentInner(
   }
 }
 
+let peerBridgeConfig: PeerBridgeConfig | undefined;
+
+/** Narrow host adapter shared by the real loop and lifecycle regression tests.
+ * It forwards peer data without a synthetic message or direct-user source. */
+export function attachPeerInboxToMessageLoop(config: PeerBridgeConfig, deps: {
+  db: ReturnType<typeof getDb>; router: MessageRouter;
+  groups: () => Record<string, RegisteredGroup>;
+  tenantIdForChat: (jid: string) => string | undefined;
+  connected: (jid: string) => boolean;
+  queue: Pick<typeof queue, 'sendMessage'>;
+  instanceRoot: string;
+}): () => Promise<void> {
+  if (fs.realpathSync(config.projectRoot) !== fs.realpathSync(deps.instanceRoot)) {
+    throw new Error('Peer bridge configuration belongs to another instance');
+  }
+  return createPeerInboxPump(config, {
+    db: deps.db, router: deps.router,
+    ownerAvailable: c => deps.groups()[c.ownerJid]?.isMain === true && deps.groups()[c.ownerJid]?.folder === c.ownerGroupFolder &&
+      deps.tenantIdForChat(c.ownerJid) === c.tenantId,
+    canDeliver: c => deps.connected(c.ownerJid),
+    notifyActive: (jid, text) => deps.queue.sendMessage(jid, text),
+  });
+}
+
 async function startMessageLoop(router: MessageRouter): Promise<void> {
   if (messageLoopRunning) {
     logger.debug('Message loop already running, skipping duplicate start');
@@ -11976,10 +12008,27 @@ async function startMessageLoop(router: MessageRouter): Promise<void> {
 
   logger.info(`${ASSISTANT_NAME} running (trigger: @${ASSISTANT_NAME})`);
   let mediaMaintenanceRunning = false;
+  let peerInboxTick: (() => Promise<void>) | undefined;
+  const peerConfigPath = process.env.SKOOBI_PEER_BRIDGE_CONFIG || readEnvFile(['SKOOBI_PEER_BRIDGE_CONFIG']).SKOOBI_PEER_BRIDGE_CONFIG;
+  if (peerConfigPath) {
+    try {
+      const config = loadPeerBridgeConfig(peerConfigPath);
+      peerInboxTick = attachPeerInboxToMessageLoop(config, {
+        db: getDb(), router,
+        groups: () => registeredGroups,
+        tenantIdForChat: jid => currentTenantRegistry().resolveTelegramJid(jid)?.tenant_id,
+        connected: jid => findChannel(channels, jid)?.isConnected() === true,
+        queue,
+        instanceRoot: process.cwd(),
+      });
+      peerBridgeConfig = config;
+    } catch { logger.warn('Peer result bridge configuration is unavailable; ordinary chat remains active'); }
+  }
 
   while (true) {
     lastMessageLoopTickAt = Date.now();
     try {
+      if (peerInboxTick) void peerInboxTick().catch(() => logger.warn('Peer result inbox tick failed; durable events remain available'));
       if (!mediaMaintenanceRunning) {
         mediaMaintenanceRunning = true;
         // A slow notification transport must not block fresh messages or stop.

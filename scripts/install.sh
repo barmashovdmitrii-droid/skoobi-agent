@@ -6,7 +6,7 @@ CANONICAL_REPO="https://github.com/barmashovdmitrii-droid/skoobi-agent.git"
 REF_DEFAULT="main"
 EXPECTED_COMMIT_DEFAULT=""
 APP_NAME="skoobi-agent"
-VERSION="2.2.0"
+VERSION="2.3.0"
 
 PREFIX="${SKOOBI_PREFIX:-$HOME/.skoobi}"
 INSTANCE="default"
