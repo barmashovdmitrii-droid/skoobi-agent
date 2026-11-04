@@ -11,7 +11,11 @@ Before a release:
 3. Keep the generated provenance manifest beside the export as private release
    evidence; do not copy it into the public repository.
 4. Scan the export for secrets, personal data, local paths, unsafe file types,
-   and unexpected files.
+   and unexpected files. Include test fixtures and comments in the manual
+   review; examples must use synthetic identities and reserved domains.
+   Inspect author, committer, and tagger metadata before pushing. Use a public
+   noreply address, including for squash merges, and exclude operator contact
+   details and machine-specific metadata.
 5. From a fresh clone run `npm ci`, the complete tests, typecheck, build, and
    the agent-runner build.
 6. Review the entire public diff.

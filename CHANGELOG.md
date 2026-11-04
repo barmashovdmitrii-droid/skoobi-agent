@@ -10,6 +10,8 @@ All notable public changes to Skoobi Agent are documented here.
 - Improved task continuity after corrections, interrupted runs, and short
   follow-up messages. Background progress cannot replace the user's current
   project focus, and old updates cannot overwrite newer direct decisions.
+- Updated transitive `shell-quote` and `proxy-addr` dependencies to versions
+  containing their critical security fixes.
 - Added bounded relevant-memory recall and clearer Telegram progress delivery.
 - Updated Desktop task result handling, local-file delivery checks, scheduled
   task recovery, and run diagnostics.
