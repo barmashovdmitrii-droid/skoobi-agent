@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { codexAccountUsedPercentAcrossHomes } from './codex-accounting.js';
 import path from 'node:path';
+import os from 'node:os';
 import http from 'node:http';
 import net from 'node:net';
 import dns from 'node:dns/promises';
@@ -78,6 +79,32 @@ export function artifactCodexPermissionConfiguration(
     reads.some((p) => p === '/' || p === home || p.startsWith(home + path.sep))
   )
     throw new Error('model_tool_roots_invalid');
+  // Codex's minimal macOS baseline includes the shared /private/tmp tree.
+  // Deny temporary roots explicitly; the narrower workspace/output rules below
+  // grant only this job's paths. Do not make sibling jobs readable via :minimal.
+  const deniedTemps = [
+    ...new Set(
+      ['/private/tmp', '/private/var/tmp', '/private/var/folders', os.tmpdir()]
+        .filter((p) => fs.existsSync(p))
+        .map((p) => fs.realpathSync(p)),
+    ),
+  ];
+  const filesystemRules = new Map<string, string>();
+  for (const [directory, mode] of [
+    [':root', 'deny'],
+    [':minimal', 'read'],
+    ...deniedTemps.map((p) => [p, 'deny']),
+    ...reads.map((p) => [p, 'read']),
+    [root, 'read'],
+    [path.join(root, 'output'), 'write'],
+    [path.join(root, 'scratch'), 'write'],
+    [home, 'deny'],
+  ]) {
+    const existing = filesystemRules.get(directory);
+    if (existing && existing !== mode)
+      throw new Error('model_tool_policy_conflict');
+    filesystemRules.set(directory, mode);
+  }
   return [
     `default_permissions = ${JSON.stringify(ARTIFACT_CODEX_PERMISSION_PROFILE)}`,
     'approval_policy = "never"',
@@ -101,13 +128,9 @@ export function artifactCodexPermissionConfiguration(
       'ALL_PROXY',
     ].map((key) => `${JSON.stringify(key)} = "exclude"`),
     `[permissions.${ARTIFACT_CODEX_PERMISSION_PROFILE}.filesystem]`,
-    '":root" = "deny"',
-    '":minimal" = "read"',
-    ...reads.map((p) => `${JSON.stringify(p)} = "read"`),
-    `${JSON.stringify(root)} = "read"`,
-    `${JSON.stringify(path.join(root, 'output'))} = "write"`,
-    `${JSON.stringify(path.join(root, 'scratch'))} = "write"`,
-    `${JSON.stringify(home)} = "deny"`,
+    ...[...filesystemRules].map(
+      ([p, mode]) => `${JSON.stringify(p)} = ${JSON.stringify(mode)}`,
+    ),
     `[permissions.${ARTIFACT_CODEX_PERMISSION_PROFILE}.network]`,
     'enabled = false',
   ];

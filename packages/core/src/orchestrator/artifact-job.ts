@@ -388,11 +388,13 @@ export async function preflightArtifactCodexPermissions(
   const socketDirectory = fs.mkdtempSync('/private/tmp/skcp-');
   fs.chmodSync(socketDirectory, 0o700);
   const socket = path.join(socketDirectory, 's');
+  const systemTempCanary = path.join(socketDirectory, 'canary');
   const sentinel = Buffer.from(
     JSON.stringify({ auth_mode: 'fixture', synthetic: crypto.randomUUID() }),
   );
   fs.writeFileSync(auth, sentinel, { flag: 'wx', mode: 0o600 });
   fs.writeFileSync(hostCanary, sentinel, { flag: 'wx', mode: 0o600 });
+  fs.writeFileSync(systemTempCanary, sentinel, { flag: 'wx', mode: 0o600 });
   let contacted = false;
   const unix = net.createServer((client) => {
     contacted = true;
@@ -452,11 +454,12 @@ export async function preflightArtifactCodexPermissions(
       .replace(
         'async function blocked',
         `denied('host-read',()=>fs.readFileSync(process.argv[4]));
+denied('shared-temp-read',()=>fs.readFileSync(process.argv[6]));
 denied('runtime-config-read',()=>fs.readFileSync(process.argv[5]));
 denied('runtime-config-write',()=>fs.writeFileSync(process.argv[5],'changed'));
 async function blocked`,
       )
-      .replace('checks.length===15', 'checks.length===18');
+      .replace('checks.length===15', 'checks.length===19');
     const result = await launched(
       null,
       executable,
@@ -476,6 +479,7 @@ async function blocked`,
         String((tcp.address() as net.AddressInfo).port),
         hostCanary,
         config,
+        systemTempCanary,
       ],
       workspace,
       15_000,
@@ -486,11 +490,12 @@ async function blocked`,
     const passed =
       result.code === 0 &&
       !result.failed &&
-      checks.length === 18 &&
+      checks.length === 19 &&
       !contacted &&
       !fs.existsSync(`${auth}.bridge`) &&
       fs.readFileSync(auth).equals(sentinel) &&
       fs.readFileSync(hostCanary).equals(sentinel) &&
+      fs.readFileSync(systemTempCanary).equals(sentinel) &&
       hash(fs.readFileSync(config)) === launch.toolProfileSha256;
     return {
       ...evidence,
