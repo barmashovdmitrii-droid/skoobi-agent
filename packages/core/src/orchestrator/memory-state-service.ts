@@ -170,7 +170,12 @@ function directSource(
   } catch {
     return null;
   }
-  return row;
+  // Telegram's durable cursor embeds message_id below millisecond precision.
+  // Memory stores canonical wall time; messageId remains the tie-breaker for
+  // sources in the same millisecond. Do not alter the original message cursor.
+  const timestamp = Date.parse(row.timestamp);
+  if (!Number.isFinite(timestamp)) return null;
+  return { ...row, timestamp: new Date(timestamp).toISOString() };
 }
 
 // Authorization binds the initial imperative to its first named target. Mere

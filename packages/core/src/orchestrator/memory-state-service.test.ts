@@ -34,7 +34,12 @@ let capability: string;
 function message(
   id: string,
   content: string,
-  options: { chatJid?: string; identity?: SenderIdentity; bot?: boolean } = {},
+  options: {
+    chatJid?: string;
+    identity?: SenderIdentity;
+    bot?: boolean;
+    timestamp?: string;
+  } = {},
 ) {
   const chat = options.chatJid ?? chatJid;
   const sender = options.identity ?? identity;
@@ -45,7 +50,9 @@ function message(
     sender: sender.telegram_user_id,
     sender_name: 'Test sender',
     content,
-    timestamp: `2026-10-01T00:00:${String(Number(id) % 60).padStart(2, '0')}.000Z`,
+    timestamp:
+      options.timestamp ??
+      `2026-10-01T00:00:${String(Number(id) % 60).padStart(2, '0')}.000Z`,
     is_bot_message: options.bot ?? false,
     sender_identity: sender,
   });
@@ -113,6 +120,92 @@ afterEach(() => {
 });
 
 describe('authenticated structured-memory IPC boundary', () => {
+  it('writes a sourced decision from a Telegram cursor without changing the original timestamp', () => {
+    const timestamp = '2026-10-01T00:00:10.500000000000011Z';
+    message('11', 'Я предпочитаю кофе.', { timestamp });
+    extendMemoryWriteCapabilitiesForChat(folder, chatJid, ['11']);
+    expect(call({ ...fact(), source: { kind: 'direct_user', messageId: '11', quote: 'Я предпочитаю кофе.' } })).toMatchObject({
+      ok: true,
+      data: {
+        revision: 1,
+        record: {
+          source: {
+            at: '2026-10-01T00:00:10.500Z',
+            messageId: '11',
+            quote: 'Я предпочитаю кофе.',
+            sourceReferenceTrust: 'verified_quote',
+          },
+        },
+      },
+    });
+    expect(
+      getDb().prepare('SELECT timestamp FROM messages WHERE id=? AND chat_jid=?').get('11', chatJid),
+    ).toEqual({ timestamp });
+  });
+
+  it('saves an assistant project card from a Telegram cursor and reads it back', () => {
+    message('11', 'Я предпочитаю кофе.', {
+      timestamp: '2026-10-01T00:00:10.500000000000011Z',
+    });
+    extendMemoryWriteCapabilitiesForChat(folder, chatJid, ['11']);
+    const result = call({
+      action: 'mutate',
+      operation: {
+        kind: 'project_upsert',
+        projectKey: 'date-repair',
+        operationId: 'telegram-card',
+        expectedRevision: 0,
+        card: {
+          title: 'Date repair',
+          goal: 'Verify Telegram source interoperability',
+          status: 'active',
+          completed: [],
+          pending: ['Check persistence'],
+          waiting: null,
+          artifacts: [],
+        },
+      },
+      source: { kind: 'assistant_report' },
+    });
+    expect(result).toMatchObject({ ok: true, data: { revision: 1 } });
+    expect(call({ action: 'get_project', projectKey: 'date-repair' })).toMatchObject({
+      ok: true,
+      data: {
+        project: {
+          revision: 1,
+          card: { goal: 'Verify Telegram source interoperability' },
+          source: { at: '2026-10-01T00:00:10.500Z' },
+        },
+      },
+    });
+  });
+
+  it('preserves latest-correction priority for Telegram messages in the same second', () => {
+    message('11', 'Я предпочитаю кофе.', {
+      timestamp: '2026-10-01T00:00:10.500000000000011Z',
+    });
+    message('12', 'Я предпочитаю чай.', {
+      timestamp: '2026-10-01T00:00:10.500000000000012Z',
+    });
+    extendMemoryWriteCapabilitiesForChat(folder, chatJid, ['11', '12']);
+    expect(call({
+      ...fact('newer-tea', 0, 'Prefers tea'),
+      source: { kind: 'direct_user', messageId: '12', quote: 'Я предпочитаю чай.' },
+    })).toMatchObject({ ok: true, data: { revision: 1 } });
+    expect(call({ ...fact('older-coffee', 1), source: { kind: 'direct_user', messageId: '11', quote: 'Я предпочитаю кофе.' } })).toMatchObject({
+      ok: false, error: 'stale_source', currentRevision: 1,
+    });
+    expect(call({ action: 'list' }).data).toMatchObject({
+      facts: [{ revision: 1, value: 'Prefers tea' }],
+    });
+  });
+
+  it('rejects an invalid stored source timestamp without creating a record', () => {
+    message('11', 'Я предпочитаю кофе.', { timestamp: 'invalid timestamp' });
+    extendMemoryWriteCapabilitiesForChat(folder, chatJid, ['11']);
+    expect(call(fact())).toMatchObject({ ok: false, error: 'current_direct_source_required' });
+  });
+
   it('writes then reads exact identity-scoped state and distinguishes a verified quote from interpretation', () => {
     const result = call(fact());
     expect(result.ok).toBe(true);
