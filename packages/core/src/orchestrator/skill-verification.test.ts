@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -21,6 +22,7 @@ import {
 } from './skill-registry.js';
 import {
   runArtifactAcceptance,
+  loadArtifactAcceptanceReceipt,
   type ArtifactAcceptanceHost,
   type BrowserArtifactAcceptanceRequirements,
 } from './artifact-acceptance.js';
@@ -164,6 +166,99 @@ describe('host skill contracts reject self-attestation and uncontrolled code', (
   });
 });
 
+// Read only bounded trace events; never log snapshots, messages, URLs or host paths.
+function traceDiagnostics(id: string) {
+  try {
+    if (!/^[a-f0-9-]{36}$/.test(id)) return { category: 'invalid_trace_id' };
+    return JSON.parse(
+      execFileSync(
+        '/usr/bin/python3',
+        [
+          '-I',
+          '-c',
+          String.raw`
+import json, os, sys, zipfile
+assert os.path.getsize(sys.argv[1]) <= 8 * 1024 * 1024
+operations, errors, last = {}, [], 'none'
+allowed = {'goto', 'click', 'press', 'innerText', 'waitForSelector'}
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    assert len(archive.infolist()) <= 256
+    traces = [item for item in archive.infolist() if item.filename.endswith('.trace')]
+    assert len(traces) <= 4 and sum(item.file_size for item in traces) <= 8 * 1024 * 1024
+    for item in traces:
+        lines = archive.read(item).splitlines()
+        assert len(lines) <= 10000
+        for line in lines:
+            assert len(line) <= 131072
+            event = json.loads(line)
+            call = event.get('callId')
+            if event.get('type') == 'before' and isinstance(call, str) and len(call) <= 200:
+                assert len(operations) < 5000
+                operation = event.get('method')
+                operations[call] = operation if operation in allowed else 'other'
+            if event.get('type') != 'after':
+                continue
+            last = operations.get(call, 'other')
+            error = event.get('error')
+            if not isinstance(error, dict):
+                continue
+            message = str(error.get('message', ''))[:8192].lower()
+            category = 'other'
+            for needle, label in [('execution context was destroyed', 'context_destroyed'),
+                                  ('has been closed', 'page_closed'), ('target closed', 'page_closed'),
+                                  ('timeout', 'timeout'), ('net::', 'navigation_error'),
+                                  ('navigation', 'navigation_error')]:
+                if needle in message:
+                    category = label
+                    break
+            name = error.get('name')
+            errors.append({'operation': last, 'errorName': name if name in ('Error', 'TimeoutError', 'TargetClosedError') else 'OtherError', 'category': category})
+print(json.dumps({'lastOperation': last, 'errors': errors[-4:]}))
+`,
+          path.join(host.stateDir, `${id}.trace.zip`),
+        ],
+        {
+          encoding: 'utf8',
+          timeout: 3000,
+          maxBuffer: 4096,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        },
+      ),
+    );
+  } catch {
+    return { category: 'trace_diagnostic_unavailable' };
+  }
+}
+
+// Failure diagnostics contain only finite checker codes from synthetic test receipts.
+function reproductionDiagnostics() {
+  try {
+    return fs
+      .readdirSync(host.stateDir)
+      .filter((name) => /^[a-f0-9-]{36}\.json$/.test(name))
+      .slice(0, 4)
+      .map((name) => loadArtifactAcceptanceReceipt(name.slice(0, -5), host))
+      .filter((receipt) => receipt !== undefined)
+      .sort((a, b) => a.payload.issuedAt.localeCompare(b.payload.issuedAt))
+      .map(({ payload }) => ({
+        status: payload.result.status,
+        code: /^[a-z][a-z0-9_]{0,63}$/.test(payload.result.code)
+          ? payload.result.code
+          : 'invalid_code',
+        checkIds: payload.result.checks
+          .map((check) => check.id)
+          .filter((id) => /^(archive_safety|entry_opened|step_[1-4])$/.test(id))
+          .slice(0, 6),
+        traceAvailable: Boolean(payload.trace && payload.trace.size > 0),
+        ...(payload.trace && payload.trace.size > 0
+          ? { trace: traceDiagnostics(payload.id) }
+          : {}),
+      }));
+  } catch {
+    return [{ code: 'receipt_diagnostic_unavailable' }];
+  }
+}
+
 // Positive containment is never mocked on platforms without the shipped adapter.
 describe.runIf(process.platform === 'darwin')(
   'independent real contained reproductions and browser checks',
@@ -177,7 +272,15 @@ describe.runIf(process.platform === 'darwin')(
       });
       expect(
         checked,
-        'The macOS isolated job controller and installed Playwright must execute both real cases.',
+        `The macOS isolated job controller and installed Playwright must execute both real cases. ${JSON.stringify(
+          {
+            status: checked.status,
+            code: checked.code,
+            verifiedCases: checked.verifiedCases,
+            receipts:
+              checked.status === 'verified' ? [] : reproductionDiagnostics(),
+          },
+        )}`,
       ).toMatchObject({ status: 'verified', verifiedCases: 2 });
     }, 60_000);
     it('activates only the reviewed draft, preserves scope, and keeps all example content out of the shared skill', () => {
