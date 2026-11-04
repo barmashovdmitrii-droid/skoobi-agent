@@ -62,6 +62,9 @@ let request;
 let result = { status: 'inconclusive', code: 'checker_error', checks: [] };
 const checks = [];
 const record = (id) => checks.push({ id, outcome: 'passed' });
+// The host still caps this entire checker process at 20 seconds. Give each
+// real browser action/navigation a bounded window that tolerates loaded hosts.
+const BROWSER_ACTION_TIMEOUT_MS = 5000;
 process.once('SIGTERM', () => {
   const hardExit = setTimeout(() => process.exit(2), 1500);
   Promise.resolve().then(async () => {
@@ -170,8 +173,8 @@ try {
             serviceWorkers: 'block',
             acceptDownloads: false,
           });
-          context.setDefaultTimeout(1500);
-          context.setDefaultNavigationTimeout(2000);
+          context.setDefaultTimeout(BROWSER_ACTION_TIMEOUT_MS);
+          context.setDefaultNavigationTimeout(BROWSER_ACTION_TIMEOUT_MS);
           await context.route('**/*', (route) => {
             const url = new URL(route.request().url());
             if (url.origin === origin && route.request().method() === 'GET')
@@ -201,7 +204,7 @@ try {
           const assertVisibleText = async (expectation) => {
             const locator = page.locator(expectation.selector);
             await locator.waitFor({ state: 'visible' });
-            const deadline = Date.now() + 1500;
+            const deadline = Date.now() + BROWSER_ACTION_TIMEOUT_MS;
             while (true) {
               const text = (await locator.innerText())
                 .replace(/\s+/g, ' ')

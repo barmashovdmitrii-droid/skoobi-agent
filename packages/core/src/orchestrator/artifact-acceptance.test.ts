@@ -49,6 +49,7 @@ describe.runIf(process.platform === 'darwin')('host artifact acceptance with a r
     fs.mkdirSync(workspace);
     for (const variant of [
       'good',
+      'delayed',
       'broken',
       'traversal',
       'symlink',
@@ -116,6 +117,17 @@ describe.runIf(process.platform === 'darwin')('host artifact acceptance with a r
       ).mode & 0o777,
     ).toBe(0o600);
   }, 25_000);
+
+  it('waits for delayed actionability, real local navigation and exact keyboard response without bypassing checks', async () => {
+    const result = await checkFixture('delayed');
+    expect(result).toMatchObject({ status: 'passed', code: 'checks_passed' });
+    expect(result.receipt?.payload.result.checks).toEqual([
+      { id: 'archive_safety', outcome: 'passed' },
+      { id: 'entry_opened', outcome: 'passed' },
+      { id: 'step_1', outcome: 'passed' },
+      { id: 'step_2', outcome: 'passed' },
+    ]);
+  }, 30_000);
 
   it.each(['traversal', 'symlink', 'large', 'duplicate'])(
     'rejects unsafe archive variant %s before browser acceptance',

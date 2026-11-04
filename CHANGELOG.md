@@ -16,6 +16,8 @@ All notable public changes to Skoobi Agent are documented here.
 - Added staged worker deployment, native build receipts, crash recovery and
   rollback. The optional MacBook worker uses a reviewed macOS arm64 CLI pin;
   the generic installer and global CLI selection remain unchanged.
+- Allowed bounded browser interaction delays while preserving exact scenario
+  checks and the host's overall execution deadline.
 - Kept private credentials, local configuration, conversations, host identities,
   generated results and private Git history outside the public source update.
 
