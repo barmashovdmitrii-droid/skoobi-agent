@@ -3,6 +3,31 @@ import os from 'os';
 import path from 'path';
 import { createHash, randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
+import { startOperationTraceStage, type OperationTraceSpan } from '@skoobi/shared/operation-trace';
+import type { MediaIntakeInput, MediaIntakeScope, MediaIntakeJob } from '@skoobi/shared/media-intake';
+import { safeTelegramBotId } from '@skoobi/shared/telegram-identity';
+import { buildTranscriptionQualityContext } from './transcription-context.js';
+import { privateAdminModeEnabled, isPrivateAdminTelegramUser } from '@skoobi/shared/private-admin';
+import {
+  createMediaIntakeStore, earliestMediaIntakeCursor, readMediaTranscriptionEvidence,
+  claimMediaIntakeNotice, settleMediaIntakeNotice,
+} from './media-intake-store.js';
+import {
+  resolveTelegramMediaScope, messagesBeforePendingMedia,
+  cancelMediaForDirectOwnerStop, dispatchMaterializedMedia, latestPendingMediaStop,
+} from './media-intake-host.js';
+import { getOrCreateOperationTrace, pruneOperationTraces, queueOperationTrace, recoverDeadOwnerOperationTraces } from './operation-trace-store.js';
+import { defaultArtifactAcceptanceHost } from './artifact-acceptance.js';
+import { createArtifactAcceptanceDeliveryPolicy } from './artifact-acceptance-policy.js';
+import {
+  bindOperationTraceInputs,
+  createToolTraceRecorder,
+  currentOperationTrace,
+  linkPipedOperationTraceInputs,
+  traceAgentExecution,
+  withOperationTraceRun,
+  registerIpcOperationTrace,
+} from './runtime-operation-trace.js';
 
 import { createAssistantMentionPattern } from '@skoobi/shared/assistant-name';
 
@@ -151,6 +176,11 @@ import {
 } from './memory-context.js';
 import { buildSkillPromptContext } from './skill-registry.js';
 import { listMemoryState } from './memory-state-store.js';
+import {
+  buildRecalledStructuredMemoryContext,
+  configuredMemoryRecallEncoder,
+  type RecalledStructuredMemoryContext,
+} from './memory-prompt-recall.js';
 import {
   buildStructuredMemoryContext,
   latestMemoryRecallQuery,
@@ -3757,6 +3787,94 @@ function currentTenantRegistry(): TenantRegistry {
   return TenantRegistry.fromRegisteredGroups(registeredGroups);
 }
 
+function mediaInputStillAdmitted(scope: MediaIntakeScope, input: MediaIntakeInput): boolean {
+  const current = resolveTelegramMediaScope(currentTenantRegistry(), scope.botId, input);
+  if (!current || current.tenantId !== scope.tenantId || current.groupFolder !== scope.groupFolder ||
+      current.chatJid !== scope.chatJid || current.botId !== scope.botId) return false;
+  if (telegramAgentHold(scope.chatJid)?.kind === 'banned') return false;
+  const allowlist = loadSenderAllowlist();
+  if (shouldDropMessage(scope.chatJid, allowlist) && !isSenderAllowed(scope.chatJid, input.message.sender, allowlist)) return false;
+  const ownerAllowlist = loadOwnerAllowlistFromEnv();
+  if (privateAdminModeEnabled() && !isPrivateAdminTelegramUser({ telegramUserId: input.message.sender, ownerAllowlist })) return false;
+  // A previously privileged source must not regain authority after revocation.
+  // Newly granted privileges never rewrite the captured source identity either.
+  if (input.message.sender_identity?.is_owner_sender === true) {
+    const identity = createTelegramSenderIdentity({ chatId: parseTelegramJid(scope.chatJid)!.chatId,
+      fromId: input.message.sender, botId: scope.botId, ownerAllowlist });
+    if (!identity.is_owner_sender) return false;
+  }
+  return true;
+}
+
+function mediaIntakeForBot(botId?: string) {
+  return createMediaIntakeStore(getDb(), {
+    botId: safeTelegramBotId(botId),
+    resolveScope: input => resolveTelegramMediaScope(currentTenantRegistry(), botId, input),
+    isAdmitted: mediaInputStillAdmitted,
+    canProcess: scope => !telegramAgentHold(scope.chatJid),
+    writeMessage: (database, message) => {
+      if (database !== getDb()) throw new Error('Media intake database binding mismatch');
+      storeMessage(message);
+    },
+  });
+}
+
+function speechQualityForMessages(chatJid: string, messages: readonly NewMessage[]): string | undefined {
+  try {
+    const tenant = currentTenantRegistry().resolveTelegramJid(chatJid);
+    if (!tenant) return undefined;
+    return buildTranscriptionQualityContext(readMediaTranscriptionEvidence(getDb(), {
+      botId: safeTelegramBotId(tenant.bot_id), tenantId: tenant.tenant_id,
+      chatJid, groupFolder: tenant.folder,
+    }, messages.map(message => message.id), mediaInputStillAdmitted));
+  } catch {
+    logger.warn('Speech quality context unavailable');
+    return undefined;
+  }
+}
+
+async function maintainMediaIntake(router: MessageRouter): Promise<void> {
+  dispatchMaterializedMedia(getDb(), chatJid => queue.enqueueMessageCheck(chatJid));
+  let source: MediaIntakeJob | undefined;
+  const notice = claimMediaIntakeNotice(getDb(), {
+    canDeliver: (candidate, job) => {
+      const channel = findChannel(channels, candidate.chatJid);
+      if (!channel?.isConnected() || telegramAgentHold(candidate.chatJid) || !mediaInputStillAdmitted(job.scope, job.input)) return false;
+      source = job; return true;
+    },
+  });
+  if (!notice) return;
+  let acknowledged = false;
+  try {
+    const kind = source?.input.media.kind === 'audio' ? 'аудиосообщения' : 'голосового сообщения';
+    const reason = ['no_speech', 'empty', 'transcription_unusable'].includes(notice.reason)
+      ? 'распознаваемую речь получить не удалось'
+      : notice.reason === 'deadline_expired' ? 'истёк лимит времени обработки'
+      : notice.reason === 'capacity' ? 'очередь обработки переполнена'
+      : ['transport_timeout', 'transport_failure', 'invalid_response', 'source_unavailable'].includes(notice.reason)
+        ? 'не удалось загрузить исходный файл'
+        : 'возникла техническая ошибка';
+    const delivered = await withOperationTraceRun(notice.chatJid, async () => {
+      try {
+        if (source) bindOperationTraceInputs(getDb(), { tenantId: source.scope.tenantId, chatId: source.scope.chatJid },
+          [source.input.message.id], 'telegram');
+      } catch { /* Notification delivery does not depend on diagnostic storage. */ }
+      return router.route({ chatJid: notice.chatJid,
+        text: `Обработка ${kind} остановлена: ${reason}.`, triggerType: 'extension',
+        meta: { kind: 'media_intake_notice', suppressCursorAdvance: true } });
+    }, { trackPipedInputs: false });
+    acknowledged = Boolean(delivered);
+    settleMediaIntakeNotice(getDb(), notice.id, acknowledged ? 'confirmed' : 'unknown');
+    if (delivered) {
+      try { storeBotReply(notice.chatJid, delivered); } catch { /* Confirmed transport is not replayed for failed history. */ }
+    }
+  } catch {
+    // A missing ACK can follow a successful external send. Never turn that
+    // uncertainty into another download, recognition pass or blind resend.
+    settleMediaIntakeNotice(getDb(), notice.id, acknowledged ? 'confirmed' : 'unknown');
+  }
+}
+
 function errorPayload(err: unknown): Record<string, unknown> {
   if (err instanceof Error) {
     return { name: err.name, message: err.message };
@@ -5735,6 +5853,16 @@ async function maybeHandleCodexDesktopStopCommand(input: {
   const stopMessage = directOwnerCodexDesktopStopMessage(input.messages);
   if (!stopMessage) return { handled: false, delivered: false };
   const stopCursor = messageCursor(stopMessage);
+  const mediaTenant = currentTenantRegistry().resolveTelegramJid(input.chatJid);
+  const currentStopIdentity = mediaTenant && createTelegramSenderIdentity({
+    chatId: mediaTenant.chat_id, fromId: stopMessage.sender, botId: mediaTenant.bot_id,
+    ownerAllowlist: loadOwnerAllowlistFromEnv(),
+  });
+  if (!mediaTenant || !currentStopIdentity?.is_owner_sender) return { handled: false, delivered: false };
+  const cancelledMedia = mediaTenant && currentStopIdentity?.is_owner_sender
+    ? cancelMediaForDirectOwnerStop(getDb(), { botId: safeTelegramBotId(mediaTenant.bot_id),
+        tenantId: mediaTenant.tenant_id, chatJid: input.chatJid, groupFolder: mediaTenant.folder }, stopMessage)
+    : 0;
   const revokedCodexControlRunId = activeCodexControlRunIds.get(input.chatJid);
 
   const cancelledRun =
@@ -5771,11 +5899,14 @@ async function maybeHandleCodexDesktopStopCommand(input: {
     interrupted?.ok === true && interrupted.result.noManagedTask === true;
   const inspectionFailed =
     interrupted?.ok === true && interrupted.result.inspectionFailed === true;
-  const text = stopCommandReplyText({
+  const ordinaryStopText = stopCommandReplyText({
     interrupted,
     chatRunStopped: cancelledRun.active && !cancelledRun.taskContainerProtected,
     scheduledTaskRunning: cancelledRun.taskContainerProtected,
   });
+  const text = cancelledMedia > 0
+    ? `Обработка входящих аудиосообщений остановлена.${cancelledRun.active || confirmed ? `\n${ordinaryStopText}` : ''}`
+    : ordinaryStopText;
   const senderId =
     stopMessage.sender_identity?.telegram_user_id || stopMessage.sender || null;
 
@@ -5838,6 +5969,12 @@ async function maybeHandleCodexDesktopStopCommand(input: {
       'Codex Desktop stop reply delivery failed',
     );
     return { handled: true, delivered: false };
+  } finally {
+    // A newer input can already be behind the global polling cursor. The stop
+    // consumes only its own frontier; later messages still need a local wakeup.
+    if (getMessagesSince(input.chatJid, stopCursor, ASSISTANT_NAME, 1).length > 0) {
+      queue.enqueueMessageCheck(input.chatJid);
+    }
   }
 }
 
@@ -6113,7 +6250,7 @@ export function isMultiSenderChat(chatJid: string): boolean {
   return false;
 }
 
-export function buildPromptMemoryContexts(input: {
+type PromptMemoryContextsInput = {
   chatJid: string;
   senderId: string | null | undefined;
   senderIdentity?: SenderIdentity | null;
@@ -6125,7 +6262,12 @@ export function buildPromptMemoryContexts(input: {
   multiSenderGroup?: boolean;
   /** Current direct user text, used for bounded relevant recall. */
   currentText?: string;
-}): string[] {
+};
+
+export function buildPromptMemoryContexts(
+  input: PromptMemoryContextsInput,
+  recalled?: RecalledStructuredMemoryContext,
+): string[] {
   const groupsDir = input.groupsDir ?? GROUPS_DIR;
   const dataDir = input.dataDir ?? DATA_DIR;
   const provenancePublicKey =
@@ -6138,7 +6280,11 @@ export function buildPromptMemoryContexts(input: {
     input.currentText !== undefined && input.chatJid.startsWith('tg:');
   // No guessed identity or cross-chat scope: mixed/indirect batches do not
   // acquire personal task state merely from a matching display name.
-  if (
+  if (recalled) {
+    structuredContext = recalled.context;
+    recallQuery = recalled.recallQuery;
+    excludeLegacyMemory = recalled.excludeLegacyMemory;
+  } else if (
     input.currentText !== undefined &&
     input.senderIdentity?.telegram_message_origin === 'direct' &&
     input.senderIdentity.identity_id &&
@@ -6228,6 +6374,25 @@ export function buildPromptMemoryContexts(input: {
   ].filter(Boolean);
 }
 
+/** Production recall awaits the local optional index, then assembles legacy
+ * context using the post-await tombstone state. Sync callers retain their API. */
+export async function buildPromptMemoryContextsWithRecall(
+  input: PromptMemoryContextsInput,
+): Promise<string[]> {
+  try {
+    const recalled = await buildRecalledStructuredMemoryContext(getDb(), input, {
+      encoder: configuredMemoryRecallEncoder(input),
+    });
+    return buildPromptMemoryContexts(input, recalled);
+  } catch {
+    return buildPromptMemoryContexts(input, {
+      context:
+        '<structured_memory unavailable="true">Current records could not be read. Do not infer that memory is empty or claim a change was saved.</structured_memory>',
+      excludeLegacyMemory: true,
+    });
+  }
+}
+
 export function buildPromptSkillContexts(input: {
   text: string;
   chatJid: string;
@@ -6295,7 +6460,7 @@ async function processGroupMessages(
     lastAgentTimestamp[chatJid] || INITIAL_INGESTION_CURSOR;
   let completed = false;
   try {
-    completed = await processGroupMessagesInner(chatJid, router);
+    completed = await withOperationTraceRun(chatJid, () => processGroupMessagesInner(chatJid, router));
     return completed;
   } finally {
     // The held messages are behind the cursor now (answered, or moved past
@@ -6488,7 +6653,7 @@ async function processGroupMessagesInner(
   // an unfinished correction. Recover ONLY the host-recorded input IDs, with
   // their original sender identity from SQLite, never a broad historical range.
   const deliveredInputIds = new Set([...deliveryReceipts.messageIds, ...supersededTimeoutIds, ...readDeferredDeliveryQuarantineIds(groupIpcDir,chatJid)]);
-  const pendingMessages = [...new Map(
+  let pendingMessages = [...new Map(
     [...recoveredInputs, ...ordinaryPending].map((message) => [message.id, message]),
   ).values()].filter((message) => !deliveredInputIds.has(message.id))
     .sort((a, b) => messageCursor(a).localeCompare(messageCursor(b)));
@@ -6501,6 +6666,19 @@ async function processGroupMessagesInner(
     if (startedWithDeferredCheckpoint) logger.warn({chatJid, groupFolder:group.folder},
       'Deferred inputs preserved but host provenance or source rows unavailable; no historical action replayed');
     return true;
+  }
+
+  const mediaFrontier = earliestMediaIntakeCursor(getDb(), chatJid);
+  if (mediaFrontier) {
+    // A direct stop must be handled before the frontier, otherwise the very
+    // media operation being cancelled would keep the stop waiting behind it.
+    const pendingStop = latestPendingMediaStop(getDb(), chatJid, sinceTimestamp, isCodexDesktopStopCommandText);
+    const stop = await maybeHandleCodexDesktopStopCommand({ chatJid, replyJid: chatJid,
+      group, messages: pendingStop ? [pendingStop] : pendingMessages, targetCursor: messageCursor(pendingStop ?? pendingMessages.at(-1)!),
+      router, chatRunActive: false });
+    if (stop.handled) return stop.delivered;
+    pendingMessages = messagesBeforePendingMedia(pendingMessages, mediaFrontier);
+    if (!pendingMessages.length) return true;
   }
 
   // Pings the host already answered during the previous run are not a task.
@@ -6573,6 +6751,13 @@ async function processGroupMessagesInner(
   // `let`: a runner that restarts its turn to fold piped follow-ups in makes
   // this run's answer cover them too (onFollowUpsAbsorbed below).
   let targetCursor = messageCursor(missedMessages[missedMessages.length - 1]);
+  try {
+    const traceTenant = currentTenantRegistry().resolveTelegramJid(chatJid);
+    bindOperationTraceInputs(getDb(), {
+      tenantId: traceTenant?.tenant_id || `channel:${eventChannelForJid(chatJid)}`,
+      chatId: chatJid,
+    }, missedMessages.map(message => message.id), eventChannelForJid(chatJid) ?? 'other');
+  } catch { /* Optional diagnostics must not stop admitted work. */ }
   const originalTargetCursor = targetCursor;
   // «стоп», пришедший, когда ничего не выполнялось, шёл сюда и уходил модели
   // как обычная задача: остановку ловил только опрос активного хода.
@@ -6666,7 +6851,7 @@ async function processGroupMessagesInner(
       },
     });
   }
-  const memoryContexts = buildPromptMemoryContexts({
+  const memoryContexts = await buildPromptMemoryContextsWithRecall({
     chatJid,
     senderId: memoryPromptSenderIdentity?.telegram_user_id,
     senderIdentity: memoryPromptSenderIdentity,
@@ -6677,6 +6862,8 @@ async function processGroupMessagesInner(
     currentText: latestMemoryRecallQuery(missedMessages),
   });
   const promptContexts = [...skillContexts.contexts, ...memoryContexts];
+  const speechQuality = speechQualityForMessages(chatJid, missedMessages);
+  if (speechQuality) promptContexts.push(speechQuality);
   const trustedOwnerContextRequest =
     isMainGroup &&
     isTrustedOwnerContextRequest({ chatJid, messages: missedMessages });
@@ -11102,7 +11289,11 @@ function buildCodexReserveInputConfig(
   };
 }
 
-async function runAgent(
+async function runAgent(...args: Parameters<typeof runAgentInner>): Promise<RunAgentResult> {
+  return traceAgentExecution(() => runAgentInner(...args));
+}
+
+async function runAgentInner(
   group: RegisteredGroup,
   prompt: string,
   chatJid: string,
@@ -11307,12 +11498,25 @@ async function runAgent(
   };
 
   // Wrap onOutput to track session ID and usage from streamed results
+  const executionTrace = currentOperationTrace();
+  const toolTrace = createToolTraceRecorder(executionTrace);
+  // This is the observed runner turn, including tools and host spawn. It is
+  // deliberately not labelled individual model-request latency.
+  let modelTrace: OperationTraceSpan | undefined;
   const wrappedOnOutput =
+    executionTrace ||
     onOutput ||
     opts?.onHeartbeat ||
     opts?.onImageArtifacts ||
     opts?.onImageGenerationCallIds
       ? async (output: ContainerOutput) => {
+          toolTrace.observe(output.toolObservation);
+          if (output.status !== 'heartbeat') {
+            modelTrace?.finish(output.status === 'success' ? 'succeeded' : 'unknown');
+            modelTrace = undefined;
+          } else if ((output.consumedFollowUps ?? 0) > 0 && !modelTrace) {
+            modelTrace = startOperationTraceStage(executionTrace, 'model_turn');
+          }
           if (output.sideEffected === true) observedSideEffect = true;
           for (const tool of output.sideEffectTools || []) {
             if (
@@ -11460,6 +11664,7 @@ async function runAgent(
       : undefined;
 
   let memoryWriteCapability = '';
+  const ipcTrace = registerIpcOperationTrace(group.folder);
   let taskAuthorizationCapability = '';
   let codexControlRunId = '';
   const codexControlChatJid = context?.memoryIdentityJid || chatJid;
@@ -11547,6 +11752,7 @@ async function runAgent(
       chatJid,
       isMain,
       assistantName: ASSISTANT_NAME,
+      ...(ipcTrace ? { operationTraceCapability: ipcTrace.token } : {}),
       tenantId: context?.tenantId || agentTenant?.tenant_id,
       credentialProxyTier: runtimeCredentialProxyTier,
       runTrust,
@@ -11631,6 +11837,7 @@ async function runAgent(
     // does not name it (see codexCliVersionOnce). Cached per process.
     if (isCodexProvider) void codexCliVersionOnce(agentInput.codex?.command);
 
+    modelTrace = startOperationTraceStage(executionTrace, 'model_turn');
     const output =
       runtime === 'sandbox'
         ? await runSandboxAgent(group, agentInput, onProcessCb, wrappedOnOutput)
@@ -11640,6 +11847,10 @@ async function runAgent(
             onProcessCb,
             wrappedOnOutput,
           );
+
+    modelTrace?.finish(output.status === 'success' ? 'succeeded' : 'unknown');
+    modelTrace = undefined;
+    toolTrace.finish();
 
     const durationMs = Date.now() - startTime;
 
@@ -11734,6 +11945,9 @@ async function runAgent(
       error: err instanceof Error ? err.message : String(err),
     };
   } finally {
+    modelTrace?.finish('unknown', { reason: 'outcome_unknown' });
+    toolTrace.finish();
+    ipcTrace?.release();
     if (memoryWriteCapability) {
       revokeMemoryWriteCapability(memoryWriteCapability);
     }
@@ -11761,10 +11975,18 @@ async function startMessageLoop(router: MessageRouter): Promise<void> {
   messageLoopRunning = true;
 
   logger.info(`${ASSISTANT_NAME} running (trigger: @${ASSISTANT_NAME})`);
+  let mediaMaintenanceRunning = false;
 
   while (true) {
     lastMessageLoopTickAt = Date.now();
     try {
+      if (!mediaMaintenanceRunning) {
+        mediaMaintenanceRunning = true;
+        // A slow notification transport must not block fresh messages or stop.
+        void maintainMediaIntake(router).catch(() => {
+          logger.warn('Durable media maintenance is temporarily unavailable');
+        }).finally(() => { mediaMaintenanceRunning = false; });
+      }
       recoverReadyTelegramDeferredMessages();
       try {
         await runPreStartReplayTick(router);
@@ -11823,6 +12045,15 @@ async function startMessageLoop(router: MessageRouter): Promise<void> {
             if (!hasTrigger) continue;
           }
 
+          // Fresh host controls bypass both the media frontier and a temporary
+          // processing hold. They never become additional agent prompt input.
+          const freshStop = await maybeHandleCodexDesktopStopCommand({ chatJid, replyJid: chatJid,
+            group, messages: groupMessages, targetCursor: messageCursor(groupMessages.at(-1)!), router });
+          if (freshStop.handled) {
+            if (!freshStop.delivered) queue.enqueueMessageCheck(chatJid);
+            continue;
+          }
+
           const hold = telegramAgentHold(chatJid);
           if (hold) {
             logger.info(
@@ -11864,8 +12095,8 @@ async function startMessageLoop(router: MessageRouter): Promise<void> {
           // Polling can observe rows already owned by an ingestion-triggered
           // run. Reusing groupMessages here would pipe that same batch twice.
           if (allPending.length === 0) continue;
-          const messagesToSend = allPending;
-          const targetCursor = messageCursor(
+          let messagesToSend = allPending;
+          let targetCursor = messageCursor(
             messagesToSend[messagesToSend.length - 1],
           );
 
@@ -11883,6 +12114,18 @@ async function startMessageLoop(router: MessageRouter): Promise<void> {
             }
             continue;
           }
+
+          let mediaFrontier: string | undefined;
+          try { mediaFrontier = earliestMediaIntakeCursor(getDb(), chatJid); }
+          catch (error) {
+            // The global seen cursor is already persisted. Keep a chat-owned
+            // retry so a transient barrier lookup failure cannot strand input.
+            queue.enqueueMessageCheck(chatJid);
+            throw error;
+          }
+          messagesToSend = messagesBeforePendingMedia(messagesToSend, mediaFrontier);
+          if (!messagesToSend.length) continue;
+          targetCursor = messageCursor(messagesToSend.at(-1)!);
 
           // «Ау» while the model is busy: the host answers at once. Only
           // during an active turn; when idle it still goes to the model. A
@@ -11958,13 +12201,27 @@ async function startMessageLoop(router: MessageRouter): Promise<void> {
           // back above whose status reply is still in flight (or has failed
           // since). Checked before piping, since it goes in with them.
           const pipeBatch = activeRunPipeBatch({
-            read: unanswered,
+            read: messagesBeforePendingMedia(unanswered, mediaFrontier),
             fresh: messagesToSend,
             answered: hostAnsweredCursorsFor(chatJid),
           });
-          const formatted = formatMessages(pipeBatch, TIMEZONE, {
-            anonymizeSenderNames: !isMainGroup,
-          });
+          // Only admitted, unanswered work actually submitted to the agent
+          // queue/pipe waits here. Passive history and host-answered commands
+          // must not become permanently waiting diagnostic jobs.
+          try {
+            const tenant = currentTenantRegistry().resolveTelegramJid(chatJid);
+            const scope = {
+              tenantId: tenant?.tenant_id || `channel:${eventChannelForJid(chatJid)}`,
+              chatId: chatJid,
+            };
+            for (const message of pipeBatch) {
+              const input = getOrCreateOperationTrace(getDb(), scope, message.id, eventChannelForJid(chatJid) ?? 'other');
+              for (const id of input?.operationIds ?? []) queueOperationTrace(getDb(), scope, id);
+            }
+          } catch { /* Queue telemetry cannot prevent dispatch. */ }
+          const formatted = [speechQualityForMessages(chatJid, pipeBatch),
+            formatMessages(pipeBatch, TIMEZONE, { anonymizeSenderNames: !isMainGroup }),
+          ].filter(Boolean).join('\n\n');
 
           const imageGenerationActive = activeImageGenerationChats.has(chatJid);
           if (imageGenerationActive) {
@@ -12022,6 +12279,7 @@ async function startMessageLoop(router: MessageRouter): Promise<void> {
             messageIds: pipeBatch.map((message) => message.id),
             ingestionCursors: pipeBatch.map(messageCursor),
           })) {
+            linkPipedOperationTraceInputs(chatJid, pipeBatch.map(message => message.id));
             extendMemoryWriteCapabilitiesForChat(
               group.folder,
               chatJid,
@@ -12349,6 +12607,15 @@ export async function main(): Promise<void> {
 
   // Database must be initialized BEFORE querying registered groups
   initDatabase(getExtensionDbSchema());
+  const maintainOperationTraces = () => {
+    try {
+      pruneOperationTraces(getDb());
+      recoverDeadOwnerOperationTraces(getDb());
+    } catch { /* Diagnostic maintenance is never a service failure. */ }
+  };
+  maintainOperationTraces();
+  const traceMaintenance = setInterval(maintainOperationTraces, 60_000);
+  traceMaintenance.unref();
   logger.info('Database initialized');
 
   // Runtime-dependent initialization
@@ -12390,6 +12657,7 @@ export async function main(): Promise<void> {
     // The last beat stays on disk for post-mortems; stopping first keeps a
     // beat taken mid-teardown from recording channels as disconnected.
     heartbeat.stop();
+    clearInterval(traceMaintenance);
     proxyServer?.close();
     await queue.shutdown();
     for (const ch of channels) await ch.disconnect();
@@ -12587,6 +12855,16 @@ export async function main(): Promise<void> {
 
   // Channel callbacks (shared by all channels)
   const channelOpts = {
+    mediaIntake: mediaIntakeForBot,
+    operationTrace: (chatJid: string, messageId: string) => {
+      try {
+        const tenant = currentTenantRegistry().resolveTelegramJid(chatJid);
+        return getOrCreateOperationTrace(getDb(), {
+          tenantId: tenant?.tenant_id || `channel:${eventChannelForJid(chatJid)}`,
+          chatId: chatJid,
+        }, messageId, eventChannelForJid(chatJid) ?? 'other');
+      } catch { return undefined; }
+    },
     onMessage: (chatJid: string, msg: NewMessage) => {
       // An identical WhatsApp redelivery is not new input. Skip it before recording events or dispatching an agent. A later media update with different content still passes through.
       if (
@@ -12645,7 +12923,15 @@ export async function main(): Promise<void> {
           return;
         }
       }
-      storeMessage(enrichedMsg);
+      const trace = channelOpts.operationTrace(chatJid, enrichedMsg.id);
+      const materialize = startOperationTraceStage(trace, 'materialize');
+      try {
+        storeMessage(enrichedMsg);
+        materialize.finish('succeeded');
+      } catch (error) {
+        materialize.finish('failed', { reason: 'storage_failure' });
+        throw error;
+      }
     },
     onChatMetadata: (
       chatJid: string,
@@ -12682,7 +12968,9 @@ export async function main(): Promise<void> {
   }
 
   // Prepare outbound delivery hooks before channels begin receiving events.
-  const router = createMessageRouter(channels);
+  const router = createMessageRouter(channels, {
+    artifactAcceptance: createArtifactAcceptanceDeliveryPolicy(defaultArtifactAcceptanceHost(process.cwd())),
+  });
   router.addPostHook((envelope) => {
     if (outboundEnvelopeAdvancesChatCursor(envelope)) {
       advanceCursorAfterDeliveredIpc(envelope.chatJid);

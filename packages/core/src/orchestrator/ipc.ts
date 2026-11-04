@@ -8,6 +8,7 @@ import { DATA_DIR, GROUPS_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from '../runtimes/container-runner.js';
 import {
   createTask,
+  getDb,
   deleteTask,
   getCalendarEventLink,
   getFinishedTasks,
@@ -42,6 +43,7 @@ import { logger } from './logger.js';
 import { signMemoryWriteRequest } from './memory-provenance.js';
 import { handleMemoryStateWireRequest } from './memory-state-service.js';
 import { notifyRunIpcActivity } from './run-activity.js';
+import { withIpcOperationTrace } from './runtime-operation-trace.js';
 import { readBoundedRegularFileNoFollowSync } from './safe-file-read.js';
 import {
   isMultiSenderRuntimeChat,
@@ -72,6 +74,20 @@ export interface IpcDeps {
 }
 
 let ipcWatcherRunning = false;
+
+function traceAuthorizedIpcDelivery<T>(
+  sourceGroup: string,
+  token: unknown,
+  send: () => Promise<T>,
+): Promise<T> {
+  let database: ReturnType<typeof getDb> | undefined;
+  try {
+    database = getDb();
+  } catch {
+    /* Optional diagnostics never stop delivery. */
+  }
+  return withIpcOperationTrace(database, sourceGroup, token, send);
+}
 
 // Cross-tenant starvation guard: processIpcFiles() is a SINGLE shared loop that
 // scans every group's IPC dirs sequentially and awaits a network send per send
@@ -266,7 +282,9 @@ async function createCalendarEventForTask(input: {
   // recurring one stores a cron expression or a period there, so the first
   // occurrence has to come from the next_run the scheduler already computed.
   const scheduleValue =
-    recurrence.kind === 'single' ? input.task.schedule_value : input.task.next_run;
+    recurrence.kind === 'single'
+      ? input.task.schedule_value
+      : input.task.next_run;
   if (!scheduleValue) return;
 
   try {
@@ -274,7 +292,8 @@ async function createCalendarEventForTask(input: {
       taskId: input.task.id,
       prompt: input.task.prompt,
       scheduleValue,
-      recurrence: recurrence.kind === 'recurring' ? recurrence.rrule : undefined,
+      recurrence:
+        recurrence.kind === 'recurring' ? recurrence.rrule : undefined,
       reminderMinutes: input.reminderMinutes,
     });
     if (!event.id) {
@@ -847,12 +866,17 @@ export function startIpcWatcher(deps: IpcDeps): void {
               if (data.type === 'message' && data.chatJid && data.text) {
                 // Authorization: verify this group can send to this chatJid
                 if (sendAuthorization.authorized) {
-                  const delivered = await deps.router.route({
-                    chatJid: data.chatJid,
-                    text: data.text,
-                    triggerType: 'ipc',
-                    groupFolder: sourceGroup,
-                  });
+                  const delivered = await traceAuthorizedIpcDelivery(
+                    sourceGroup,
+                    data.operationTraceCapability,
+                    () =>
+                      deps.router.route({
+                        chatJid: data.chatJid,
+                        text: data.text,
+                        triggerType: 'ipc',
+                        groupFolder: sourceGroup,
+                      }),
+                  );
                   // Confirmed delivery = useful progress of this group's
                   // active sandbox run that never crosses the child's stdout.
                   // Feed the run's liveness deadlines (no-output / progress in
@@ -913,10 +937,15 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   noteChatFileSendStarted(sourceGroup, sentFileKey);
                   let ok = false;
                   try {
-                    ok = await deps.router.sendPhoto(
-                      data.chatJid,
-                      fileValidation.realPath,
-                      data.caption,
+                    ok = await traceAuthorizedIpcDelivery(
+                      sourceGroup,
+                      data.operationTraceCapability,
+                      () =>
+                        deps.router.sendPhoto(
+                          data.chatJid,
+                          fileValidation.realPath,
+                          data.caption,
+                        ),
                     );
                   } finally {
                     noteChatFileSendFinished(sourceGroup, sentFileKey, ok);
@@ -1005,10 +1034,15 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   noteChatFileSendStarted(sourceGroup, sentFileKey);
                   let ok = false;
                   try {
-                    ok = await deps.router.sendDocument(
-                      data.chatJid,
-                      fileValidation.realPath,
-                      data.caption,
+                    ok = await traceAuthorizedIpcDelivery(
+                      sourceGroup,
+                      data.operationTraceCapability,
+                      () =>
+                        deps.router.sendDocument(
+                          data.chatJid,
+                          fileValidation.realPath,
+                          data.caption,
+                        ),
                     );
                   } finally {
                     noteChatFileSendFinished(sourceGroup, sentFileKey, ok);
@@ -1062,9 +1096,10 @@ export function startIpcWatcher(deps: IpcDeps): void {
                 }
               } else if (data.type === 'voice' && data.chatJid && data.text) {
                 if (sendAuthorization.authorized) {
-                  const ok = await deps.router.sendVoice(
-                    data.chatJid,
-                    data.text,
+                  const ok = await traceAuthorizedIpcDelivery(
+                    sourceGroup,
+                    data.operationTraceCapability,
+                    () => deps.router.sendVoice(data.chatJid, data.text),
                   );
                   // Liveness + transcript placeholder with the spoken text —
                   // the voice note is the whole answer of such a turn, so the
@@ -1596,7 +1631,9 @@ export async function processTaskIpc(
         if (data.prompt !== undefined) updates.prompt = data.prompt;
         if (data.schedule_type !== undefined)
           updates.schedule_type = data.schedule_type as
-            'cron' | 'interval' | 'once';
+            | 'cron'
+            | 'interval'
+            | 'once';
         if (data.schedule_value !== undefined)
           updates.schedule_value = data.schedule_value;
 

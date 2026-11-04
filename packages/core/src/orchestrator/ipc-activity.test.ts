@@ -24,7 +24,17 @@ vi.mock('./config.js', async (importOriginal) => ({
   GROUPS_DIR: '/tmp/claudeclaw-ipc-activity-test/groups',
 }));
 
-import { _initTestDatabase, getRecentConversationMessages } from './db.js';
+import {
+  _initTestDatabase,
+  getDb,
+  getRecentConversationMessages,
+} from './db.js';
+import {
+  currentOperationTrace,
+  bindOperationTraceInputs,
+  registerIpcOperationTrace,
+  withOperationTraceRun,
+} from './runtime-operation-trace.js';
 import { getEventsForTenant } from './event-store.js';
 import {
   ipcDocumentHistoryPlaceholder,
@@ -360,6 +370,59 @@ describe('IPC watcher → run-activity liveness notifications', () => {
     ).toEqual([]);
   });
 
+  it('binds actual IPC routing to the originating attempt and keeps authorization independent', async () => {
+    let token = '',
+      attemptId = '';
+    await withOperationTraceRun('guest@g.us', async () => {
+      bindOperationTraceInputs(
+        getDb(),
+        { tenantId: 'synthetic-ipc', chatId: 'guest@g.us' },
+        ['original'],
+        'whatsapp',
+      );
+      attemptId = currentOperationTrace()!.attemptId!;
+      const binding = registerIpcOperationTrace(GUEST_FOLDER)!;
+      token = binding.token;
+      binding.release();
+    });
+    const observed: Array<{ text: string; attempt: string | undefined }> = [];
+    const original = router.route;
+    router.route = async (envelope) => {
+      observed.push({
+        text: envelope.text,
+        attempt: currentOperationTrace()?.attemptId,
+      });
+      return envelope.text;
+    };
+    try {
+      writeEnvelope(GUEST_FOLDER, 'trace-1.json', {
+        type: 'message',
+        chatJid: 'guest@g.us',
+        text: 'bound',
+        operationTraceCapability: token,
+      });
+      writeEnvelope(GUEST_FOLDER, 'trace-2.json', {
+        type: 'message',
+        chatJid: 'guest@g.us',
+        text: 'unbound',
+        operationTraceCapability: 'b'.repeat(43),
+      });
+      writeEnvelope(GUEST_FOLDER, 'trace-3.json', {
+        type: 'message',
+        chatJid: 'other@g.us',
+        text: 'blocked',
+        operationTraceCapability: token,
+      });
+      vi.advanceTimersByTime(1000);
+      await flushWatcherPass();
+      expect(observed).toEqual([
+        { text: 'bound', attempt: attemptId },
+        { text: 'unbound', attempt: undefined },
+      ]);
+    } finally {
+      router.route = original;
+    }
+  });
 
   // deliveries were never written to messages, so the dashboard chat, the
   // bot's recent_conversation_context and chat_history saw «no answer» after
@@ -446,13 +509,18 @@ describe('IPC watcher → run-activity liveness notifications', () => {
   // saw anything. Now: WARN + an `error` event (kind ipc_delivery_failed);
   // still not a delivery (no liveness signal, nothing in the chat history).
   it('срыв доставки голоса/фото/документа — WARN и событие error ipc_delivery_failed', async () => {
-    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const warnSpy = vi
+      .spyOn(logger, 'warn')
+      .mockImplementation(() => undefined);
     const tenantId = defaultWhatsappTenantId('main');
     const errorEvents = () =>
       getEventsForTenant(tenantId).filter((event) => event.type === 'error');
     const errorsBefore = errorEvents().length;
-    const historyBefore = getRecentConversationMessages('main@g.us', '', 100)
-      .length;
+    const historyBefore = getRecentConversationMessages(
+      'main@g.us',
+      '',
+      100,
+    ).length;
     const livenessBefore = mainEvents.length;
     try {
       const failPhoto = path.join(tmpDir, 'fail-photo.png');

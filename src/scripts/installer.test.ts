@@ -2090,6 +2090,7 @@ esac`,
       } else {
         const outsideEnv = path.join(outside, 'outside.env');
         fs.writeFileSync(outsideEnv, 'KEEP=unchanged\n', { mode: 0o644 });
+        fs.chmodSync(outsideEnv, 0o644);
         fs.symlinkSync(outsideEnv, path.join(instanceDir, '.env'));
       }
       const result = runResult(

@@ -23,6 +23,7 @@ import { spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { createCodexToolObserver, type CodexToolObservation } from './codex-tool-observation.js';
 
 export interface CodexRunnerConfig {
   /** Absolute path to the codex binary (resolved host-side). */
@@ -162,6 +163,8 @@ export interface CodexTurnOptions {
    * silent tool/reasoning item is not mistaken for a wedged process.
    */
   onInFlight?: (count: number) => void;
+  /** Bounded, sanitized CLI tool observations; not semantic outcome evidence. */
+  onToolObservation?: (event: CodexToolObservation) => void;
   /**
    * Промежуточная реплика модели внутри хода — то, что она говорит по дороге
    * («сверяю таблицу», «нашёл три расхождения, продолжаю»).
@@ -2166,6 +2169,7 @@ async function runSingleAttempt(
     activeCodexKillers.add(stopFromRunner);
 
     let stdoutBuf = '';
+    const toolObserver = createCodexToolObserver(options.onToolObservation);
     let stderrTail = '';
     let resolved = false;
     // Which of our own limits stopped the turn (see CodexTurnResult.stopKind).
@@ -2822,6 +2826,7 @@ async function runSingleAttempt(
           onActivity?.();
         }
         if (!event) continue;
+        toolObserver.observe(event);
         recordImageGeneration(parseCodexImageGenerationEvent(event));
         if (event.type === 'thread.started' && event.thread_id) {
           newThreadId = event.thread_id;

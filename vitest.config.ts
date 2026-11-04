@@ -13,6 +13,9 @@ export default defineConfig({
   // package root.
   resolve: {
     alias: {
+      '@skoobi/shared/operation-trace': pkg('shared', 'src', 'operation-trace.ts'),
+      '@skoobi/shared/transcription-result': pkg('shared', 'src', 'transcription-result.ts'),
+      '@skoobi/shared/media-intake': pkg('shared', 'src', 'media-intake.ts'),
       '@skoobi/shared/logger': pkg('shared', 'src', 'logger.ts'),
       '@skoobi/shared/env': pkg('shared', 'src', 'env.ts'),
       '@skoobi/shared/log-sanitize': pkg('shared', 'src', 'log-sanitize.ts'),
@@ -39,6 +42,14 @@ export default defineConfig({
       ),
       '@skoobi/shared': pkg('shared', 'src', 'index.ts'),
       '@skoobi/core/types': pkg('core', 'src', 'orchestrator', 'types.ts'),
+      '@skoobi/core/operation-trace-store': pkg('core', 'src', 'orchestrator', 'operation-trace-store.ts'),
+      '@skoobi/core/media-intake-store': pkg('core', 'src', 'orchestrator', 'media-intake-store.ts'),
+      '@skoobi/core/document-evidence': pkg('core', 'src', 'orchestrator', 'document-evidence.ts'),
+      '@skoobi/core/document-reconciliation': pkg('core', 'src', 'orchestrator', 'document-reconciliation.ts'),
+      '@skoobi/core/memory-semantic-store': pkg('core', 'src', 'orchestrator', 'memory-semantic-store.ts'),
+      '@skoobi/core/artifact-job': pkg('core', 'src', 'orchestrator', 'artifact-job.ts'),
+      '@skoobi/core/artifact-acceptance': pkg('core', 'src', 'orchestrator', 'artifact-acceptance.ts'),
+      '@skoobi/core/artifact-acceptance-policy': pkg('core', 'src', 'orchestrator', 'artifact-acceptance-policy.ts'),
       '@skoobi/core/config': pkg('core', 'src', 'orchestrator', 'config.ts'),
       '@skoobi/core/timezone': pkg('core', 'src', 'orchestrator', 'timezone.ts'),
       '@skoobi/core/router': pkg('core', 'src', 'orchestrator', 'router.ts'),
@@ -111,6 +122,7 @@ export default defineConfig({
       '@skoobi/channel-whatsapp/whatsapp-media': pkg('channel-whatsapp', 'src', 'whatsapp-media.ts'),
       '@skoobi/channel-whatsapp/wiring': pkg('channel-whatsapp', 'src', 'wiring.ts'),
       '@skoobi/channel-whatsapp': pkg('channel-whatsapp', 'src', 'index.ts'),
+      '@skoobi/memory/semantic-retrieval': pkg('memory', 'src', 'semantic-retrieval.ts'),
       '@skoobi/memory/memory-context': pkg('memory', 'src', 'memory-context.ts'),
       '@skoobi/memory/memory-curator': pkg('memory', 'src', 'memory-curator.ts'),
       '@skoobi/memory/user-memory-migration': pkg('memory', 'src', 'user-memory-migration.ts'),

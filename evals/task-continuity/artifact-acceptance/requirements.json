@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "kind": "browser-archive",
+  "entrypoint": "index.html",
+  "initial": { "selector": "#status", "text": "Ready" },
+  "steps": [
+    {
+      "action": "click",
+      "selector": "#next",
+      "expect": { "selector": "#status", "text": "Details" },
+      "path": "details.html"
+    },
+    {
+      "action": "press",
+      "selector": "#confirm",
+      "key": "Enter",
+      "expect": { "selector": "#status", "text": "Complete" }
+    }
+  ]
+}

@@ -141,6 +141,83 @@ async function respond(
   throw new Error('No structured-memory IPC request observed');
 }
 describe('real MCP to authenticated structured-memory service', () => {
+  it('round-trips typed project observations and requested comparison over sealed IPC without mutating on read', async () => {
+    const db = getDb();
+    ensureMemoryStateSchema(db);
+    const scope = {
+      chatJid: 'tg:101',
+      identityId: 'identity-a',
+      tenantId: 'tenant-a',
+    };
+    for (const projectKey of ['alpha', 'beta'])
+      mutateMemoryState(
+        db,
+        scope,
+        {
+          kind: 'project_upsert',
+          operationId: `seed-${projectKey}`,
+          expectedRevision: 0,
+          projectKey,
+          card: {
+            title: `Project ${projectKey}`,
+            goal: 'Synthetic goal',
+            status: 'active',
+            pending: [],
+            completed: [],
+            waiting: null,
+            artifacts: [],
+          },
+        },
+        { kind: 'assistant_report', at: '2026-10-01T00:00:00.000Z' },
+      );
+    await import('../agent/runner/src/ipc-mcp-stdio.js');
+    const pending = handlers.get('memory_state')!({
+      operation: {
+        kind: 'fact_upsert',
+        operationId: 'typed-project-benefit',
+        expectedRevision: 0,
+        projectKey: 'alpha',
+        key: 'benefit',
+        value: 'Synthetic expected benefit',
+        detail: {
+          kind: 'project_value',
+          category: 'expected_benefit',
+          basis: 'expectation',
+        },
+      },
+      source: { kind: 'assistant_report' },
+    });
+    const request = await respond();
+    expect(JSON.stringify(request)).not.toContain('Synthetic expected benefit');
+    expect(await pending).not.toHaveProperty('isError', true);
+    const before = db.serialize();
+    const reading = handlers.get('memory_state_read')!({
+      action: 'compare_projects',
+      projectKeys: ['alpha', 'beta'],
+    });
+    const readRequest = await respond();
+    expect(readRequest).not.toHaveProperty('payload');
+    const result = await reading;
+    expect(result.isError).not.toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      ok: true,
+      data: {
+        kind: 'project_comparison',
+        readOnly: true,
+        projects: [
+          {
+            projectKey: 'alpha',
+            observations: [
+              { category: 'expected_benefit', basis: 'expectation' },
+            ],
+          },
+          { projectKey: 'beta', observations: [] },
+        ],
+      },
+    });
+    expect(db.serialize()).toEqual(before);
+  });
+
   it('round-trips mutation and read without serializing the capability secret', async () => {
     await import('../agent/runner/src/ipc-mcp-stdio.js');
     const write = handlers.get('memory_state')!({

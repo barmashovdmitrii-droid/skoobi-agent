@@ -3,6 +3,14 @@ import { z } from 'zod';
 
 import { getDb } from './db.js';
 import {
+  compareProjectInsights,
+  projectValueDetailSchema,
+} from './project-insights.js';
+import {
+  editorialFeedbackDetailSchema,
+  verifyEditorialMessageArtifact,
+} from './editorial-feedback.js';
+import {
   authenticateMemoryStateRequest,
   signMemoryStateResponse,
   openMemoryStateWireRequest,
@@ -82,6 +90,12 @@ const operationSchema = z.discriminatedUnion('kind', [
         .enum(['fact', 'decision', 'preference', 'permission_note'])
         .optional(),
       validUntil: z.string().datetime().nullable().optional(),
+      detail: z
+        .discriminatedUnion('kind', [
+          projectValueDetailSchema,
+          editorialFeedbackDetailSchema,
+        ])
+        .optional(),
     })
     .strict(),
   z
@@ -94,6 +108,7 @@ const operationSchema = z.discriminatedUnion('kind', [
     })
     .strict(),
 ]);
+
 const sourceSchema = z.discriminatedUnion('kind', [
   z
     .object({
@@ -105,6 +120,16 @@ const sourceSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('assistant_report') }).strict(),
 ]);
 const requestSchema = z.discriminatedUnion('action', [
+  z
+    .object({
+      action: z.literal('compare_projects'),
+      projectKeys: z
+        .array(key.transform((value) => value.normalize('NFKC').toLowerCase()))
+        .min(2)
+        .max(3)
+        .refine((keys) => new Set(keys).size === keys.length),
+    })
+    .strict(),
   z
     .object({
       action: z.literal('mutate'),
@@ -367,6 +392,34 @@ function processMemoryStateRequest(
   };
   try {
     ensureMemoryStateSchema(db);
+    if (payload.action === 'compare_projects') {
+      const projects = payload.projectKeys.map((projectKey) => {
+        let page = getMemoryProjectPage(db, scope, projectKey, {
+          pageSize: 100,
+        });
+        const project = page?.project ?? null;
+        const facts = page?.facts.slice() ?? [];
+        let pages = 1;
+        while (page?.nextCursor && pages < 20) {
+          page = getMemoryProjectPage(db, scope, projectKey, {
+            pageSize: 100,
+            cursor: page.nextCursor,
+          });
+          if (page) facts.push(...page.facts);
+          pages++;
+        }
+        return { projectKey, project, facts, complete: !page?.nextCursor };
+      });
+      const data = compareProjectInsights(projects);
+      if (Buffer.byteLength(JSON.stringify(data)) > 128 * 1024)
+        return deny('memory_result_too_large_select_project');
+      return {
+        type: 'memory_state_result',
+        request_id: auth.requestId,
+        ok: true,
+        data,
+      };
+    }
     if (payload.action === 'list' || payload.action === 'get_project') {
       const data =
         payload.action === 'list'
@@ -482,6 +535,19 @@ function processMemoryStateRequest(
           ? { explicitActivate: true }
           : {}),
       };
+    }
+    if (
+      operation.kind === 'fact_upsert' &&
+      operation.detail?.kind === 'editorial_feedback' &&
+      operation.detail.artifact.kind === 'assistant_message'
+    ) {
+      const evidence = verifyEditorialMessageArtifact(
+        db,
+        context.chatJid,
+        operation.detail.artifact,
+      );
+      if (!evidence) return deny('editorial_artifact_version_mismatch');
+      source.editorialArtifactEvidence = evidence;
     }
     const result = mutateMemoryState(db, scope, operation, source);
     return {

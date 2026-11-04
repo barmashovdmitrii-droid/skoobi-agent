@@ -58,6 +58,18 @@
     "./assistant-name": {
       "types": "./dist/assistant-name.d.ts",
       "default": "./dist/assistant-name.js"
+    },
+    "./media-intake": {
+      "types": "./dist/media-intake.d.ts",
+      "default": "./dist/media-intake.js"
+    },
+    "./operation-trace": {
+      "types": "./dist/operation-trace.d.ts",
+      "default": "./dist/operation-trace.js"
+    },
+    "./transcription-result": {
+      "types": "./dist/transcription-result.d.ts",
+      "default": "./dist/transcription-result.js"
     }
   },
   "scripts": {

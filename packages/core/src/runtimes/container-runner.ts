@@ -241,6 +241,8 @@ export interface ContainerInput {
   senderIdentity?: SenderIdentity;
   /** Host-issued bearer scoped to this exact run identity (not a signing key). */
   memoryWriteCapability?: string;
+  /** Opaque diagnostic correlation; grants no send or other tool authority. */
+  operationTraceCapability?: string;
   /** Ed25519 public verifier; safe to expose to the sandbox. */
   memoryProvenancePublicKey?: string;
   /** Host-issued bearer that can request exact, one-use task-operation grants. */
@@ -305,6 +307,15 @@ export interface LinkCheckRunConfig {
 }
 
 export interface ContainerOutput {
+  /** CLI execution observation only; no arguments, names, output or authority. */
+  toolObservation?: {
+    phase: 'started' | 'finished';
+    callId: string;
+    family: 'shell' | 'file' | 'browser' | 'mcp' | 'other';
+    outcome?: 'succeeded' | 'failed' | 'unknown';
+    startedObserved: boolean;
+    source: 'codex_cli';
+  };
   // 'heartbeat' = liveness-only frame from the agent runner mid-turn; runtimes
   // refresh watchdogs on it but must not treat it as delivered output.
   status: 'success' | 'error' | 'heartbeat';
@@ -423,7 +434,7 @@ export function redactContainerRuntimeDiagnostics(
       '$1[REDACTED]',
     )
     .replace(
-      /("(?:taskAuthorizationCapability|memoryWriteCapability|codexControlRunId|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_CUSTOM_HEADERS)"\s*:\s*")[^"]*(")/gi,
+      /("(?:taskAuthorizationCapability|memoryWriteCapability|operationTraceCapability|codexControlRunId|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_CUSTOM_HEADERS)"\s*:\s*")[^"]*(")/gi,
       '$1[REDACTED]$2',
     )
     .replace(
@@ -1227,6 +1238,7 @@ export async function runContainerAgent(
     proxyIdentityToken,
     input.taskAuthorizationCapability || '',
     input.memoryWriteCapability || '',
+    input.operationTraceCapability || '',
     input.codexControlRunId || '',
     ...containerCredentialEnvironmentValues(containerArgs),
   ];

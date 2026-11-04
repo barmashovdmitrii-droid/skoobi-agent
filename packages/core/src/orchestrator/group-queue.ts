@@ -526,8 +526,9 @@ export class GroupQueue {
     this.longRunTimer = null;
   }
 
-  enqueueMessageCheck(groupJid: string): void {
-    if (this.shuttingDown) return;
+  /** True acknowledges local queue admission, not completion or delivery. */
+  enqueueMessageCheck(groupJid: string): boolean {
+    if (this.shuttingDown) return false;
     const state = this.getGroup(groupJid);
 
     if (state.active) {
@@ -551,7 +552,7 @@ export class GroupQueue {
       // сделано для задач (enqueueTask ниже); порядок важен: сначала пайп,
       // потом закрытие, иначе сообщение потеряется.
       if (state.idleWaiting) this.closeStdin(groupJid);
-      return;
+      return true;
     }
 
     if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
@@ -559,12 +560,13 @@ export class GroupQueue {
       if (!this.waitingGroups.includes(groupJid)) {
         this.waitingGroups.push(groupJid);
       }
-      return;
+      return true;
     }
 
     this.runForGroup(groupJid, 'messages').catch((err) =>
       logger.error({ groupJid, err }, 'Error in runForGroup'),
     );
+    return true;
   }
 
   /**

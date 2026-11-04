@@ -3,6 +3,13 @@ import { tmpdir } from 'os';
 import { dirname, join } from 'path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type {
+  OperationTraceObserver,
+  OperationTraceDetails,
+  OperationTraceStage,
+  OperationTraceOutcome,
+} from '@skoobi/shared/operation-trace';
+import { parseLocalTranscriptionResult } from '@skoobi/shared/transcription-result';
 
 const sharedMocks = vi.hoisted(() => ({
   logger: {
@@ -29,8 +36,10 @@ vi.mock('@skoobi/shared', () => ({
 
 import {
   buildWhisperArgs,
+  runControlledLocalProcess,
   candidateFromWhisperOutput,
   createSerializedLocalTranscriber,
+  createSerializedLocalTranscribers,
   parseAutoLanguageProbability,
   parseWhisperJson,
   retryReasonForAutoCandidate,
@@ -181,6 +190,28 @@ function candidate(
     invalidReason: null,
     ...overrides,
   };
+}
+
+function recordingTrace() {
+  const events: Array<{
+    stage: OperationTraceStage;
+    initial: OperationTraceDetails;
+    outcome?: OperationTraceOutcome;
+    details?: OperationTraceDetails;
+  }> = [];
+  const trace: OperationTraceObserver = {
+    operationIds: ['00000000-0000-4000-8000-000000000001'],
+    startStage(stage, initial = {}) {
+      const event: (typeof events)[number] = { stage, initial };
+      events.push(event);
+      return {
+        finish(outcome, details) {
+          Object.assign(event, { outcome, details });
+        },
+      };
+    },
+  };
+  return { trace, events };
 }
 
 describe('whisper-cli arguments and structured output', () => {
@@ -822,5 +853,741 @@ describe('local prompt, failures, cleanup and serialization', () => {
     await expect(second).resolves.toBe('Второй выполнен.');
     expect(events).toEqual(['first-start', 'first-fail', 'second-start']);
     expect(maxActive).toBe(1);
+  });
+});
+
+describe('local transcription operation trace', () => {
+  it('links the existing bounded rechecks and records only measured metadata', async () => {
+    const source = await sourceFile('private-source.ogg');
+    const secret = 'private words and prompt';
+    const execLocal = localExecForPasses({
+      auto: {
+        text: secret,
+        language: 'ru',
+        languageProbability: 0.6,
+        tokenProbabilities: [0.6],
+      },
+      ru: { text: secret, tokenProbabilities: [0.99] },
+      kk: { text: secret, tokenProbabilities: [0.95] },
+    });
+    const { trace, events } = recordingTrace();
+    const transcribe = createSerializedLocalTranscriber(
+      () => config({ initialPrompt: secret }),
+      execLocal,
+    );
+    await expect(transcribe(source, undefined, trace)).resolves.toBe(secret);
+    expect(
+      execLocal.mock.calls.filter(([name]) => name.includes('whisper')),
+    ).toHaveLength(3);
+    expect(events.map((event) => event.stage)).toEqual([
+      'stt_queue',
+      'stt_preprocess',
+      'ffmpeg',
+      'stt',
+      'stt_recheck',
+      'stt_recheck',
+    ]);
+    expect(events.every((event) => event.outcome === 'succeeded')).toBe(true);
+    expect(
+      events
+        .filter((event) => event.stage === 'stt_recheck')
+        .map((event) => event.initial),
+    ).toEqual([
+      { passIndex: 2, language: 'ru', reason: 'low_language_probability' },
+      { passIndex: 3, language: 'kk', reason: 'low_language_probability' },
+    ]);
+    expect(
+      events.find((event) => event.stage === 'stt')?.details,
+    ).toMatchObject({ language: 'ru', languageProbability: 0.6 });
+    expect(
+      events.find((event) => event.stage === 'stt_preprocess')?.details,
+    ).toEqual({ audioDurationMs: 1000 });
+    expect(JSON.stringify(events)).not.toContain(secret);
+    expect(JSON.stringify(events)).not.toContain(source);
+    expect(JSON.stringify(events)).not.toContain(config().whisperModel);
+  });
+
+  it('records a process timeout without leaking errors or adding a retry', async () => {
+    const { trace, events } = recordingTrace();
+    const execLocal = vi.fn<LocalExecFile>(async (executable, args) => {
+      if (executable.includes('ffmpeg')) {
+        await writeWav(args.at(-1) as string);
+        return { stdout: '', stderr: '' };
+      }
+      throw Object.assign(new Error('private process output'), {
+        code: 'ETIMEDOUT',
+        stderr: 'private process output',
+      });
+    });
+    const transcribe = createSerializedLocalTranscriber(
+      () => config(),
+      execLocal,
+    );
+    await expect(
+      transcribe(await sourceFile(), undefined, trace),
+    ).resolves.toBeNull();
+    expect(events.find((event) => event.stage === 'stt')).toMatchObject({
+      outcome: 'failed',
+      details: { reason: 'process_timeout' },
+    });
+    expect(
+      events.filter((event) => event.stage === 'stt_recheck'),
+    ).toHaveLength(0);
+    expect(execLocal).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(events)).not.toContain('private process output');
+  });
+
+  it('does not let throwing observers break transcription or poison the queue', async () => {
+    const execLocal = localExecForPasses({
+      auto: {
+        text: 'Synthetic text.',
+        language: 'en',
+        languageProbability: 0.99,
+        tokenProbabilities: [0.99],
+      },
+    });
+    const transcribe = createSerializedLocalTranscriber(
+      () => config(),
+      execLocal,
+    );
+    const source = await sourceFile();
+    const throwingStart: OperationTraceObserver = {
+      operationIds: [],
+      startStage() {
+        throw new Error('diagnostics unavailable');
+      },
+    };
+    const throwingFinish: OperationTraceObserver = {
+      operationIds: [],
+      startStage() {
+        return {
+          finish() {
+            throw new Error('diagnostics unavailable');
+          },
+        };
+      },
+    };
+    await expect(
+      Promise.all([
+        transcribe(source, undefined, throwingStart),
+        transcribe(source, undefined, throwingFinish),
+        transcribe(source),
+      ]),
+    ).resolves.toEqual([
+      'Synthetic text.',
+      'Synthetic text.',
+      'Synthetic text.',
+    ]);
+    expect(execLocal).toHaveBeenCalledTimes(6);
+  });
+
+  it('keeps queue waiting separate from STT and releases it after processing failure', async () => {
+    let release!: () => void;
+    let started!: () => void;
+    const block = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const firstStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const successfulExec = localExecForPasses({
+      auto: {
+        text: 'Next.',
+        language: 'en',
+        languageProbability: 0.99,
+        tokenProbabilities: [0.99],
+      },
+    });
+    let first = true;
+    const execLocal: LocalExecFile = async (...args) => {
+      if (first) {
+        first = false;
+        started();
+        await block;
+        throw new Error('first ffmpeg failed');
+      }
+      return successfulExec(...args);
+    };
+    const transcribe = createSerializedLocalTranscriber(
+      () => config(),
+      execLocal,
+    );
+    const source = await sourceFile();
+    const firstTrace = recordingTrace();
+    const secondTrace = recordingTrace();
+    const a = transcribe(source, undefined, firstTrace.trace);
+    await firstStarted;
+    const b = transcribe(source, undefined, secondTrace.trace);
+    await Promise.resolve();
+    expect(secondTrace.events).toEqual([{ stage: 'stt_queue', initial: {} }]);
+    release();
+    await expect(a).resolves.toBeNull();
+    await expect(b).resolves.toBe('Next.');
+    expect(
+      firstTrace.events.find((event) => event.stage === 'ffmpeg'),
+    ).toMatchObject({
+      outcome: 'failed',
+      details: { reason: 'process_failure' },
+    });
+    expect(secondTrace.events[0]).toMatchObject({
+      outcome: 'succeeded',
+      details: { queueWaitMs: expect.any(Number) },
+    });
+    expect(secondTrace.events[0].details?.queueWaitMs).toBeGreaterThanOrEqual(
+      0,
+    );
+  });
+});
+
+describe('bounded local transcription cancellation', () => {
+  it('preserves stdout/stderr and nonzero exit evidence for controlled calls', async () => {
+    const control = {
+      timeout: 3000,
+      signal: new AbortController().signal,
+      maxBuffer: 1024,
+    };
+    await expect(
+      runControlledLocalProcess(
+        process.execPath,
+        [
+          '-e',
+          'process.stdout.write("result");process.stderr.write("diagnostic")',
+        ],
+        control,
+      ),
+    ).resolves.toEqual({ stdout: 'result', stderr: 'diagnostic' });
+    await expect(
+      runControlledLocalProcess(
+        process.execPath,
+        ['-e', 'process.stderr.write("failed");process.exitCode=7'],
+        control,
+      ),
+    ).rejects.toMatchObject({ code: 7, stderr: 'failed' });
+  });
+
+  it('bounds output and terminates a controlled call at its wall timeout', async () => {
+    const signal = new AbortController().signal;
+    await expect(
+      runControlledLocalProcess(
+        process.execPath,
+        [
+          '-e',
+          'process.stdout.write("x".repeat(4096));setInterval(()=>{},1000)',
+        ],
+        { timeout: 3000, signal, maxBuffer: 64 },
+      ),
+    ).rejects.toMatchObject({
+      code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+      stdout: 'x'.repeat(64),
+    });
+    await expect(
+      runControlledLocalProcess(
+        process.execPath,
+        ['-e', 'setInterval(()=>{},1000)'],
+        { timeout: 50, signal, maxBuffer: 64 },
+      ),
+    ).rejects.toMatchObject({ code: 'ETIMEDOUT' });
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'stops a wrapper descendant before the serialized queue advances, even if the wrapper exits first',
+    async () => {
+      const source = await sourceFile();
+      const wrapperReady = join(dirname(source), 'wrapper-ready');
+      const childReady = join(dirname(source), 'child-ready');
+      const heartbeat = join(dirname(source), 'heartbeat');
+      const controller = new AbortController();
+      const childProgram =
+        'const fs=require("node:fs");process.on("SIGTERM",()=>{});fs.writeFileSync(process.argv[1],String(process.pid));fs.writeFileSync(process.argv[2],"tick");setInterval(()=>fs.appendFileSync(process.argv[2],"tick"),10)';
+      const wrapperProgram = `const fs=require("node:fs");process.on("SIGTERM",()=>process.exit(0));fs.writeFileSync(process.argv[1],String(process.pid));require("node:child_process").spawn(process.execPath,["-e",${JSON.stringify(childProgram)},process.argv[2],process.argv[3]],{stdio:"ignore"});setInterval(()=>{},1000)`;
+      const normalExec = localExecForPasses({
+        auto: {
+          text: 'Next result',
+          language: 'en',
+          languageProbability: 0.99,
+          tokenProbabilities: [0.99],
+        },
+      });
+      let first = true;
+      let successorStarted = false;
+      const transcribe = createSerializedLocalTranscriber(
+        () => config(),
+        async (...args) => {
+          if (first) {
+            first = false;
+            return runControlledLocalProcess(
+              process.execPath,
+              ['-e', wrapperProgram, wrapperReady, childReady, heartbeat],
+              { timeout: 10_000, signal: controller.signal, maxBuffer: 1024 },
+            );
+          }
+          successorStarted = true;
+          const before = await fs.readFile(heartbeat, 'utf8');
+          await new Promise((resolve) => setTimeout(resolve, 75));
+          expect(await fs.readFile(heartbeat, 'utf8')).toBe(before);
+          return normalExec(...args);
+        },
+      );
+      let firstSettled = false;
+      const a = transcribe(source, undefined, undefined, {
+        signal: controller.signal,
+        deadlineAtMs: Date.now() + 20_000,
+      }).then((result) => {
+        firstSettled = true;
+        return result;
+      });
+      let wrapperPid: number | undefined;
+      try {
+        const deadline = Date.now() + 3000;
+        while (!(await fs.stat(childReady).catch(() => undefined))) {
+          if (Date.now() > deadline)
+            throw new Error('Synthetic wrapper did not start');
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        wrapperPid = Number(await fs.readFile(wrapperReady, 'utf8'));
+        const b = transcribe(source);
+        controller.abort();
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(() => process.kill(wrapperPid!, 0)).toThrow();
+        expect(firstSettled).toBe(false);
+        expect(successorStarted).toBe(false);
+        await expect(a).resolves.toBeNull();
+        await expect(b).resolves.toBe('Next result');
+        expect(successorStarted).toBe(true);
+      } finally {
+        controller.abort();
+        if (wrapperPid) {
+          try {
+            process.kill(-wrapperPid, 'SIGKILL');
+          } catch {
+            /* group already stopped */
+          }
+        }
+      }
+    },
+    10_000,
+  );
+
+  it('aborts a queued entry without letting its successor overtake active work', async () => {
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let began!: () => void;
+    const started = new Promise<void>((resolve) => {
+      began = resolve;
+    });
+    const exec = localExecForPasses({
+      auto: {
+        text: 'Result',
+        language: 'en',
+        languageProbability: 0.99,
+        tokenProbabilities: [0.99],
+      },
+    });
+    let first = true;
+    const transcribe = createSerializedLocalTranscriber(
+      () => config(),
+      async (...args) => {
+        if (first) {
+          first = false;
+          began();
+          await blocked;
+        }
+        return exec(...args);
+      },
+    );
+    const source = await sourceFile();
+    const a = transcribe(source);
+    await started;
+    const controller = new AbortController();
+    const b = transcribe(source, undefined, undefined, {
+      signal: controller.signal,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    const c = transcribe(source);
+    controller.abort();
+    await expect(b).resolves.toBeNull();
+    expect(exec).not.toHaveBeenCalled();
+    release();
+    await expect(a).resolves.toBe('Result');
+    await expect(c).resolves.toBe('Result');
+    expect(exec).toHaveBeenCalledTimes(4);
+  });
+
+  it('waits for close and escalates when a local child ignores TERM', async () => {
+    const source = await sourceFile('child-ready');
+    await fs.unlink(source);
+    const controller = new AbortController();
+    let completed = false;
+    const result = runControlledLocalProcess(
+      process.execPath,
+      [
+        '-e',
+        'process.on("SIGTERM",()=>{});require("node:fs").writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)',
+        source,
+      ],
+      { timeout: 10_000, signal: controller.signal, maxBuffer: 1024 },
+    ).then(
+      (value) => {
+        completed = true;
+        return value;
+      },
+      (error) => {
+        completed = true;
+        return error as NodeJS.ErrnoException;
+      },
+    );
+    const deadline = Date.now() + 3000;
+    while (!(await fs.stat(source).catch(() => undefined))) {
+      if (Date.now() > deadline)
+        throw new Error('Synthetic child did not start');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const pid = Number(await fs.readFile(source, 'utf8'));
+    try {
+      controller.abort();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(completed).toBe(false);
+      expect(await result).toMatchObject({ code: 'ABORT_ERR' });
+      expect(() => process.kill(pid, 0)).toThrow();
+    } finally {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        /* child already closed */
+      }
+    }
+  }, 10_000);
+});
+
+describe('typed local transcription evidence', () => {
+  it('distinguishes malformed recognizer output from a genuine empty segment list', async () => {
+    expect(parseWhisperJson('{}')).toBeNull();
+    expect(parseWhisperJson('{"transcription":[]}')?.transcript).toBeNull();
+    const exec = localExecForPasses({
+      auto: { text: '', invalidJson: true },
+      ru: { text: '', invalidJson: true },
+      kk: { text: '', invalidJson: true },
+    });
+    const result = await createSerializedLocalTranscribers(
+      () => config(),
+      exec,
+    ).detailed(await sourceFile());
+    expect(result).toMatchObject({
+      status: 'technical_error',
+      error: { stage: 'whisper', code: 'invalid_output', retryable: false },
+    });
+    expect(result.passes).toHaveLength(3);
+    expect(parseLocalTranscriptionResult(result)).toEqual(result);
+  });
+  it('keeps a confident recording on one pass and preserves exact original whitespace', async () => {
+    const original = '  Отправь  файл.\n';
+    const exec = localExecForPasses({
+      auto: {
+        text: original,
+        language: 'ru',
+        languageProbability: 0.99,
+        tokenProbabilities: [0.99],
+      },
+    });
+    const result = await createSerializedLocalTranscribers(
+      () => config(),
+      exec,
+    ).detailed(await sourceFile());
+    expect(result).toMatchObject({
+      status: 'success',
+      text: 'Отправь файл.',
+      originalText: original,
+      selectedPassIndex: 1,
+      recheck: { reason: null, comparison: 'not_run' },
+      uncertainty: [],
+      ambiguities: [],
+    });
+    expect(result.passes).toHaveLength(1);
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(parseLocalTranscriptionResult(result)).toEqual(result);
+  });
+
+  it('retains number, negation and possible-name disagreement instead of declaring the highest score correct', async () => {
+    const exec = localExecForPasses({
+      auto: {
+        text: 'Отправь ПолучателюА 10 рублей.',
+        language: 'ru',
+        languageProbability: 0.4,
+        tokenProbabilities: [0.8],
+      },
+      ru: {
+        text: 'Не отправляй ПолучателюБ 20 рублей.',
+        language: 'ru',
+        tokenProbabilities: [0.99],
+      },
+      kk: {
+        text: 'Синтетикалық сөйлем.',
+        language: 'kk',
+        tokenProbabilities: [0.7],
+      },
+    });
+    const trace = recordingTrace();
+    const result = await createSerializedLocalTranscribers(
+      () => config(),
+      exec,
+    ).detailed(await sourceFile(), undefined, trace.trace);
+    expect(result).toMatchObject({
+      status: 'doubtful',
+      text: 'Не отправляй ПолучателюБ 20 рублей.',
+      originalText: 'Отправь ПолучателюА 10 рублей.',
+      selectedPassIndex: 2,
+      recheck: { reason: 'low_language_probability', comparison: 'different' },
+    });
+    expect(result.uncertainty).toEqual(
+      expect.arrayContaining([
+        'number_disagreement',
+        'negation_disagreement',
+        'possible_name_disagreement',
+      ]),
+    );
+    expect(result.ambiguities.map((item) => item.kind)).toEqual([
+      'number',
+      'negation',
+      'possible_name',
+    ]);
+    expect(result.passes).toHaveLength(3);
+    expect(exec).toHaveBeenCalledTimes(4);
+    expect(parseLocalTranscriptionResult(result)).toEqual(result);
+    expect(JSON.stringify(trace.events)).not.toContain('Получателю');
+    expect(JSON.stringify(trace.events)).not.toContain('рублей');
+  });
+
+  it.each([
+    ['', 'empty'],
+    ['[BLANK_AUDIO]', 'no_speech'],
+  ] as const)(
+    'keeps %s as completed empty input without a quality retry',
+    async (text, emptyReason) => {
+      const exec = localExecForPasses({
+        auto: { text, language: 'ru', languageProbability: 0.99 },
+      });
+      const result = await createSerializedLocalTranscribers(
+        () => config(),
+        exec,
+      ).detailed(await sourceFile());
+      expect(result).toMatchObject({
+        status: 'empty',
+        text: null,
+        originalText: text,
+        emptyReason,
+        passes: [{ index: 1, valid: false }],
+      });
+      expect(exec).toHaveBeenCalledTimes(2);
+      expect(parseLocalTranscriptionResult(result)).toEqual(result);
+    },
+  );
+
+  it('preserves rejected original captions and does not fabricate a transcript after bounded invalid rechecks', async () => {
+    const text = 'Спасибо за просмотр.';
+    const exec = localExecForPasses({
+      auto: { text, language: 'ru', languageProbability: 0.99 },
+      ru: { text, language: 'ru' },
+      kk: { text, language: 'kk' },
+    });
+    const result = await createSerializedLocalTranscribers(
+      () => config(),
+      exec,
+    ).detailed(await sourceFile());
+    expect(result).toMatchObject({
+      status: 'unusable',
+      text: null,
+      originalText: text,
+      recheck: { reason: 'invalid_transcript' },
+    });
+    expect(result.passes).toHaveLength(3);
+    expect(parseLocalTranscriptionResult(result)).toEqual(result);
+  });
+
+  it('uses the existing bounded rechecks for an isolated suspect tail but never cuts the phrase out', async () => {
+    const text = 'Отправь файл. Продолжение следует...';
+    const exec = localExecForPasses({
+      auto: {
+        text,
+        language: 'ru',
+        languageProbability: 0.99,
+        tokenProbabilities: [0.99],
+      },
+      ru: { text, language: 'ru', tokenProbabilities: [0.98] },
+      kk: { text, language: 'kk', tokenProbabilities: [0.97] },
+    });
+    const result = await createSerializedLocalTranscribers(
+      () => config(),
+      exec,
+    ).detailed(await sourceFile());
+    expect(result).toMatchObject({
+      status: 'doubtful',
+      text,
+      originalText: text,
+      recheck: { reason: 'suspect_caption_tail' },
+    });
+    expect(exec).toHaveBeenCalledTimes(4);
+    expect(parseLocalTranscriptionResult(result)).toEqual(result);
+    const ordinary = localExecForPasses({
+      auto: {
+        text: 'Продолжение следует в следующем выпуске.',
+        language: 'ru',
+        languageProbability: 0.99,
+        tokenProbabilities: [0.99],
+      },
+    });
+    expect(
+      (
+        await createSerializedLocalTranscribers(
+          () => config(),
+          ordinary,
+        ).detailed(await sourceFile())
+      ).status,
+    ).toBe('success');
+    expect(ordinary).toHaveBeenCalledTimes(2);
+  });
+
+  it('rechecks a trailing caption cue after substantial speech without sentence punctuation and preserves every candidate', async () => {
+    const text =
+      'Проверь пожалуйста этот черновик и сравни его с исходным документом перед окончательной отправкой Продолжение следует...';
+    const exec = localExecForPasses({
+      auto: {
+        text,
+        language: 'ru',
+        languageProbability: 0.99,
+        tokenProbabilities: [0.99],
+      },
+      ru: { text, language: 'ru', tokenProbabilities: [0.98] },
+      kk: { text, language: 'kk', tokenProbabilities: [0.97] },
+    });
+    const result = await createSerializedLocalTranscribers(
+      () => config(),
+      exec,
+    ).detailed(await sourceFile());
+    expect(result).toMatchObject({
+      status: 'doubtful',
+      text,
+      originalText: text,
+      recheck: { reason: 'suspect_caption_tail' },
+      uncertainty: expect.arrayContaining(['suspect_caption_tail']),
+    });
+    expect(result.passes).toHaveLength(3);
+    expect(result.passes.every((pass) => pass.text === text)).toBe(true);
+    expect(exec).toHaveBeenCalledTimes(4);
+    expect(parseLocalTranscriptionResult(result)).toEqual(result);
+  });
+
+  it.each([
+    'Для нового выпуска нашего небольшого проекта мы вместе заранее придумали понятное короткое название: Продолжение следует...',
+    'Для нового выпуска нашего небольшого проекта мы вместе заранее придумали понятное короткое название Продолжение следует...',
+    'Для нового выпуска нашего небольшого проекта мы вместе заранее придумали название «Продолжение следует...».',
+    'После просмотра нового выпуска нашего небольшого проекта все зрители задали один вопрос: Продолжение следует?',
+    'Мы внимательно прочитали новый выпуск нашего небольшого проекта и уже знаем что продолжение следует...',
+    'Продолжение следует в следующем выпуске, поэтому пока не публикуй окончательный вариант.',
+  ])(
+    'does not add a caption recheck for a title, quotation, question or ordinary use: %s',
+    async (text) => {
+      const exec = localExecForPasses({
+        auto: {
+          text,
+          language: 'ru',
+          languageProbability: 0.99,
+          tokenProbabilities: [0.99],
+        },
+      });
+      const result = await createSerializedLocalTranscribers(
+        () => config(),
+        exec,
+      ).detailed(await sourceFile());
+      expect(result).toMatchObject({
+        status: 'success',
+        text,
+        originalText: text,
+        recheck: { reason: null },
+        uncertainty: [],
+      });
+      expect(result.passes).toHaveLength(1);
+      expect(exec).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each([
+    ['ETIMEDOUT', 'process_timeout', true],
+    ['ENOENT', 'missing_executable', false],
+    ['EACCES', 'access_denied', false],
+  ] as const)(
+    'distinguishes %s from genuine empty speech',
+    async (code, expected, retryable) => {
+      const exec = vi
+        .fn<LocalExecFile>()
+        .mockRejectedValue(
+          Object.assign(new Error('private synthetic error payload'), { code }),
+        );
+      const result = await createSerializedLocalTranscribers(
+        () => config(),
+        exec,
+      ).detailed(await sourceFile());
+      expect(result).toMatchObject({
+        status: 'technical_error',
+        text: null,
+        passes: [],
+        error: { stage: 'ffmpeg', code: expected, retryable },
+      });
+      expect(JSON.stringify(result)).not.toContain(
+        'private synthetic error payload',
+      );
+      expect(parseLocalTranscriptionResult(result)).toEqual(result);
+    },
+  );
+
+  it('shares one queue between detailed and legacy callers and starts no work for queued cancellation', async () => {
+    const exec = localExecForPasses({
+      auto: {
+        text: 'Result',
+        language: 'en',
+        languageProbability: 0.99,
+        tokenProbabilities: [0.99],
+      },
+    });
+    let first = true,
+      started!: () => void,
+      release!: () => void;
+    const ready = new Promise<void>((resolve) => {
+        started = resolve;
+      }),
+      blocked = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    const bundle = createSerializedLocalTranscribers(
+      () => config(),
+      async (...args) => {
+        if (first) {
+          first = false;
+          started();
+          await blocked;
+        }
+        return exec(...args);
+      },
+    );
+    const source = await sourceFile();
+    const a = bundle.legacy(source);
+    await ready;
+    const controller = new AbortController();
+    const b = bundle.detailed(source, undefined, undefined, {
+      signal: controller.signal,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    const c = bundle.detailed(source);
+    controller.abort();
+    expect(await b).toMatchObject({
+      status: 'cancelled',
+      error: { code: 'aborted', retryable: false },
+    });
+    expect(exec).not.toHaveBeenCalled();
+    release();
+    await expect(a).resolves.toBe('Result');
+    expect(await c).toMatchObject({ status: 'success', text: 'Result' });
+    expect(exec).toHaveBeenCalledTimes(4);
   });
 });

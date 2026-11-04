@@ -2,6 +2,32 @@
 
 All notable public changes to Skoobi Agent are documented here.
 
+## 2.2.0
+
+- Added bounded operation timelines linking admitted messages, queued work,
+  model/tool attempts and transport outcomes. Diagnostics do not treat API
+  acknowledgement as human acceptance or replay uncertain external actions.
+- Made Telegram audio intake durable across interruptions, with ordered
+  materialization, cancellation and bounded technical retries. Suspicious
+  transcripts can receive a bounded recheck using the existing speech model.
+- Added an opt-in artifact contract and a macOS producer sandbox with host-run
+  browser scenarios, exact-byte receipts and protected delivery snapshots.
+  Ordinary full-access runs cannot declare themselves isolated; unsupported
+  environments and missing required tools remain explicitly inconclusive.
+- Added a strict PDF/XLSX calculation reconciliation pilot with page/cell
+  evidence, exact decimal arithmetic, independent formula checks and final-file
+  rendering. This does not certify arbitrary layouts or financial correctness.
+- Added source-linked editorial feedback, read-only project comparisons and
+  optional local semantic recall. Search remains scoped to current authorized
+  records; corrections and forgetting invalidate derived indexes. Embedding
+  setup is explicit and does not change speech recognition.
+- Added reproducible skill verification, scoped file undo and a resumable
+  private feature-branch update helper. File undo does not reverse messages,
+  payments or other external actions; public export remains a separate review.
+- Preserved public installation safeguards, optional accounting interfaces,
+  dependency security overrides and existing data. New fixtures are synthetic;
+  operator-specific model pins and private runtime state are not distributed.
+
 ## 2.1.1
 
 - Fixed structured memory writes from Telegram messages whose durable cursor

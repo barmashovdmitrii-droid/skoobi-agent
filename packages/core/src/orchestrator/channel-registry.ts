@@ -12,6 +12,8 @@ import type {
   OwnerAllowlistConfig,
   TenantRegistry,
 } from './tenant-registry.js';
+import type { OperationTraceObserver } from '@skoobi/shared/operation-trace';
+import type { MediaIntakeAdapter } from '@skoobi/shared/media-intake';
 
 /**
  * Initiate a subscription purchase for a plan and return the hosted payform URL.
@@ -36,6 +38,12 @@ export interface ChannelOpts {
   tenantRegistry?: () => TenantRegistry;
   ownerAllowlist?: () => OwnerAllowlistConfig;
   onTelegramCallbackQuery?: OnTelegramCallbackQuery;
+  /** Host-scoped observations only; never an authorization decision. */
+  operationTrace?: (
+    chatJid: string,
+    messageId: string,
+  ) => OperationTraceObserver | undefined;
+  mediaIntake?: (botId?: string) => MediaIntakeAdapter | undefined;
 }
 
 export type ChannelFactory = (opts: ChannelOpts) => Channel | null;

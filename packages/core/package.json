@@ -39,6 +39,14 @@
       "types": "./dist/orchestrator/event-store.d.ts",
       "default": "./dist/orchestrator/event-store.js"
     },
+    "./artifact-acceptance": {
+      "types": "./dist/orchestrator/artifact-acceptance.d.ts",
+      "default": "./dist/orchestrator/artifact-acceptance.js"
+    },
+    "./artifact-acceptance-policy": {
+      "types": "./dist/orchestrator/artifact-acceptance-policy.d.ts",
+      "default": "./dist/orchestrator/artifact-acceptance-policy.js"
+    },
     "./db": {
       "types": "./dist/orchestrator/db.d.ts",
       "default": "./dist/orchestrator/db.js"
@@ -178,6 +186,30 @@
     "./cost-tracking": {
       "types": "./dist/cost-tracking/index.d.ts",
       "default": "./dist/cost-tracking/index.js"
+    },
+    "./operation-trace-store": {
+      "types": "./dist/orchestrator/operation-trace-store.d.ts",
+      "default": "./dist/orchestrator/operation-trace-store.js"
+    },
+    "./media-intake-store": {
+      "types": "./dist/orchestrator/media-intake-store.d.ts",
+      "default": "./dist/orchestrator/media-intake-store.js"
+    },
+    "./document-evidence": {
+      "types": "./dist/orchestrator/document-evidence.d.ts",
+      "default": "./dist/orchestrator/document-evidence.js"
+    },
+    "./document-reconciliation": {
+      "types": "./dist/orchestrator/document-reconciliation.d.ts",
+      "default": "./dist/orchestrator/document-reconciliation.js"
+    },
+    "./artifact-job": {
+      "types": "./dist/orchestrator/artifact-job.d.ts",
+      "default": "./dist/orchestrator/artifact-job.js"
+    },
+    "./memory-semantic-store": {
+      "types": "./dist/orchestrator/memory-semantic-store.d.ts",
+      "default": "./dist/orchestrator/memory-semantic-store.js"
     }
   },
   "scripts": {

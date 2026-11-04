@@ -1,4 +1,6 @@
 import { createHash } from 'crypto';
+import { startOperationTraceStage, type OperationTraceSpan } from '@skoobi/shared/operation-trace';
+import { currentOperationTrace } from './runtime-operation-trace.js';
 
 import { z } from 'zod';
 
@@ -835,6 +837,7 @@ export async function executeToolCall(
   const senderId = input.session?.senderId || null;
   const argsHash = stableHash(call.data.arguments_json || '');
   const parsedArgs = parseArguments(call.data.arguments_json);
+  let executionTrace: OperationTraceSpan | undefined;
 
   try {
     if (decision.requires_approval) {
@@ -873,11 +876,13 @@ export async function executeToolCall(
     if (!definition?.execute || !parsedArgs.args) {
       throw new Error('No executor is registered for this tool');
     }
+    executionTrace = startOperationTraceStage(currentOperationTrace(), 'tool', { toolFamily: 'mcp' });
     const rawResult = await definition.execute(parsedArgs.args, {
       tenant: input.tenant,
       session: input.session,
       call: call.data,
     });
+    executionTrace.finish('succeeded');
     // Scrub declared-sensitive fields before the result leaves the executor or
     // hits the audit log (finding: redactions declared but never applied).
     const result = applyRedactions(rawResult, decision.redactions);
@@ -908,6 +913,7 @@ export async function executeToolCall(
     });
     return { executed: true, decision, result };
   } catch (err) {
+    executionTrace?.finish('unknown', { reason: 'outcome_unknown' });
     const message = err instanceof Error ? err.message : String(err);
     const event = recordTenantEvent({
       tenant: input.tenant,
