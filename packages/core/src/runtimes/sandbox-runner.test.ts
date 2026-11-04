@@ -1220,6 +1220,7 @@ describe('guest macOS non-enumerative Seatbelt boundary', () => {
       LATE_ENV: lateEnv,
       EXPECTED_WRAPPER_DIR: GUEST_SANDBOX_EXEC_WRAPPER_DIR,
     };
+    // Bound each native launch; 3 sequential launches plus cleanup fit the test budget.
     try {
       const allowed = spawnSync(
         srt,
@@ -1229,8 +1230,10 @@ describe('guest macOS non-enumerative Seatbelt boundary', () => {
           '-c',
           'cat "$ALLOWED_FILE" && printf created > "$ALLOWED_DIR/new.tmp" && mv "$ALLOWED_DIR/new.tmp" "$ALLOWED_DIR/new.txt" && rm "$ALLOWED_DIR/new.txt" && test -z "${CLAUDECLAW_GUEST_SEATBELT_POLICY_B64:-}" && case "$PATH" in "$EXPECTED_WRAPPER_DIR":*) exit 91;; esac',
         ],
-        { env, encoding: 'utf8' },
+        { env, encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' },
       );
+      expect(allowed.error).toBeUndefined();
+      expect(allowed.signal).toBeNull();
       expect(allowed.status, allowed.stderr).toBe(0);
       expect(allowed.stdout).toBe('VISIBLE');
       expect(fs.existsSync(path.join(allowedDir, 'new.txt'))).toBe(false);
@@ -1238,22 +1241,26 @@ describe('guest macOS non-enumerative Seatbelt boundary', () => {
       const siblingRead = spawnSync(
         srt,
         ['-s', settingsPath, '-c', 'cat "$LATE_SIBLING"'],
-        { env, encoding: 'utf8' },
+        { env, encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' },
       );
+      expect(siblingRead.error).toBeUndefined();
+      expect(siblingRead.signal).toBeNull();
       expect(siblingRead.status).not.toBe(0);
       expect(siblingRead.stdout).not.toContain('LATE_SIBLING_SECRET');
 
       const envRead = spawnSync(
         srt,
         ['-s', settingsPath, '-c', 'cat "$LATE_ENV"'],
-        { env, encoding: 'utf8' },
+        { env, encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' },
       );
+      expect(envRead.error).toBeUndefined();
+      expect(envRead.signal).toBeNull();
       expect(envRead.status).not.toBe(0);
       expect(envRead.stdout).not.toContain('LATE_ENV_SECRET');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 40_000);
 
   it('real macOS full wrapper keeps downgraded canonical received readable without opening its group', () => {
     if (process.platform !== 'darwin') return;
@@ -1469,6 +1476,7 @@ describe('guest macOS non-enumerative Seatbelt boundary', () => {
       FUTURE_NEW: path.join(futureSibling, 'new.txt'),
     };
 
+    // Bound each native launch; 6 sequential launches plus cleanup fit the test budget.
     try {
       const childReadWrite = spawnSync(
         srt,
@@ -1478,8 +1486,10 @@ describe('guest macOS non-enumerative Seatbelt boundary', () => {
           '-c',
           'test "$(cat "$AUTH")" = AUTH_OK && printf "model = test\\n" > "$CONFIG" && mkdir "$CHILD_TMP" && printf x > "$CHILD_TMP/a" && mv "$CHILD_TMP/a" "$CHILD_TMP/b" && rm "$CHILD_TMP/b"',
         ],
-        { env, encoding: 'utf8' },
+        { env, encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' },
       );
+      expect(childReadWrite.error).toBeUndefined();
+      expect(childReadWrite.signal).toBeNull();
       expect(childReadWrite.status, childReadWrite.stderr).toBe(0);
       expect(fs.readFileSync(config, 'utf8')).toBe('model = test\n');
 
@@ -1490,8 +1500,15 @@ describe('guest macOS non-enumerative Seatbelt boundary', () => {
         const denied = spawnSync(
           srt,
           ['-s', settingsPath, '-c', 'cat "$READ_PATH"'],
-          { env: { ...env, READ_PATH: readPath }, encoding: 'utf8' },
+          {
+            env: { ...env, READ_PATH: readPath },
+            encoding: 'utf8',
+            timeout: 10_000,
+            killSignal: 'SIGKILL',
+          },
         );
+        expect(denied.error).toBeUndefined();
+        expect(denied.signal).toBeNull();
         expect(denied.status).not.toBe(0);
         expect(denied.stdout).not.toContain(secret);
       }
@@ -1499,23 +1516,32 @@ describe('guest macOS non-enumerative Seatbelt boundary', () => {
       const parentRead = spawnSync(
         srt,
         ['-s', settingsPath, '-c', 'ls "$PARENT"'],
-        { env, encoding: 'utf8' },
+        { env, encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' },
       );
+      expect(parentRead.error).toBeUndefined();
+      expect(parentRead.signal).toBeNull();
       expect(parentRead.status).not.toBe(0);
 
       for (const writePath of [env.SIBLING_NEW, env.FUTURE_NEW]) {
         const denied = spawnSync(
           srt,
           ['-s', settingsPath, '-c', 'printf denied > "$WRITE_PATH"'],
-          { env: { ...env, WRITE_PATH: writePath }, encoding: 'utf8' },
+          {
+            env: { ...env, WRITE_PATH: writePath },
+            encoding: 'utf8',
+            timeout: 10_000,
+            killSignal: 'SIGKILL',
+          },
         );
+        expect(denied.error).toBeUndefined();
+        expect(denied.signal).toBeNull();
         expect(denied.status).not.toBe(0);
         expect(fs.existsSync(writePath)).toBe(false);
       }
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 70_000);
 });
 
 // ---------------------------------------------------------------------------
