@@ -16,8 +16,8 @@ async function start(): Promise<void> {
   // Канал: только Telegram (саморегистрация side-effect'ом импорта wiring).
   await import('@skoobi/channel-telegram/wiring');
 
-  // Встроенные extensions ядра (учёт стоимости агент-ранов, webhook-схема).
-  await import('@skoobi/core/cost-tracking');
+  // Встроенные extensions ядра (телеметрия агент-ранов, webhook-схема).
+  await import('@skoobi/core/run-telemetry');
   await import('@skoobi/core/webhook');
 
   // Load optional extensions from the configured code root.

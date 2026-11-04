@@ -6,6 +6,8 @@ import { execFile } from 'child_process';
 import { fileURLToPath } from 'url';
 import { promisify } from 'util';
 import { Api, Bot, InputFile } from 'grammy';
+import type { ReactionTypeEmoji } from 'grammy/types';
+import { ProgressMessages } from './progress-message.js';
 
 import {
   ASSISTANT_NAME,
@@ -157,10 +159,6 @@ export interface TelegramChannelHost {
     ownerAllowlist?: OwnerAllowlistConfig;
   }): boolean;
   privateAdminClosedBotText(): string;
-  captionPhoto(
-    photoPath: string,
-    costMeta?: { groupFolder?: string; chatJid?: string },
-  ): Promise<string | null>;
 }
 
 const execFileAsync = promisify(execFile);
@@ -518,24 +516,338 @@ function renderAdminContact(text: string): string {
  * Claude's output naturally matches Telegram's Markdown v1 format:
  *   *bold*, _italic_, `code`, ```code blocks```, [links](url)
  */
+/**
+ * Telegram Markdown v1 silently EATS intra-word `_`
+ * and `*`. `some_file_name.py` parses fine — Telegram just renders "file name"
+ * in italics and drops both underscores — so the existing parse-error fallback
+ * below never fires and the reader cannot tell anything was removed. It is
+ * exactly file paths, column names and identifiers that get corrupted.
+ *
+ * Escape those markers, and ONLY those: a marker is rewritten only when it sits
+ * between two word characters (i.e. inside a token), never when it delimits
+ * prose. Deliberately additive — intentional *bold*, _italic_, `code` and
+ * ```fences``` are untouched, and text inside code spans/fences is skipped
+ * entirely because it is already rendered literally.
+ */
+/** Commands registered on the bot — see the `this.bot.command(...)` calls. */
+const HANDLED_BOT_COMMANDS = new Set([
+  'ban', 'chatid', 'cleanup', 'engine', 'health', 'help', 'keep', 'language',
+  'lastseen', 'limits', 'pause', 'pending', 'ping', 'resume',
+  'start', 'stats', 'status', 'storage', 'users',
+  'limit', 'balance', 'subscribe', 'tariffs', 'pay',
+]);
+
+/**
+ * True only for a real, registered slash command (bot_command entity at offset
+ * 0).
+ */
+export function isHandledBotCommand(message: {
+  text?: string;
+  entities?: readonly { type: string; offset: number; length: number }[];
+}): boolean {
+  const text = message.text;
+  if (!text) return false;
+  const first = message.entities?.[0];
+  if (!first || first.type !== 'bot_command' || first.offset !== 0) return false;
+  // `/status@SkoobiBot` → `status`
+  const name = text
+    .slice(1, first.length)
+    .split('@')[0]
+    .toLowerCase();
+  return HANDLED_BOT_COMMANDS.has(name);
+}
+
+/**
+ * Rewrite CommonMark emphasis into the dialect Telegram's legacy `Markdown`
+ * parse mode actually understands: `*bold*`, `_italic_` — one delimiter, not two.
+ *
+ * The model writes `**жирный**`, which legacy Markdown cannot render, so the
+ * asterisks would otherwise reach the chat as literal characters.
+ *
+ * Code fences and inline code are split out first and left byte-for-byte —
+ * asterisks inside a snippet are content, not formatting. Empty emphasis
+ * (`****`) is left alone rather than collapsed: it is not markup either way,
+ * and rewriting it risks producing an empty entity, which Telegram rejects
+ * outright.
+ */
+export function normalizeMarkdownForTelegram(text: string): string {
+  const parts = normalizeTelegramBlocks(text).split(
+    /(```[\s\S]*?```|`[^`\n]*`)/g,
+  );
+  return parts
+    .map((part, i) =>
+      i % 2 === 1
+        ? part
+        : part
+            // ***bold italic*** → *_bold italic_*
+            .replace(/\*\*\*([^\s*](?:[\s\S]*?[^\s*])?)\*\*\*/g, '*_$1_*')
+            .replace(/\*\*([^\s*](?:[\s\S]*?[^\s*])?)\*\*/g, '*$1*')
+            .replace(/__([^\s_](?:[\s\S]*?[^\s_])?)__/g, '_$1_'),
+    )
+    .join('');
+}
+
+/**
+ * Rewrite the block-level CommonMark that legacy `Markdown` cannot render into
+ * something that reads well in a chat bubble. Tables, `###` headings and `>`
+ * quotes otherwise appear as raw pipes, hashes and angle brackets.
+ *
+ * - a GFM table (header row + `|---|` separator) becomes one `• first — rest`
+ *   line per data row; with more than two columns the header names label the
+ *   values (`Цена: 5 000 ₸ · Срок: 2 дня`);
+ * - a heading becomes a bold line (`**…**`, normalised to `*…*` downstream);
+ * - a quote marker (`>` or an HTML-escaped `&gt;`) becomes `» `.
+ *
+ * Code fences are left byte-for-byte. Idempotent: its own output contains no
+ * tables, headings or quote markers.
+ */
+export function normalizeTelegramBlocks(text: string): string {
+  const parts = text.split(/(```[\s\S]*?```)/g);
+  return parts
+    .map((part, i) => (i % 2 === 1 ? part : normalizeTelegramProseBlocks(part)))
+    .join('');
+}
+
+const TELEGRAM_TABLE_SEPARATOR_ROW =
+  /^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$/;
+
+function isTelegramTableRow(line: string): boolean {
+  const trimmed = line.trim();
+  return trimmed.startsWith('|') && trimmed.indexOf('|', 1) > 0;
+}
+
+function splitTelegramTableRow(line: string): string[] {
+  let body = line.trim();
+  if (body.startsWith('|')) body = body.slice(1);
+  if (body.endsWith('|')) body = body.slice(0, -1);
+  return body.split('|').map((cell) => cell.trim());
+}
+
+function telegramTableToLines(rows: string[]): string[] {
+  const header = splitTelegramTableRow(rows[0]);
+  const out: string[] = [];
+  for (const row of rows.slice(2)) {
+    if (TELEGRAM_TABLE_SEPARATOR_ROW.test(row)) continue;
+    const cells = splitTelegramTableRow(row);
+    if (cells.every((cell) => !cell)) continue;
+    const [first, ...rest] = cells;
+    const labelled = rest
+      .map((value, idx) => {
+        if (!value) return '';
+        const label = header[idx + 1];
+        return rest.length > 1 && label ? `${label}: ${value}` : value;
+      })
+      .filter(Boolean);
+    const tail = labelled.join(' · ');
+    if (first && tail) out.push(`• ${first} — ${tail}`);
+    else out.push(`• ${first || tail}`);
+  }
+  return out;
+}
+
+function normalizeTelegramProseBlocks(text: string): string {
+  const lines = text.split('\n');
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (
+      isTelegramTableRow(line) &&
+      i + 1 < lines.length &&
+      TELEGRAM_TABLE_SEPARATOR_ROW.test(lines[i + 1]) &&
+      lines[i + 1].includes('|')
+    ) {
+      let end = i + 2;
+      while (end < lines.length && isTelegramTableRow(lines[end])) end++;
+      out.push(...telegramTableToLines(lines.slice(i, end)));
+      i = end - 1;
+      continue;
+    }
+    const heading = /^ {0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$/.exec(line);
+    if (heading) {
+      const title = heading[1].replace(/\*+/g, '').trim();
+      out.push(title ? `**${title}**` : line);
+      continue;
+    }
+    const quote = /^ {0,3}(?:(?:>|&gt;)[ \t]?)+(.*)$/.exec(line);
+    // «> 100 000 ₸» / «>5 мин» mean "more than", not a quote.
+    if (quote && !/^[\d.,+\-−–]/.test(quote[1])) {
+      out.push(quote[1].trim() ? `» ${quote[1]}` : '');
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
+/**
+ * What to send when Telegram rejects the Markdown: the same text with the
+ * CommonMark emphasis markers dropped, so the fallback does not show `**` and
+ * raw tables either.
+ */
+export function plainTelegramText(text: string): string {
+  const parts = normalizeTelegramBlocks(text).split(
+    /(```[\s\S]*?```|`[^`\n]*`)/g,
+  );
+  return parts
+    .map((part, i) =>
+      i % 2 === 1
+        ? part
+        : part
+            .replace(/\*\*\*([^\s*](?:[\s\S]*?[^\s*])?)\*\*\*/g, '$1')
+            .replace(/\*\*([^\s*](?:[\s\S]*?[^\s*])?)\*\*/g, '$1')
+            .replace(/__([^\s_](?:[\s\S]*?[^\s_])?)__/g, '$1'),
+    )
+    .join('');
+}
+
+/**
+ * Split a long answer into Telegram-sized messages at a paragraph, then line,
+ * then word boundary. A blind 4096-character slice cut words and formatting
+ * entities in half, and a cut entity sent the whole part down the plain-text
+ * fallback.
+ */
+export function splitTelegramText(text: string, maxLength = 3900): string[] {
+  // One message whenever it fits once formatted; only a real overflow is cut,
+  // and then with a margin for the escapes added per part.
+  if (
+    escapeIntraWordMarkdown(normalizeMarkdownForTelegram(text)).length <= 4096
+  ) {
+    return text.trim() ? [text] : [];
+  }
+  const chunks: string[] = [];
+  let rest = text;
+  while (rest.length > maxLength) {
+    const window = rest.slice(0, maxLength);
+    let cut = window.lastIndexOf('\n\n');
+    if (cut < maxLength / 2) cut = window.lastIndexOf('\n');
+    if (cut < maxLength / 2) cut = window.lastIndexOf(' ');
+    if (cut <= 0) cut = maxLength;
+    chunks.push(rest.slice(0, cut).trimEnd());
+    rest = rest.slice(cut).replace(/^\s+/, '');
+  }
+  if (rest.trim()) chunks.push(rest);
+  return chunks.filter((chunk) => chunk.trim());
+}
+
+/** The Bot API's getFile refuses anything larger ("file is too big"). */
+export const TELEGRAM_BOT_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024;
+
+/**
+ * Explain when a file exceeds the Bot API download limit instead of reporting
+ * a generic processing failure. The size check needs no network call.
+ */
+export function telegramOversizePlaceholder(
+  label: string,
+  fileSize: number | undefined,
+): string | null {
+  if (!fileSize || fileSize <= TELEGRAM_BOT_DOWNLOAD_LIMIT_BYTES) return null;
+  const mb = Math.round(fileSize / (1024 * 1024));
+  return (
+    `[${label} — ${mb} MB, not downloaded: the Telegram Bot API refuses files ` +
+    'over 20 MB, so its content is unknown — do not guess it. Ask for a cloud ' +
+    'link (Yandex Disk, Google Drive, iCloud) or a part under 20 MB]'
+  );
+}
+
+/**
+ * A `[text](url)` link exactly as legacy Markdown reads it: the text up to the
+ * first `]`, the URL up to the first `)`.
+ */
+const TELEGRAM_MARKDOWN_LINK = /(\[[^\]\n]*\]\([^\s)]*\))/g;
+
+/**
+ * A `[text](url)` link whose URL holds balanced parentheses
+ * (`…/wiki/Foo_(bar)`) — read the way the runner's link check reads it.
+ */
+const MARKDOWN_LINK_WITH_PARENS =
+  /\[([^\]\n]*)\]\(([^\s()]*(?:\([^\s()]*\)[^\s()]*)+)\)/g;
+
+/**
+ * Legacy Markdown ends a link's URL at the first `)` and has no escape for
+ * it: `[Меркурий](https://ru.wikipedia.org/wiki/Меркурий_(планета))` went out
+ * as a link to `…Меркурий_(планета` plus a stray `)`, while the link check had
+ * opened the full address and called it fine. Inside the URL the parentheses
+ * become %28/%29 — the same address for the site — so the whole URL arrives.
+ */
+export function encodeMarkdownLinkParens(text: string): string {
+  return text.replace(
+    MARKDOWN_LINK_WITH_PARENS,
+    (_m, label: string, url: string) =>
+      `[${label}](${url.replace(/\(/g, '%28').replace(/\)/g, '%29')})`,
+  );
+}
+
+/**
+ * Escape `_`/`*` inside words (`some_file_name`) so Telegram does not take
+ * them for italics/bold. Code and `[text](url)` links are left verbatim, but
+ * for parentheses inside a link's URL (encodeMarkdownLinkParens).
+ *
+ * Legacy Markdown copies a link's text and URL raw — a backslash there is not
+ * an escape but a character. A backslash in an escaped URL can be interpreted
+ * as a path separator by a browser. A bare URL keeps the escape: outside an
+ * entity Telegram removes the backslash, while a raw `_` could open italics.
+ */
+export function escapeIntraWordMarkdown(text: string): string {
+  // Split on code fences and inline code so their contents are left verbatim.
+  const parts = text.split(/(```[\s\S]*?```|`[^`\n]*`)/g);
+  return parts
+    .map((part, i) =>
+      i % 2 === 1
+        ? part
+        : encodeMarkdownLinkParens(part)
+            .split(TELEGRAM_MARKDOWN_LINK)
+            .map((piece, j) =>
+              j % 2 === 1
+                ? piece
+                : piece.replace(
+                    /(?<=\w)([_*])(?=\w)/g,
+                    (_m, ch: string) => `\\${ch}`,
+                  ),
+            )
+            .join(''),
+    )
+    .join('');
+}
+
 async function sendTelegramMessage(
   api: { sendMessage: Api['sendMessage'] },
   chatId: string | number,
   text: string,
   options: { message_thread_id?: number } = {},
 ): Promise<void> {
+  // Nothing to say. Telegram rejects a blank message with a 400, which used to
+  // surface as an outbound delivery failure and hold the cursor back so the
+  // whole turn was retried.
+  if (!text.trim()) {
+    logger.debug({ chatId }, 'Skipping empty Telegram message');
+    return;
+  }
+  const formatted = escapeIntraWordMarkdown(normalizeMarkdownForTelegram(text));
+  if (!formatted.trim()) {
+    // Formatting emptied it (a bare «>»): send it exactly as written.
+    await api.sendMessage(chatId, text, options);
+    return;
+  }
   try {
-    await api.sendMessage(chatId, text, {
+    await api.sendMessage(chatId, formatted, {
       ...options,
       parse_mode: 'Markdown',
     });
   } catch (err) {
-    if (!isTelegramMarkdownParseError(err)) throw err;
+    // A one-character answer that is nothing but markdown punctuation ("*",
+    // "_", "`") survives the trim above but renders to nothing once Telegram
+    // parses the entities, and the resulting "text must be non-empty" is NOT a
+    // parse error — so it used to bypass this fallback and fail the delivery.
+    // Observed on real turns: an agent output of exactly one character.
+    if (!isTelegramMarkdownParseError(err) && !isTelegramEmptyTextError(err)) {
+      throw err;
+    }
     logger.debug(
       { err: sanitizeTelegramError(err) },
       'Markdown send failed, falling back to plain text',
     );
-    await api.sendMessage(chatId, text, options);
+    const plain = plainTelegramText(text);
+    await api.sendMessage(chatId, plain.trim() ? plain : text, options);
   }
 }
 
@@ -569,27 +881,96 @@ function isTelegramMarkdownParseError(err: unknown): boolean {
   return /can't parse entities|parse entities|markdown/i.test(text);
 }
 
+/** Telegram's 400 for a message whose text is empty after entity parsing. */
+function isTelegramEmptyTextError(err: unknown): boolean {
+  const anyErr = err as {
+    message?: unknown;
+    description?: unknown;
+    error?: { description?: unknown };
+  };
+  const text = [
+    anyErr?.message,
+    anyErr?.description,
+    anyErr?.error?.description,
+  ]
+    .filter(Boolean)
+    .join(' ');
+  return /text must be non-empty/i.test(text);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+/**
+ * A send that failed on the way (Wi-Fi drop, DNS, Telegram 5xx) rather than
+ * on Telegram's verdict. Before, only 429 was retried: any other failure
+ * failed the delivery, and the host then re-ran the WHOLE model turn to
+ * produce the answer again.
+ */
+export function isTelegramTransientSendError(err: unknown): boolean {
+  const anyErr = err as {
+    name?: unknown;
+    message?: unknown;
+    error_code?: unknown;
+    error?: { message?: unknown; code?: unknown };
+  };
+  const code = Number(anyErr?.error_code);
+  if (Number.isFinite(code) && code >= 500 && code < 600) return true;
+  if (anyErr?.name === 'HttpError') return true;
+  const text = [anyErr?.message, anyErr?.error?.message, anyErr?.error?.code]
+    .filter(Boolean)
+    .join(' ');
+  return /Network request for '[^']+' failed|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|socket hang up|fetch failed|Bad Gateway|Gateway Timeout|Internal Server Error/i.test(
+    text,
+  );
+}
+
+/** Waits before re-sending after a transient failure (see above). */
+export const TELEGRAM_TRANSIENT_SEND_RETRY_DELAYS_MS: readonly number[] = [
+  1500, 4000, 8000,
+];
 
 async function sendTelegramMessageWithRetry(
   api: { sendMessage: Api['sendMessage'] },
   chatId: string | number,
   text: string,
   options: { message_thread_id?: number } = {},
+  transientDelaysMs: readonly number[] = TELEGRAM_TRANSIENT_SEND_RETRY_DELAYS_MS,
 ): Promise<void> {
-  try {
-    await sendTelegramMessage(api, chatId, text, options);
-  } catch (err) {
-    const retryAfter = telegramRetryAfterSeconds(err);
-    if (retryAfter === null) throw err;
-    logger.warn(
-      { retryAfter, err: sanitizeTelegramError(err) },
-      'Telegram rate limited message send, retrying once',
-    );
-    await sleep(retryAfter * 1000);
-    await sendTelegramMessage(api, chatId, text, options);
+  let transientAttempt = 0;
+  let rateLimitRetried = false;
+  for (;;) {
+    try {
+      await sendTelegramMessage(api, chatId, text, options);
+      return;
+    } catch (err) {
+      const retryAfter = telegramRetryAfterSeconds(err);
+      if (retryAfter !== null && !rateLimitRetried) {
+        rateLimitRetried = true;
+        logger.warn(
+          { retryAfter, err: sanitizeTelegramError(err) },
+          'Telegram rate limited message send, retrying once',
+        );
+        await sleep(retryAfter * 1000);
+        continue;
+      }
+      if (
+        retryAfter === null &&
+        isTelegramTransientSendError(err) &&
+        transientAttempt < transientDelaysMs.length
+      ) {
+        const delay = transientDelaysMs[transientAttempt];
+        transientAttempt += 1;
+        logger.warn(
+          { attempt: transientAttempt, delay, err: sanitizeTelegramError(err) },
+          'Telegram send failed on the network, retrying',
+        );
+        await sleep(delay);
+        continue;
+      }
+      throw err;
+    }
   }
 }
 
@@ -1436,12 +1817,36 @@ export function telegramMessageTimestamp(ctx: any): string {
   return base.replace('.000Z', `.500${sequence}Z`);
 }
 
+/**
+ * A forward whose original author is this very bot, or the forwarding user
+ * themselves, carries no third party's words. The watchdog sends its alerts
+ * through the bot's own token, so "forward the alert and say fix it" lands
+ * here. Telegram sets forward_origin server-side; a user cannot forge it.
+ *
+ * Bot-authored forwards should remain usable as context for owner requests.
+ */
+function isSelfAuthoredForward(ctx: any, origin: any): boolean {
+  if (origin?.type !== 'user') return false;
+  const senderId = origin.sender_user?.id;
+  if (senderId === undefined || senderId === null) return false;
+  const botId = ctx.me?.id;
+  if (
+    botId !== undefined &&
+    botId !== null &&
+    origin.sender_user?.is_bot === true &&
+    String(senderId) === String(botId)
+  ) {
+    return true;
+  }
+  const fromId = ctx.from?.id;
+  return fromId !== undefined && fromId !== null && String(senderId) === String(fromId);
+}
+
 function telegramMessageOriginForContext(
   ctx: any,
 ): 'direct' | 'forwarded' | 'quoted' {
   const message = ctx.message;
   if (
-    message?.forward_origin != null ||
     message?.is_automatic_forward === true ||
     message?.via_bot != null ||
     message?.sender_business_bot != null ||
@@ -1449,11 +1854,18 @@ function telegramMessageOriginForContext(
   ) {
     return 'forwarded';
   }
+  if (
+    message?.forward_origin != null &&
+    !isSelfAuthoredForward(ctx, message.forward_origin)
+  ) {
+    return 'forwarded';
+  }
+  // A quote marks someone else's words. `code`/`pre` do not: they are the
+  // author's own formatting of a PID or a log line, and counting them made the
+  // owner's own message unauthorised whenever it contained one.
   const nonAuthoritativeEntityTypes = new Set([
     'blockquote',
     'expandable_blockquote',
-    'code',
-    'pre',
   ]);
   const entities = [
     ...(Array.isArray(message?.entities) ? message.entities : []),
@@ -1687,21 +2099,6 @@ function contextFrom(ctx: any): any {
   return ctx.from || ctx.callbackQuery?.from;
 }
 
-async function captionVideoNoteFrames(
-  host: TelegramChannelHost,
-  framePaths: string[],
-  costMeta: { groupFolder: string; chatJid: string },
-): Promise<string[]> {
-  const captions: string[] = [];
-  for (const framePath of framePaths.slice(0, 3)) {
-    const caption = await host.captionPhoto(framePath, costMeta);
-    const trimmed = caption?.trim().replace(/[.!?…]+$/u, '');
-    if (!trimmed) continue;
-    if (!captions.includes(trimmed)) captions.push(trimmed);
-  }
-  return captions;
-}
-
 function isOwnerCommandContext(opts: TelegramChannelOpts, ctx: any): boolean {
   if (!ctx.callbackQuery && telegramMessageOriginForContext(ctx) !== 'direct') {
     return false;
@@ -1866,6 +2263,7 @@ export function readSkoobiEngineRuntimeStatus(
     'SKOOBI_CODEX_FALLBACK_MODEL',
     'SKOOBI_CODEX_ALLOW_MODEL_DOWNGRADE',
     'SKOOBI_CODEX_REASONING_EFFORT',
+    'SKOOBI_CHEAP_MODEL',
     'SKOOBI_QUOTA_DEGRADED_MODEL',
     'SKOOBI_SANDBOX_CODEX_PRIMARY',
     'SKOOBI_TELEGRAM_GUEST_LIVE_ENABLED',
@@ -1920,7 +2318,8 @@ export function readSkoobiEngineRuntimeStatus(
     fallbackModel: allowDowngrade
       ? value('SKOOBI_CODEX_FALLBACK_MODEL') || cliConfig.fallback
       : undefined,
-    degradedModel: value('SKOOBI_QUOTA_DEGRADED_MODEL'),
+    degradedModel:
+      value('SKOOBI_CHEAP_MODEL') || value('SKOOBI_QUOTA_DEGRADED_MODEL'),
     reasoningEffort: value('SKOOBI_CODEX_REASONING_EFFORT'),
     route: sandboxPrimary
       ? 'full-agent для всех sandbox-чатов'
@@ -2113,8 +2512,16 @@ const TYPING_REFRESH_INTERVAL_MS = 4000;
 // the run's finally block and after each delivered turn, so this is a pure
 // leak failsafe — it must NOT fire during legitimate long agent runs (the
 // old 3-minute cap killed the indicator mid-run and users read the silence
-// as a crash).
-const TYPING_MAX_DURATION_MS = 30 * 60 * 1000;
+// as a crash). Admin turns may run up to 90 minutes and the sandbox allows
+// two more on top (resolveSandboxGlobalTimeoutMs), so the cap sits just past
+// both configured limits.
+export const TYPING_MAX_DURATION_MS = 95 * 60 * 1000;
+
+function telegramProgressAbortSignal(signal: AbortSignal): NonNullable<Parameters<Api['sendMessage']>[3]> {
+  // grammY's declarations name its historical abort-controller polyfill.
+  // Its fetch transport also accepts the standard Node/Web AbortSignal.
+  return AbortSignal.any([signal, AbortSignal.timeout(8000)]) as unknown as NonNullable<Parameters<Api['sendMessage']>[3]>;
+}
 
 export class TelegramChannel implements Channel {
   name = 'telegram';
@@ -2124,6 +2531,7 @@ export class TelegramChannel implements Channel {
   private botToken: string;
   private ownerNotificationChannel?: TelegramChannel;
   private peerChannels: TelegramChannel[] = [];
+  private progressMessages = new ProgressMessages();
   // jid -> interval handle for the active typing-refresh loop.
   // Indexed by full jid (e.g. "tg:100000001") so multiple chats can be
   // "typing" simultaneously without stomping on each other.
@@ -2249,6 +2657,7 @@ export class TelegramChannel implements Channel {
     tenant: TelegramTenantView,
     senderId: string,
     type:
+      | 'quota_balance_viewed'
       | 'memory_delete_requested'
       | 'memory_deleted'
       | 'memory_delete_unavailable',
@@ -2443,8 +2852,6 @@ export class TelegramChannel implements Channel {
           preserved_tables: [
             'messages',
             'events',
-            'usage_ledger',
-            'usage_events',
             'model_traces',
           ],
         });
@@ -2506,8 +2913,6 @@ export class TelegramChannel implements Channel {
       preserved_tables: [
         'messages',
         'events',
-        'usage_ledger',
-        'usage_events',
         'model_traces',
       ],
     });
@@ -3460,6 +3865,8 @@ export class TelegramChannel implements Channel {
     this.bot = new Bot(this.botToken, {
       client: {
         baseFetchConfig: { agent: https.globalAgent, compress: true },
+    // Bound stalled network requests while allowing uploads and long polling.
+        timeoutSeconds: 180,
       },
     });
 
@@ -3989,8 +4396,14 @@ export class TelegramChannel implements Channel {
     });
 
     this.bot.on('message:text', async (ctx) => {
-      // Skip commands
-      if (ctx.message.text.startsWith('/')) return;
+      // a bare `startsWith('/')` discarded EVERY
+      // message beginning with a slash — a pasted path like /Users/example/...,
+      // a typo, a Russian phrase with a slash — silently, with no reply at all.
+      // grammy has already routed real commands to their own handlers by now,
+      // so only skip when Telegram itself marked the text as a bot_command at
+      // offset 0 AND the command is one this bot actually registers. Anything
+      // else is ordinary text and must reach the agent.
+      if (isHandledBotCommand(ctx.message)) return;
 
       const chatJid = this.chatJidForChat(ctx.chat.id);
       let content = ctx.message.text;
@@ -4223,28 +4636,12 @@ export class TelegramChannel implements Channel {
           group.folder,
         );
 
-        // Vision caption (Tier 1): instead of leaking the absolute path in
-        // the placeholder, ask Haiku for a 1–2 sentence Russian description
-        // and use that as searchable context. Failure → null → '[Photo]'.
-        let visionCaption: string | null = null;
-        if (savedPath) {
-          visionCaption = await this.opts.host.captionPhoto(savedPath, {
-            groupFolder: group.folder,
-            chatJid,
-          });
-        }
-
-        let placeholder: string;
         const fileRef = savedPath
           ? ` File: received/${path.basename(savedPath)} — use Read tool to inspect visual context`
           : '';
-        if (savedPath && visionCaption) {
-          placeholder = `[Photo: ${visionCaption}.${fileRef}]`;
-        } else if (savedPath) {
-          placeholder = `[Photo.${fileRef}]`;
-        } else {
-          placeholder = '[Photo — download failed]';
-        }
+        const placeholder = savedPath
+          ? `[Photo.${fileRef}]`
+          : '[Photo — download failed]';
 
         storeNonText(ctx, placeholder, {
           skipAccessCheck: true,
@@ -4252,7 +4649,7 @@ export class TelegramChannel implements Channel {
         });
         if (savedPath) {
           await recordMedia(ctx, group.folder, savedPath, 'photo', {
-            hasCaption: !!visionCaption || !!ctx.message.caption,
+            hasCaption: !!ctx.message.caption,
           });
         }
       } catch (err) {
@@ -4288,28 +4685,28 @@ export class TelegramChannel implements Channel {
         });
         return;
       }
+      const videoTooBig = telegramOversizePlaceholder(
+        'Video',
+        ctx.message.video?.file_size,
+      );
+      if (videoTooBig) {
+        storeNonText(ctx, videoTooBig, {
+          skipAccessCheck: true,
+          skipInbox: true,
+        });
+        return;
+      }
 
       const result = await processTelegramVideoFile(
         this.botToken,
         fileId,
         group.folder,
       );
-      const frameCaptions =
-        result.framePaths.length > 0
-          ? await captionVideoNoteFrames(this.opts.host, result.framePaths, {
-              groupFolder: group.folder,
-              chatJid,
-            })
-          : [];
-
       const parts: string[] = [];
       if (result.transcript) {
         parts.push(`Transcript: ${result.transcript}`);
       } else {
         parts.push('transcription failed or no speech detected');
-      }
-      if (frameCaptions.length > 0) {
-        parts.push(`Visual summary: ${frameCaptions.join('. ')}`);
       }
       const frameRefs = result.framePaths.map(
         (framePath) => `received/${path.basename(framePath)}`,
@@ -4375,25 +4772,13 @@ export class TelegramChannel implements Channel {
         fileId,
         group.folder,
       );
-      const frameCaptions =
-        result.framePaths.length > 0
-          ? await captionVideoNoteFrames(this.opts.host, result.framePaths, {
-              groupFolder: group.folder,
-              chatJid,
-            })
-          : [];
-
-      // Tier 1: placeholders go into the DB and must not leak absolute paths.
-      // Guest live/Codex runs do not receive file tools, so we include a short
-      // textual vision summary from key frames while keeping file refs relative.
+      // Tier 1: placeholders go into the DB and must not leak absolute paths,
+      // so key frames are referenced by relative path.
       const parts: string[] = [];
       if (result.transcript) {
         parts.push(`Transcript: ${result.transcript}`);
       } else {
         parts.push('transcription failed or no speech detected');
-      }
-      if (frameCaptions.length > 0) {
-        parts.push(`Visual summary: ${frameCaptions.join('. ')}`);
       }
       const frameRefs = result.framePaths.map(
         (framePath) => `received/${path.basename(framePath)}`,
@@ -4500,6 +4885,17 @@ export class TelegramChannel implements Channel {
         });
         return;
       }
+      const audioTooBig = telegramOversizePlaceholder(
+        'Audio',
+        ctx.message.audio?.file_size,
+      );
+      if (audioTooBig) {
+        storeNonText(ctx, audioTooBig, {
+          skipAccessCheck: true,
+          skipInbox: true,
+        });
+        return;
+      }
 
       const savedPath = await downloadTelegramAudio(
         this.botToken,
@@ -4552,6 +4948,17 @@ export class TelegramChannel implements Channel {
       });
       if (!fileId) {
         storeNonText(ctx, `[Document: ${name}]`, {
+          skipAccessCheck: true,
+          skipInbox: true,
+        });
+        return;
+      }
+      const documentTooBig = telegramOversizePlaceholder(
+        `Document: ${name}`,
+        ctx.message.document?.file_size,
+      );
+      if (documentTooBig) {
+        storeNonText(ctx, documentTooBig, {
           skipAccessCheck: true,
           skipInbox: true,
         });
@@ -4703,6 +5110,38 @@ export class TelegramChannel implements Channel {
     this.bot = null;
   }
 
+  async sendProgress(jid: string, text: string, turnKey: string): Promise<boolean> {
+    const bot = this.bot;
+    if (!bot) throw new Error('Telegram bot not initialized');
+    const chatId = this.telegramChatIdForJid(jid);
+    if (readTelegramAccessState()[jid]?.outboundBlockedReason === 'bot_blocked_by_user') {
+      throw new Error('Telegram chat unreachable: bot_blocked_by_user');
+    }
+    // Plain text keeps edits valid even when a progress excerpt cuts Markdown.
+    const visible = plainTelegramText(text).slice(0, 3900);
+    if (!visible.trim()) return false;
+    const delivered = await this.progressMessages.update({
+      chat: jid,
+      turn: turnKey,
+      text: visible,
+      send: async (value, signal) => {
+        const message = await bot.api.sendMessage(chatId, value, {
+          disable_notification: true,
+        }, telegramProgressAbortSignal(signal));
+        return message.message_id;
+      },
+      edit: async (id, value, signal) => {
+        await bot.api.editMessageText(chatId, id, value, {}, telegramProgressAbortSignal(signal));
+      },
+    });
+    if (delivered) logger.info({ jid, length: visible.length }, 'Telegram progress updated');
+    return delivered;
+  }
+
+  async finishProgress(jid: string, turnKey: string): Promise<void> {
+    await this.progressMessages.finish(jid, turnKey);
+  }
+
   async sendMessage(jid: string, text: string): Promise<void> {
     if (!this.bot) {
       logger.warn('Telegram bot not initialized');
@@ -4716,18 +5155,16 @@ export class TelegramChannel implements Channel {
         throw new Error('Telegram chat unreachable: bot_blocked_by_user');
       }
 
-      // Telegram has a 4096 character limit per message — split if needed
-      const MAX_LENGTH = 4096;
-      if (text.length <= MAX_LENGTH) {
-        await sendTelegramMessageWithRetry(this.bot.api, numericId, text);
-      } else {
-        for (let i = 0; i < text.length; i += MAX_LENGTH) {
-          await sendTelegramMessageWithRetry(
-            this.bot.api,
-            numericId,
-            text.slice(i, i + MAX_LENGTH),
-          );
-        }
+      // Telegram has a 4096 character limit per message — split if needed.
+      // Tables are rewritten before the split so a long table is not cut
+      // between its header and its rows; the margin under 4096 absorbs the
+      // escapes added per part.
+      const parts = splitTelegramText(normalizeTelegramBlocks(text));
+      // A reply that formatting empties (e.g. a bare «>») still goes out as
+      // typed instead of silently vanishing while logged as sent.
+      if (parts.length === 0 && text.trim()) parts.push(text);
+      for (const part of parts) {
+        await sendTelegramMessageWithRetry(this.bot.api, numericId, part);
       }
       logger.info({ jid, length: text.length }, 'Telegram message sent');
     } catch (err) {
@@ -4912,6 +5349,44 @@ export class TelegramChannel implements Channel {
     }, TYPING_REFRESH_INTERVAL_MS);
     this.typingIntervals.set(jid, timer);
   }
+
+  /**
+   * Реакция на входящее сообщение — например, 👀 «увидел, возьму следом»,
+   * пока модель занята долгой задачей. Строго best-effort: реакции в чате
+   * могут быть выключены, сообщение — слишком старым, эмодзи — не из списка
+   * Telegram. Поэтому ни одного ретрая и никакого ожидания retry_after: вызов
+   * идёт мимо sendTelegramMessageWithRetry, ошибка пишется в debug, а наружу
+   * возвращается false.
+   */
+  async reactToMessage(
+    jid: string,
+    messageId: string,
+    emoji: string,
+  ): Promise<boolean> {
+    if (!this.bot) return false;
+    const numericMessageId = Number(messageId);
+    if (
+      !/^\d+$/.test(messageId) ||
+      !Number.isSafeInteger(numericMessageId) ||
+      numericMessageId <= 0
+    ) {
+      return false;
+    }
+    try {
+      await this.bot.api.setMessageReaction(
+        this.telegramChatIdForJid(jid),
+        numericMessageId,
+        [{ type: 'emoji', emoji } as ReactionTypeEmoji],
+      );
+      return true;
+    } catch (err) {
+      logger.debug(
+        { jid, err: sanitizeTelegramError(err) },
+        'Telegram reaction was not set',
+      );
+      return false;
+    }
+  }
 }
 
 export class TelegramMultiBotChannel implements Channel {
@@ -4945,6 +5420,18 @@ export class TelegramMultiBotChannel implements Channel {
     await channel.sendMessage(jid, text);
   }
 
+  async sendProgress(jid: string, text: string, turnKey: string): Promise<boolean> {
+    const channel = this.channelForJid(jid);
+    if (!channel) throw new Error(`No Telegram bot owns JID: ${jid}`);
+    return channel.sendProgress(jid, text, turnKey);
+  }
+
+  async finishProgress(jid: string, turnKey: string): Promise<void> {
+    const channel = this.channelForJid(jid);
+    if (!channel) throw new Error(`No Telegram bot owns JID: ${jid}`);
+    await channel.finishProgress(jid, turnKey);
+  }
+
   async sendPhoto(
     jid: string,
     filePath: string,
@@ -4975,6 +5462,16 @@ export class TelegramMultiBotChannel implements Channel {
     const channel = this.channelForJid(jid);
     if (!channel) return;
     await channel.setTyping(jid, isTyping);
+  }
+
+  async reactToMessage(
+    jid: string,
+    messageId: string,
+    emoji: string,
+  ): Promise<boolean> {
+    const channel = this.channelForJid(jid);
+    if (!channel) return false;
+    return channel.reactToMessage(jid, messageId, emoji);
   }
 }
 

@@ -10,14 +10,18 @@
  * lives in cwd. Multiple instances = multiple directories.
  */
 import { loadExtensions } from './orchestrator/extension-loader.js';
+import { initServiceLifecycle } from './orchestrator/service-lifecycle.js';
 
 async function start(): Promise<void> {
+  // Record start/stop reasons before anything else can fail, so that a crash
+  // during startup still leaves a trace distinguishing it from a deploy.
+  initServiceLifecycle();
+
   // Load enabled built-in channels (self-registering on import).
-  // This local deployment keeps Telegram enabled and leaves WhatsApp disabled.
   await import('./channels/index.js');
 
   // Load built-in extensions (always present in core)
-  await import('./cost-tracking/index.js');
+  await import('@skoobi/core/run-telemetry');
   await import('./webhook/index.js');
 
   // Load installable extensions from extensions/ directory

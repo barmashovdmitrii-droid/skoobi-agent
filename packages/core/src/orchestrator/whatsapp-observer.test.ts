@@ -93,6 +93,20 @@ describe('observed WhatsApp storage', () => {
     expect(listObservedWhatsAppMessages()).toHaveLength(2);
   });
 
+  it('keeps the earliest time when WhatsApp redelivers a message later', () => {
+    storeObservedWhatsAppMessage(
+      observed({ timestamp: '2026-09-01T03:54:24.000Z' }),
+      RETENTION,
+    );
+    storeObservedWhatsAppMessage(
+      observed({ timestamp: '2026-09-27T06:16:13.000Z', upsertType: 'notify' }),
+      RETENTION,
+    );
+    const rows = listObservedWhatsAppMessages();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].timestamp).toBe('2026-09-01T03:54:24.000Z');
+  });
+
   it('upserts a duplicate-key history batch atomically with last value winning', () => {
     const result = storeObservedWhatsAppMessagesBatch(
       [
@@ -485,6 +499,9 @@ describe('buildWhatsAppObserverContext', () => {
     expect(result.mode).toBe('index');
     expect(result.messageCount).toBe(0);
     expect(result.xml).toContain('<chat ref="wa_');
+    // Shared vector with agent/runner chat-history.test.ts (opaqueWhatsAppRef):
+    // the runner's chat_history accepts refs from this context.
+    expect(result.xml).toContain('<chat ref="wa_cd15cd200b"');
     expect(result.xml).toContain('Анна &amp; партнёры');
     expect(result.xml).not.toContain('Привет');
     expect(result.xml).not.toContain('English private text');

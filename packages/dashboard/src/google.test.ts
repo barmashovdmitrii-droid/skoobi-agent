@@ -60,6 +60,10 @@ function makeTokenFile(content = 'refresh-from-file', mode = 0o600): string {
   tempDirs.add(dir);
   const file = path.join(dir, 'refresh-token');
   fs.writeFileSync(file, content, { mode });
+  // The production service intentionally runs with umask 077. Force the
+  // requested fixture mode so permissive-file cases remain meaningful when
+  // this suite is launched from that service.
+  fs.chmodSync(file, mode);
   return file;
 }
 

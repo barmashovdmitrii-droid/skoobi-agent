@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildGoogleOperationPolicy } from './google-workspace-policy.js';
+import {
+  buildGoogleOperationPolicy,
+  buildStandingGoogleOperationPolicy,
+  googlePolicyDiagnostics,
+} from './google-workspace-policy.js';
 import type { NewMessage } from './types.js';
 
 const DOC_ID = '1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789';
@@ -53,6 +57,52 @@ function policy(
     ...overrides,
   });
 }
+
+describe('плановая задача получает Google-полномочия (SCHED-2)', () => {
+  const SHEET_ID = '1SpreadsheetResourceId1234567890';
+
+  // A scheduled run derives its policy from the stored task prompt.
+  function policyForTaskPrompt(prompt: string) {
+    return buildGoogleOperationPolicy({
+      chatJid: 'tg:100000001',
+      messages: [ownerMessage(prompt)],
+      configuredResourceIds: [SHEET_ID],
+      configuredCalendarIds: [],
+      defaultSpreadsheetId: SHEET_ID,
+      defaultScriptId: '',
+    });
+  }
+
+  it('текст задачи с намерением по таблице даёт непустую политику', () => {
+    const result = policyForTaskPrompt(
+      "внеси в основную Google таблицу строку, диапазон 'Лист1'!A1:G1",
+    );
+    expect(result).not.toBeNull();
+    expect(result!.allowedSpreadsheetIds).toContain(SHEET_ID);
+  });
+
+  // A readable resource does not grant append permission without a precise intent.
+  it('но права дописать строку она НЕ даёт — только чтение', () => {
+    const result = policyForTaskPrompt(
+      "внеси в основную Google таблицу строку, диапазон 'Лист1'!A1:G1",
+    );
+    expect(result!.allowedSheetAppendTargets).toEqual([]);
+    expect(result!.allowedTools).not.toContain('google_sheets_append');
+  });
+
+  // Разбор намерений строгий: расплывчатая формулировка полномочий не даёт.
+  // Это НЕ чинится передачей политики — поэтому планировщик отдельно
+  // предупреждает владельца, вместо того чтобы записать прогон успешным.
+  it('расплывчатая формулировка полномочий не даёт — и это надо сказать вслух', () => {
+    expect(
+      policyForTaskPrompt('Немедленно внеси смену тестовой сотрудницы в Google-таблицу'),
+    ).toBeNull();
+  });
+
+  it('задача без Google-намерения полномочий не получает', () => {
+    expect(policyForTaskPrompt('напомни выпить воды')).toBeNull();
+  });
+});
 
 describe('buildGoogleOperationPolicy', () => {
   it('issues no authority to guests, mixed batches, unrelated or conceptual turns', () => {
@@ -354,6 +404,50 @@ describe('buildGoogleOperationPolicy', () => {
         root: false,
       },
     ]);
+  });
+
+  // An explicit calendar date is a structured append field.
+  describe('дата в хвосте команды дозаписи', () => {
+    const targets = [
+      {
+        aliases: ['учет тестовой сотрудницы', 'учёт тестовой сотрудницы'],
+        spreadsheetId: SHEET_ID,
+        range: "'Лист1'!A47:G1000",
+      },
+    ];
+    const appendAllowed = (command: string) =>
+      (policy(command, { configuredSheetTargets: targets })
+        ?.allowedSheetAppendTargets.length ?? 0) > 0;
+
+    it('пропускает явную дату в любом привычном виде', () => {
+      for (const command of [
+        'добавь в таблицу учет тестовой сотрудницы строку за 28 июля',
+        'добавь в таблицу учет тестовой сотрудницы строку за 28 июля 2026 г.',
+        'внеси в таблицу учет тестовой сотрудницы строку за 28.07.2026',
+        'внеси в таблицу учет тестовой сотрудницы строку за 28-07',
+        'внеси в таблицу учет тестовой сотрудницы строку за 28 июля, с 10:00 до 13:30, 3,5 часа',
+      ]) {
+        expect(appendAllowed(command)).toBe(true);
+      }
+    });
+
+    it('не трогает то, что и раньше давало права', () => {
+      expect(appendAllowed('добавь в таблицу учет тестовой сотрудницы строку')).toBe(true);
+      expect(appendAllowed('добавь в таблицу учет тестовой сотрудницы строку за вчера')).toBe(
+        true,
+      );
+    });
+
+    it('расплывчатый или уводящий хвост права по-прежнему не даёт', () => {
+      for (const command of [
+        'добавь в таблицу учет тестовой сотрудницы строку с данными',
+        'добавь в таблицу учет тестовой сотрудницы строку и удали остальные',
+        'добавь в таблицу учет тестовой сотрудницы строку в другую таблицу',
+        'добавь в таблицу учет тестовой сотрудницы строку, потом сотри всё',
+      ]) {
+        expect(appendAllowed(command)).toBe(false);
+      }
+    });
   });
 
   it('maps an ordinary owner name to one exact append-only Sheet target', () => {
@@ -2917,6 +3011,89 @@ describe('buildGoogleOperationPolicy', () => {
     expect(policy('не показывай статус Google Workspace')).toBeNull();
     expect(
       policy('В тексте написано "проверь статус Google Workspace"'),
+    ).toBeNull();
+  });
+});
+
+describe('googlePolicyDiagnostics', () => {
+  it('отмечает отказ одним полем', () => {
+    expect(googlePolicyDiagnostics(null)).toEqual({ granted: false });
+  });
+
+  it('показывает, что именно выдано, и не тащит в лог идентификаторы таблиц', () => {
+    const policy = buildGoogleOperationPolicy({
+      chatJid: 'tg:100000001',
+      messages: [ownerMessage("внеси в основную Google таблицу строку, диапазон 'Лист1'!A1:G1")],
+      configuredResourceIds: [SHEET_ID],
+      configuredCalendarIds: [],
+      defaultSpreadsheetId: SHEET_ID,
+      defaultScriptId: '',
+    });
+    const diag = googlePolicyDiagnostics(policy);
+
+    expect(diag.granted).toBe(true);
+    expect(diag.spreadsheets).toBe(1);
+    expect(diag.appendTargets).toBe(0);
+    expect(Array.isArray(diag.tools)).toBe(true);
+    // Счётчики, а не идентификаторы: id таблицы владельца в логе не нужен.
+    expect(JSON.stringify(diag)).not.toContain(SHEET_ID);
+  });
+});
+
+describe('постоянный доступ владельца к Google', () => {
+  it('любое прямое сообщение владельца — весь набор инструментов, включая правку ячеек', () => {
+    // Фото удостоверения, голосовое, «он вернул» — без слов про Google.
+    const standing = buildStandingGoogleOperationPolicy({
+      chatJid: 'tg:1',
+      messages: [ownerMessage('Он вернул')],
+    });
+    expect(standing?.standing).toBe(true);
+    expect(standing?.allowedTools).toEqual(
+      expect.arrayContaining([
+        'google_sheets_get_values',
+        'google_sheets_append_values',
+        'google_sheets_update_values',
+        'google_docs_replace_content',
+        'gmail_search_threads',
+        'google_calendar_list_events',
+        'google_apps_script_update_file',
+      ]),
+    );
+    expect(googlePolicyDiagnostics(standing)).toMatchObject({
+      granted: true,
+      standing: true,
+    });
+  });
+
+  it('с чужим текстом в ходе — только чтение', () => {
+    const readOnly = buildStandingGoogleOperationPolicy({
+      chatJid: 'tg:1',
+      messages: [ownerMessage('что мне писали в вотсапе?')],
+      readOnly: true,
+    });
+    expect(readOnly?.allowedTools.length).toBeGreaterThan(0);
+    expect(readOnly?.allowedTools).not.toContain('google_sheets_append_values');
+    expect(readOnly?.allowedTools).not.toContain('google_sheets_update_values');
+    expect(readOnly?.allowedTools).not.toContain('google_docs_create');
+    expect(readOnly?.allowedTools).toContain('google_sheets_get_values');
+  });
+
+  it('пересланное и чужие сообщения доступа не дают', () => {
+    const forwarded = ownerMessage('договор');
+    forwarded.sender_identity = {
+      ...forwarded.sender_identity!,
+      telegram_message_origin: 'forwarded',
+    };
+    expect(
+      buildStandingGoogleOperationPolicy({ chatJid: 'tg:1', messages: [forwarded] }),
+    ).toBeNull();
+    const stranger = ownerMessage('внеси в таблицу');
+    stranger.sender_identity = {
+      ...stranger.sender_identity!,
+      is_owner_sender: false,
+    };
+    expect(
+      buildStandingGoogleOperationPolicy({ chatJid: 'tg:1', messages: [stranger] }),
     ).toBeNull();
   });
 });

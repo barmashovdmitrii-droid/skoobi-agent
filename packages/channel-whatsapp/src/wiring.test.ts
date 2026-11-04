@@ -181,7 +181,11 @@ describe('WhatsApp observer retention wiring', () => {
         fromMe: true,
       },
     ]);
-    const sql = prepare.mock.calls[0][0] as string;
+    // The daily gap count issues its own COUNT statement at
+    // channel creation; pick the anchor query by content, not by position.
+    const sql = prepare.mock.calls
+      .map((call) => call[0] as string)
+      .find((candidate) => candidate.includes('anchor_candidates'))!;
     expect(sql).toContain('json_each(?)');
     expect(sql).toContain('newer.timestamp > gap.gap_timestamp');
     expect(sql).toContain("'document'");
@@ -197,6 +201,46 @@ describe('WhatsApp observer retention wiring', () => {
       channelOpts.host.getObservedMediaBackfillAnchors(Number.NaN),
     ).toEqual([]);
     expect(prepare).toHaveBeenCalledTimes(prepareCalls);
+  });
+
+  it('reports the observer media gap count once at startup and then daily', async () => {
+    const get = vi.fn().mockReturnValue({ c: 317 });
+    const prepare = vi.fn((_sql: string) => ({ get, all: vi.fn() }));
+    mocks.getDb.mockReturnValue({ prepare });
+    const factory = await importFactory();
+    factory({ onMessage: vi.fn() });
+
+    const gapLogs = () =>
+      mocks.loggerInfo.mock.calls.filter(
+        (call) => call[1] === 'WhatsApp observer media gaps (media_enriched = 0)',
+      );
+    expect(gapLogs()).toHaveLength(1);
+    expect(gapLogs()[0][0]).toEqual({ gaps: 317 });
+    const countSql = prepare.mock.calls
+      .map((call) => call[0] as string)
+      .find((sql) => sql.includes('COUNT(*)'))!;
+    expect(countSql).toContain('media_enriched = 0');
+    expect(countSql).toContain("'document'");
+
+    vi.advanceTimersByTime(24 * 60 * 60 * 1000 - 1);
+    expect(gapLogs()).toHaveLength(1);
+    get.mockReturnValue({ c: 12 });
+    vi.advanceTimersByTime(1);
+    expect(gapLogs()).toHaveLength(2);
+    expect(gapLogs()[1][0]).toEqual({ gaps: 12 });
+
+    // A database error costs one WARN without identifiers, never a crash.
+    get.mockImplementationOnce(() => {
+      throw new Error('private path /Users/example/store/messages.db');
+    });
+    expect(() => vi.advanceTimersByTime(24 * 60 * 60 * 1000)).not.toThrow();
+    expect(mocks.loggerWarn).toHaveBeenCalledWith(
+      { errorKind: 'Error' },
+      'WhatsApp observer media gap count unavailable',
+    );
+    expect(JSON.stringify(mocks.loggerWarn.mock.calls)).not.toContain(
+      'private path',
+    );
   });
 
   it('persists bounded backfill progress in local router state', async () => {

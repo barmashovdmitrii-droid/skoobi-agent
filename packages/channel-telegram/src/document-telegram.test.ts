@@ -149,6 +149,23 @@ describe('document-telegram', () => {
     expect(result.preview).toContain('April | 110000');
   });
 
+  it('extracts RU/KK text and XML entities from a real DOCX after parser updates', async () => {
+    const root = path.join(dir, 'docx-src');
+    await fs.mkdir(path.join(root, '_rels'), { recursive: true });
+    await fs.mkdir(path.join(root, 'word'), { recursive: true });
+    await fs.writeFile(path.join(root, '[Content_Types].xml'),
+      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>');
+    await fs.writeFile(path.join(root, '_rels', '.rels'),
+      '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>');
+    await fs.writeFile(path.join(root, 'word', 'document.xml'),
+      '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Привет &amp; Сәлем! Құжат № 1.</w:t></w:r></w:p></w:body></w:document>');
+    const file = path.join(dir, 'sample.docx');
+    await execFileAsync('/usr/bin/zip', ['-qr', file, '.'], { cwd: root });
+    const result = await extractDocumentPreview(file);
+    expect(result.extractionStatus).toBe('ok');
+    expect(result.preview).toBe('Привет & Сәлем! Құжат № 1.');
+  });
+
   it('builds placeholders with only relative received paths', () => {
     const result: TelegramDocumentResult = {
       filePath: path.join(dir, 'received', 'report.pdf'),

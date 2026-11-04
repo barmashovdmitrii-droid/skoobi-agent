@@ -2,6 +2,26 @@
 
 All notable public changes to Skoobi Agent are documented here.
 
+## 2.1.0
+
+- Added scoped project cards, versioned decisions, source quotations, expiry,
+  and explicit forgetting to structured memory. Reads are paginated; structured
+  memory tool requests and responses are authenticated and encrypted in local IPC.
+- Improved task continuity after corrections, interrupted runs, and short
+  follow-up messages. Background progress cannot replace the user's current
+  project focus, and old updates cannot overwrite newer direct decisions.
+- Updated transitive `shell-quote` and `proxy-addr` dependencies to versions
+  containing their critical security fixes.
+- Added bounded relevant-memory recall and clearer Telegram progress delivery.
+- Updated Desktop task result handling, local-file delivery checks, scheduled
+  task recovery, and run diagnostics.
+- Preserved existing public installation and upgrade safeguards, optional
+  accounting interfaces, and stored user data. Runtime telemetry no longer
+  presents subscription token counts as an API spending estimate.
+- Kept deployment-specific operations, runtime state, private reports, and
+  private Git history outside the public update. Examples and test fixtures
+  use synthetic identities.
+
 ## 2.0.0
 
 - Added one fail-closed operation lock shared by install, update, uninstall,

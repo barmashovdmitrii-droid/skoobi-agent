@@ -23,6 +23,9 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, MAX_TRANSCRIPT_BYTES, STORE_DIR } from './config.js';
+import { StringDecoder } from 'node:string_decoder';
+
+import { readEnvFile } from './env.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { isSafeRuntimeSessionId } from './runtime-namespace.js';
 
@@ -154,6 +157,85 @@ function moveFile(src: string, dest: string): void {
   }
 }
 
+
+
+function archiveWithRedaction(src: string, dest: string): boolean {
+  let secrets: [string, string][];
+  try {
+    secrets = Object.entries(
+      readEnvFile([
+        'TELEGRAM_BOT_TOKEN',
+        'HELPER_SECRET',
+        'ANTHROPIC_API_KEY',
+        'OPENAI_API_KEY',
+        'WEBHOOK_SECRET',
+      ]),
+    ).filter(([, v]) => typeof v === 'string' && v.length >= 16) as [
+      string,
+      string,
+    ][];
+  } catch {
+    return false;
+  }
+  if (secrets.length === 0) return false;
+
+  const tmp = `${dest}.redacting`;
+  try {
+    // Chunked so a 100MB+ transcript never has to fit in memory. A secret could
+    // straddle a chunk boundary, so keep a tail of the longest secret minus one
+    // byte and prepend it to the next chunk.
+    const maxSecret = Math.max(...secrets.map(([, v]) => v.length));
+    const fdIn = fs.openSync(src, 'r');
+    const fdOut = fs.openSync(tmp, 'w');
+    try {
+      const size = 4 * 1024 * 1024;
+      const buf = Buffer.allocUnsafe(size);
+      // A chunk boundary lands at an arbitrary BYTE offset, so it can split a
+      // multi-byte UTF-8 character in half — Cyrillic is 2 bytes, an emoji 4.
+      // Decoding each chunk independently turned those halves into U+FFFD and
+      // silently corrupted the archived transcript (verified: 2 replacement
+      // characters per split). StringDecoder holds an incomplete sequence back
+      // until the next write completes it, so text crossing a boundary stays
+      // intact. The `carry` below is a separate concern — it exists so a SECRET
+      // straddling a boundary is still matched.
+      const decoder = new StringDecoder('utf8');
+      let carry = '';
+      const redact = (s: string): string => {
+        for (const [k, v] of secrets) s = s.split(v).join(`[redacted:${k}]`);
+        return s;
+      };
+      for (;;) {
+        const n = fs.readSync(fdIn, buf, 0, size, null);
+        if (n <= 0) break;
+        const text = redact(carry + decoder.write(buf.subarray(0, n)));
+        // Hold back the tail that a secret could still straddle. Keyed on the
+        // read being short (EOF) rather than on `n === size`: readSync may
+        // legitimately return fewer bytes than requested mid-file, and the old
+        // `n === size` test dropped the carry in exactly that case, letting a
+        // split secret through unredacted.
+        const keep = Math.max(0, Math.min(maxSecret - 1, text.length));
+        carry = text.slice(text.length - keep);
+        fs.writeSync(fdOut, text.slice(0, text.length - keep));
+      }
+      const tail = redact(carry + decoder.end());
+      if (tail) fs.writeSync(fdOut, tail);
+    } finally {
+      fs.closeSync(fdIn);
+      fs.closeSync(fdOut);
+    }
+    fs.renameSync(tmp, dest);
+    fs.unlinkSync(src);
+    return true;
+  } catch {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* best effort */
+    }
+    return false;
+  }
+}
+
 /**
  * If the on-disk transcript for (groupFolder, sessionId) exceeds the cap,
  * archive it under store/archive/sessions/ and return rotation details.
@@ -198,7 +280,9 @@ export function rotateTranscriptIfTooLarge(
       archiveDir,
       `${sessionId}.archived-${stamp}.jsonl`,
     );
-    moveFile(transcriptPath, archivedPath);
+    if (!archiveWithRedaction(transcriptPath, archivedPath)) {
+      moveFile(transcriptPath, archivedPath);
+    }
     result.archivedPath = archivedPath;
   } catch (err) {
     result.archiveError = err instanceof Error ? err.message : String(err);

@@ -247,3 +247,64 @@ describe('resolveResumeSessionId', () => {
     expect(s.rotated).toHaveLength(1);
   });
 });
+
+describe('archive redaction (ultrareview 2026-07-27 M9)', () => {
+  let dir: string;
+  const SECRET = 'SEKRET-' + 'x'.repeat(40);
+  const CHUNK = 4 * 1024 * 1024;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'transcript-redact-'));
+    fs.writeFileSync(path.join(dir, '.env'), `TELEGRAM_BOT_TOKEN=${SECRET}\n`);
+    process.env.CLAUDECLAW_ENV_FILE = path.join(dir, '.env');
+  });
+  afterEach(() => {
+    delete process.env.CLAUDECLAW_ENV_FILE;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function seed(body: Buffer): string {
+    const sess = path.join(dir, 'sessions', 'g', '.claude', 'projects', 'p');
+    fs.mkdirSync(sess, { recursive: true });
+    const src = path.join(sess, 'sess.jsonl');
+    fs.writeFileSync(src, body);
+    return src;
+  }
+
+  it('strips a secret that straddles a chunk boundary', () => {
+    // Secret split across the 4MB read boundary — the case the carry exists for.
+    const head = Buffer.alloc(CHUNK - 10, 0x61);
+    seed(Buffer.concat([head, Buffer.from(SECRET + '\n', 'utf8')]));
+    const out = rotateTranscriptIfTooLarge('g', 'sess', {
+      maxBytes: 1024,
+      dataDir: dir,
+      storeDir: dir,
+    });
+    const text = fs.readFileSync(out!.archivedPath!, 'utf8');
+    expect(text).not.toContain(SECRET);
+    expect(text).toContain('[redacted:TELEGRAM_BOT_TOKEN]');
+  });
+
+  it('does NOT corrupt multi-byte characters split across a chunk boundary', () => {
+    // Cyrillic is 2 bytes and an emoji 4, so a byte-aligned chunk split used to
+    // decode half a character into U+FFFD and silently damage the archive.
+    const marker = 'Привет 🐕 кириллица';
+    const head = Buffer.alloc(CHUNK - 3, 0x61);
+    seed(
+      Buffer.concat([
+        head,
+        Buffer.from(marker, 'utf8'),
+        Buffer.from('\n' + SECRET + '\n', 'utf8'),
+      ]),
+    );
+    const out = rotateTranscriptIfTooLarge('g', 'sess', {
+      maxBytes: 1024,
+      dataDir: dir,
+      storeDir: dir,
+    });
+    const text = fs.readFileSync(out!.archivedPath!, 'utf8');
+    expect(text).toContain(marker);
+    expect(text).not.toContain('�');
+    expect(text).not.toContain(SECRET);
+  });
+});

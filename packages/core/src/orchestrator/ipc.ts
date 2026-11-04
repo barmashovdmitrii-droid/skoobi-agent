@@ -17,11 +17,21 @@ import {
   updateTask,
   upsertCalendarEventLink,
 } from './db.js';
+import { recordTenantEvent } from './event-store.js';
 import {
   CalendarAdapter,
   createGoogleCalendarAdapterFromEnv,
   shouldCreateCalendarEventForTask,
 } from './calendar-adapter.js';
+import { calendarRecurrenceForTask } from './calendar-recurrence.js';
+import {
+  ipcDocumentHistoryPlaceholder,
+  ipcPhotoHistoryPlaceholder,
+  ipcVoiceHistoryPlaceholder,
+  isSensitiveSendPath,
+  noteChatFileSendFinished,
+  noteChatFileSendStarted,
+} from './chat-file-sends.js';
 import { isValidGroupFolder } from './group-folder.js';
 import {
   resolveExistingSafeIpcCategoryDirectory,
@@ -30,6 +40,7 @@ import {
 } from './ipc-paths.js';
 import { logger } from './logger.js';
 import { signMemoryWriteRequest } from './memory-provenance.js';
+import { handleMemoryStateWireRequest } from './memory-state-service.js';
 import { notifyRunIpcActivity } from './run-activity.js';
 import { readBoundedRegularFileNoFollowSync } from './safe-file-read.js';
 import {
@@ -37,10 +48,12 @@ import {
   untrustedMainRuntimePaths,
 } from './runtime-namespace.js';
 import { isSafeSkillName, proposeSkill } from './skill-registry.js';
+import { nextRunForResumedTask } from './task-next-run.js';
 import {
   authorizeTaskOperationRequest,
   consumeTaskOperationGrant,
 } from './task-authorization.js';
+import { TenantRegistry } from './tenant-registry.js';
 import { MessageRouter, RegisteredGroup, ScheduledTask } from './types.js';
 
 export interface IpcDeps {
@@ -71,6 +84,55 @@ let ipcWatcherRunning = false;
 // next poll (oldest-first), bounding per-tenant influence on the global cadence.
 const MAX_IPC_FILES_PER_GROUP_PER_TICK = 50;
 let defaultCalendarAdapter: CalendarAdapter | null | undefined;
+
+type IpcDeliveryMedium = 'voice' | 'photo' | 'document';
+
+
+
+function reportIpcDeliveryFailure(input: {
+  chatJid: string;
+  sourceGroup: string;
+  medium: IpcDeliveryMedium;
+  reason: string;
+  registeredGroups: Record<string, RegisteredGroup>;
+  details?: Record<string, unknown>;
+}): void {
+  logger.warn(
+    {
+      chatJid: input.chatJid,
+      sourceGroup: input.sourceGroup,
+      medium: input.medium,
+      reason: input.reason,
+      ...input.details,
+    },
+    `IPC ${input.medium} delivery failed`,
+  );
+  // Observability-only tenant lookup, like message-loop's recordEventSafely:
+  // resolveJid() covers both channels and never feeds a routing decision.
+  const tenant = TenantRegistry.fromRegisteredGroups(
+    input.registeredGroups,
+  ).resolveJid(input.chatJid);
+  if (!tenant) return;
+  try {
+    recordTenantEvent({
+      tenant,
+      type: 'error',
+      actor: 'system',
+      payload: {
+        kind: 'ipc_delivery_failed',
+        medium: input.medium,
+        chat_jid: input.chatJid,
+        sourceGroup: input.sourceGroup,
+        reason: input.reason,
+      },
+    });
+  } catch (err) {
+    logger.warn(
+      { err, chatJid: input.chatJid, type: 'error' },
+      'Event store append failed',
+    );
+  }
+}
 
 function ownDataProperty(value: unknown, key: string): unknown {
   if ((typeof value !== 'object' && typeof value !== 'function') || !value) {
@@ -197,11 +259,22 @@ async function createCalendarEventForTask(input: {
   const adapter = calendarAdapterFromDeps(input.deps);
   if (!adapter) return;
 
+  const recurrence = calendarRecurrenceForTask(input.task);
+  if (recurrence.kind === 'unsupported') return;
+
+  // A one-off task stores its wall-clock time directly in schedule_value; a
+  // recurring one stores a cron expression or a period there, so the first
+  // occurrence has to come from the next_run the scheduler already computed.
+  const scheduleValue =
+    recurrence.kind === 'single' ? input.task.schedule_value : input.task.next_run;
+  if (!scheduleValue) return;
+
   try {
     const event = await adapter.createReminderEvent({
       taskId: input.task.id,
       prompt: input.task.prompt,
-      scheduleValue: input.task.schedule_value,
+      scheduleValue,
+      recurrence: recurrence.kind === 'recurring' ? recurrence.rrule : undefined,
       reminderMinutes: input.reminderMinutes,
     });
     if (!event.id) {
@@ -516,40 +589,7 @@ export function validateIpcSendFilePath(input: {
     // (credentials, private keys, certs, databases) by sending them as a
     // photo/document to its own chat. Legitimate sends are images/PDFs/generated
     // docs, which never use these names or extensions.
-    const parts = realPath.split(path.sep);
-    const base = path.basename(realPath);
-    // Credential-bearing config dirs. Kept consistent with mount-security.ts's
-    // DEFAULT_BLOCKED_PATTERNS (.aws/.azure/.gcloud/.kube/.docker/.gnupg, .config
-    // for XDG creds like .config/gh/hosts.yml or .config/gcloud) so the IPC send
-    // surface and the mount surface treat the same paths as sensitive.
-    const inSensitiveDir =
-      parts.includes('.ssh') ||
-      parts.includes('store') ||
-      parts.includes('secrets') ||
-      parts.includes('.aws') ||
-      parts.includes('.azure') ||
-      parts.includes('.gcloud') ||
-      parts.includes('.kube') ||
-      parts.includes('.docker') ||
-      parts.includes('.gnupg') ||
-      parts.includes('.config');
-    const isSensitiveName =
-      // dotenv and all variants: .env, .env.local, .env.production, .env.bak ...
-      /^\.env(\..+)?$/i.test(base) ||
-      // SQLite databases + WAL/SHM/journal sidecars: messages.db, mem0-*.db, *.sqlite
-      /\.(db|sqlite|sqlite3)(-wal|-shm|-journal)?$/i.test(base) ||
-      // SSH/host private key files
-      /^id_(rsa|dsa|ecdsa|ed25519)$/i.test(base) ||
-      // package/registry auth tokens, FTP/HTTP creds, and PyPI upload creds
-      /^\.(npmrc|netrc|pypirc)$/i.test(base) ||
-      // GCP/service-account & generic credential dumps; kubeconfig clusters/tokens
-      /^credentials(\.json|\.ya?ml)?$/i.test(base) ||
-      /(^|\.)kubeconfig$/i.test(base) ||
-      // private key files named by convention
-      /^private_key/i.test(base) ||
-      // key material, certificate bundles, and keystores
-      /\.(pem|key|p12|pfx|keystore|jks|crt|cer|der|asc|gpg)$/i.test(base);
-    if (inSensitiveDir || isSensitiveName) {
+    if (isSensitiveSendPath(realPath)) {
       return { allowed: false, reason: 'guest_sensitive_file_denied' };
     }
 
@@ -567,6 +607,14 @@ export function validateIpcSendFilePath(input: {
 
   return { allowed: true, realPath, staged: false };
 }
+
+// The chat-transcript placeholders of IPC media deliveries live with the
+// other «file went to the chat» bookkeeping; re-exported for existing callers.
+export {
+  ipcDocumentHistoryPlaceholder,
+  ipcPhotoHistoryPlaceholder,
+  ipcVoiceHistoryPlaceholder,
+} from './chat-file-sends.js';
 
 /**
  * Validate the shape of an IPC "send" envelope before it is authorized or
@@ -716,7 +764,9 @@ export function startIpcWatcher(deps: IpcDeps): void {
               const response =
                 data?.type === 'task_authorize'
                   ? authorizeTaskOperationRequest(data, sourceGroup)
-                  : signMemoryWriteRequest(data, sourceGroup);
+                  : data?.type === 'memory_state'
+                    ? handleMemoryStateWireRequest(data, sourceGroup)
+                    : signMemoryWriteRequest(data, sourceGroup);
               const resultName = `${response.request_id}.result.json`;
               writeFileAtomicNoFollowSync(
                 path.join(memoryDir, resultName),
@@ -855,6 +905,12 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     fs.unlinkSync(filePath);
                     continue;
                   }
+                  // The final answer may link this same file: noted so the
+                  // host does not attach it a second time (chat-file-sends).
+                  const sentFileKey = fileValidation.staged
+                    ? String(data.filePath)
+                    : fileValidation.realPath;
+                  noteChatFileSendStarted(sourceGroup, sentFileKey);
                   let ok = false;
                   try {
                     ok = await deps.router.sendPhoto(
@@ -863,6 +919,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       data.caption,
                     );
                   } finally {
+                    noteChatFileSendFinished(sourceGroup, sentFileKey, ok);
                     if (fileValidation.staged) {
                       try {
                         fs.unlinkSync(fileValidation.realPath);
@@ -873,17 +930,43 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     }
                   }
                   // Confirmed photo delivery feeds the active run's liveness
-                  // deadlines (see the 'message' branch above).
-                  if (ok) notifyRunIpcActivity(sourceGroup, 'photo');
-                  logger.info(
-                    {
-                      chatJid: data.chatJid,
+                  // deadlines (see the 'message' branch above) and lands in
+                  // the chat transcript as a placeholder — the same reason as
+                  // the storeBotReply in the 'message' branch: without it the
+                  // photo reaches the user but no reader of the history (the
+                  // bot's own context included) ever sees that it was sent.
+                  if (ok) {
+                    notifyRunIpcActivity(sourceGroup, 'photo');
+                    storeBotReply(
+                      data.chatJid,
+                      ipcPhotoHistoryPlaceholder(
+                        String(data.filePath),
+                        typeof data.caption === 'string'
+                          ? data.caption
+                          : undefined,
+                      ),
+                    );
+                    logger.info(
+                      {
+                        chatJid: data.chatJid,
+                        sourceGroup,
+                        fileBasename: path.basename(fileValidation.realPath),
+                        ok,
+                      },
+                      'IPC photo sent',
+                    );
+                  } else {
+                    reportIpcDeliveryFailure({
+                      chatJid: String(data.chatJid),
                       sourceGroup,
-                      fileBasename: path.basename(fileValidation.realPath),
-                      ok,
-                    },
-                    'IPC photo sent',
-                  );
+                      medium: 'photo',
+                      reason: 'channel_send_failed',
+                      registeredGroups,
+                      details: {
+                        fileBasename: path.basename(fileValidation.realPath),
+                      },
+                    });
+                  }
                 } else {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
@@ -916,6 +999,10 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     fs.unlinkSync(filePath);
                     continue;
                   }
+                  const sentFileKey = fileValidation.staged
+                    ? String(data.filePath)
+                    : fileValidation.realPath;
+                  noteChatFileSendStarted(sourceGroup, sentFileKey);
                   let ok = false;
                   try {
                     ok = await deps.router.sendDocument(
@@ -924,6 +1011,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       data.caption,
                     );
                   } finally {
+                    noteChatFileSendFinished(sourceGroup, sentFileKey, ok);
                     if (fileValidation.staged) {
                       try {
                         fs.unlinkSync(fileValidation.realPath);
@@ -933,16 +1021,39 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       }
                     }
                   }
-                  if (ok) notifyRunIpcActivity(sourceGroup, 'document');
-                  logger.info(
-                    {
-                      chatJid: data.chatJid,
+                  // Liveness + transcript placeholder, as for photos above.
+                  if (ok) {
+                    notifyRunIpcActivity(sourceGroup, 'document');
+                    storeBotReply(
+                      data.chatJid,
+                      ipcDocumentHistoryPlaceholder(
+                        String(data.filePath),
+                        typeof data.caption === 'string'
+                          ? data.caption
+                          : undefined,
+                      ),
+                    );
+                    logger.info(
+                      {
+                        chatJid: data.chatJid,
+                        sourceGroup,
+                        fileBasename: path.basename(fileValidation.realPath),
+                        ok,
+                      },
+                      'IPC document sent',
+                    );
+                  } else {
+                    reportIpcDeliveryFailure({
+                      chatJid: String(data.chatJid),
                       sourceGroup,
-                      fileBasename: path.basename(fileValidation.realPath),
-                      ok,
-                    },
-                    'IPC document sent',
-                  );
+                      medium: 'document',
+                      reason: 'channel_send_failed',
+                      registeredGroups,
+                      details: {
+                        fileBasename: path.basename(fileValidation.realPath),
+                      },
+                    });
+                  }
                 } else {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
@@ -955,16 +1066,34 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     data.chatJid,
                     data.text,
                   );
-                  if (ok) notifyRunIpcActivity(sourceGroup, 'voice');
-                  logger.info(
-                    {
-                      chatJid: data.chatJid,
+                  // Liveness + transcript placeholder with the spoken text —
+                  // the voice note is the whole answer of such a turn, so the
+                  // bot's next turn must be able to see what it said.
+                  if (ok) {
+                    notifyRunIpcActivity(sourceGroup, 'voice');
+                    storeBotReply(
+                      data.chatJid,
+                      ipcVoiceHistoryPlaceholder(String(data.text)),
+                    );
+                    logger.info(
+                      {
+                        chatJid: data.chatJid,
+                        sourceGroup,
+                        length: String(data.text).length,
+                        ok,
+                      },
+                      'IPC voice sent',
+                    );
+                  } else {
+                    reportIpcDeliveryFailure({
+                      chatJid: String(data.chatJid),
                       sourceGroup,
-                      length: String(data.text).length,
-                      ok,
-                    },
-                    'IPC voice sent',
-                  );
+                      medium: 'voice',
+                      reason: 'channel_send_failed',
+                      registeredGroups,
+                      details: { length: String(data.text).length },
+                    });
+                  }
                 } else {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
@@ -1273,7 +1402,14 @@ export async function processTaskIpc(
     case 'pause_task':
       if (safeTaskId(data.taskId)) {
         const task = getTaskById(data.taskId);
-        if (task && canManageTask(task)) {
+        if (task?.status === 'cancelled' && canManageTask(task)) {
+          // A cancelled task is history, not a schedule: pausing it would make
+          // it resumable again through the paused→active path.
+          logger.warn(
+            { taskId: data.taskId, sourceGroup },
+            'Cancelled task cannot be paused',
+          );
+        } else if (task && canManageTask(task)) {
           updateTask(data.taskId, { status: 'paused' });
           logger.info(
             { taskId: data.taskId, sourceGroup },
@@ -1291,10 +1427,29 @@ export async function processTaskIpc(
     case 'resume_task':
       if (safeTaskId(data.taskId)) {
         const task = getTaskById(data.taskId);
-        if (task && canManageTask(task)) {
-          updateTask(data.taskId, { status: 'active' });
-          logger.info(
+        if (task?.status === 'cancelled' && canManageTask(task)) {
+          // cancel_task keeps the row (status 'cancelled', next_run NULL) so
+          // the run history survives; it is not a pause and must not be
+          // re-armed by "возобнови задачу". Schedule it anew instead.
+          logger.warn(
             { taskId: data.taskId, sourceGroup },
+            'Cancelled task cannot be resumed',
+          );
+        } else if (task && canManageTask(task)) {
+          // A recurring task the scheduler paused after an uncertain side
+          // effect or too many failures has next_run NULL and would never be
+          // due again; re-arm it at its next slot (task-next-run.ts).
+          const rearmedNextRun = nextRunForResumedTask(task);
+          updateTask(data.taskId, {
+            status: 'active',
+            ...(rearmedNextRun ? { next_run: rearmedNextRun } : {}),
+          });
+          logger.info(
+            {
+              taskId: data.taskId,
+              sourceGroup,
+              ...(rearmedNextRun ? { nextRun: rearmedNextRun } : {}),
+            },
             'Task resumed via IPC',
           );
         } else {
@@ -1322,7 +1477,10 @@ export async function processTaskIpc(
             break;
           }
           await deleteCalendarEventForTask(data.taskId, deps);
-          deleteTask(data.taskId);
+          // Soft cancellation preserves the task row and run history.
+          // Physical deletion is reserved for bulk cleanup_tasks. The calendar
+          // link is marked deleted after confirmed external deletion.
+          updateTask(data.taskId, { status: 'cancelled', next_run: null });
           logger.info(
             { taskId: data.taskId, sourceGroup },
             'Task cancelled via IPC',
@@ -1471,6 +1629,33 @@ export async function processTaskIpc(
         }
 
         updateTask(data.taskId, updates);
+
+        // Re-mirror a task that already had a calendar event. Before recurring
+        // tasks were mirrored this only risked a stale one-off entry; a stale
+        // RRULE would go on firing on the old rule indefinitely, and nothing in
+        // the chat contradicts it. Gated on effectiveOwner for the same reason
+        // creation is: a guest must never reach the owner's calendar.
+        if (
+          effectiveOwner &&
+          (data.prompt !== undefined ||
+            data.schedule_type !== undefined ||
+            data.schedule_value !== undefined) &&
+          getCalendarEventLink(data.taskId)?.status === 'active'
+        ) {
+          const updatedTask = getTaskById(data.taskId);
+          if (updatedTask) {
+            await deleteCalendarEventForTask(data.taskId, deps);
+            // requested:true keeps the event the owner already asked for, while
+            // shouldCreateCalendarEventForTask still declines a schedule that
+            // has no exact RRULE translation.
+            await createCalendarEventForTask({
+              task: updatedTask,
+              requested: true,
+              deps,
+            });
+          }
+        }
+
         logger.info(
           { taskId: data.taskId, sourceGroup, updates },
           'Task updated via IPC',

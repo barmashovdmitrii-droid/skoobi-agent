@@ -33,6 +33,7 @@ import {
 const OBSERVER_BATCH_CHUNK_SIZE = 1_000;
 const OBSERVER_MEDIA_BACKFILL_PROGRESS_KEY =
   'whatsapp_observer_media_backfill.v1';
+const OBSERVER_MEDIA_GAPS_REPORT_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 function observerStoreInput(message: WhatsAppObservedMessage) {
   return {
@@ -200,6 +201,20 @@ const host: WhatsAppChannelHost = {
         return { ...value, fromMe: value.fromMe === 1 };
       });
   },
+  countObservedMediaGaps() {
+    // Те же строки, которые backfill считает пропусками (media_enriched = 0 у
+    // медиа в личных и групповых чатах). Только число — без идентификаторов.
+    const row = getDb()
+      .prepare(
+        `SELECT COUNT(*) AS c
+           FROM observed_whatsapp_messages
+          WHERE message_kind IN ('image', 'video', 'voice', 'audio', 'document')
+            AND media_enriched = 0
+            AND (chat_jid GLOB '*@s.whatsapp.net' OR chat_jid GLOB '*@g.us')`,
+      )
+      .get() as { c: number } | undefined;
+    return Number(row?.c ?? 0);
+  },
   getObservedMediaBackfillProgress() {
     const raw = getRouterState(OBSERVER_MEDIA_BACKFILL_PROGRESS_KEY);
     if (!raw) return undefined;
@@ -226,6 +241,23 @@ const host: WhatsAppChannelHost = {
 
 const OBSERVER_PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 let observerPruneTimer: NodeJS.Timeout | null = null;
+let observerMediaGapsTimer: NodeJS.Timeout | null = null;
+
+    // Report the aggregate number of observer media gaps once a day, without
+    // exposing message content or identifiers.
+function reportObserverMediaGaps(): void {
+  try {
+    logger.info(
+      { gaps: host.countObservedMediaGaps!() },
+      'WhatsApp observer media gaps (media_enriched = 0)',
+    );
+  } catch (error) {
+    logger.warn(
+      { errorKind: error instanceof Error ? error.name || 'Error' : typeof error },
+      'WhatsApp observer media gap count unavailable',
+    );
+  }
+}
 
 function enforceObserverRetention(): void {
   try {
@@ -266,6 +298,14 @@ registerChannel('whatsapp', (opts: ChannelOpts) => {
         OBSERVER_PRUNE_INTERVAL_MS,
       );
       observerPruneTimer.unref();
+    }
+    reportObserverMediaGaps();
+    if (!observerMediaGapsTimer) {
+      observerMediaGapsTimer = setInterval(
+        reportObserverMediaGaps,
+        OBSERVER_MEDIA_GAPS_REPORT_INTERVAL_MS,
+      );
+      observerMediaGapsTimer.unref();
     }
   }
   // WhatsApp auth is file-based (store/auth/creds.json from Baileys).

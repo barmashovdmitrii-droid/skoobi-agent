@@ -36,7 +36,6 @@ export interface ChannelOpts {
   tenantRegistry?: () => TenantRegistry;
   ownerAllowlist?: () => OwnerAllowlistConfig;
   onTelegramCallbackQuery?: OnTelegramCallbackQuery;
-  onPlanPurchase?: OnPlanPurchase;
 }
 
 export type ChannelFactory = (opts: ChannelOpts) => Channel | null;

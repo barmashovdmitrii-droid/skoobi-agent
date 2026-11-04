@@ -38,7 +38,85 @@ export type ServiceStatus = {
   name: string;
   state: 'ok' | 'warn' | 'down';
   detail: string;
+  /** Last exit code from `launchctl print`; null when unknown/never exited. */
+  lastExitCode?: number | null;
+  /** How many times launchd has (re)started the job since it was loaded. */
+  runs?: number | null;
+  /** Age of the heartbeat log in seconds, when the unit declares one. */
+  heartbeatAgeSec?: number | null;
+  /** True when a periodic job has not written its log for 2+ periods. */
+  stale?: boolean;
 };
+
+/**
+ * `daemon`   — KeepAlive, expected to hold a pid forever. pid '-' is a problem.
+ * `periodic` — StartInterval/StartCalendarInterval. pid '-' is the NORMAL idle
+ *              state between runs; only a bad exit code or a stale heartbeat
+ *              means anything. Treating these two kinds alike is why a naive
+ *              list would show every cron-ish job as permanently "stopped".
+ */
+type LaunchdKind = 'daemon' | 'periodic';
+
+type LaunchdUnit = {
+  id: string;
+  name: string;
+  label: string | null;
+  kind: LaunchdKind;
+  /** Nominal period in seconds; drives the staleness threshold (2 periods). */
+  periodSec?: number;
+  /**
+   * Log that this job appends to on EVERY run, used as a liveness heartbeat.
+   *
+   * Deliberately absent for jobs that are silent on a no-op run — log-roller
+   * only prints when it actually rolls, so its mtime sits months in the past
+   * while the job is perfectly healthy. Checking freshness there would
+   * manufacture a permanent false alarm, which is worse than no check.
+   */
+  heartbeatLog?: string;
+};
+
+/**
+ * `launchctl print gui/<uid>/<label>` exposes fields `launchctl list` does not:
+ * the last exit code and the restart count. That is the difference between
+ * "the bot is running" and "the bot is running but has repeatedly crashed".
+ */
+async function readLaunchdDetail(
+  label: string,
+  executor: LaunchctlListExecutor = defaultLaunchctlListExecutor,
+): Promise<{ lastExitCode: number | null; runs: number | null }> {
+  try {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+    const { stdout } = await executor(
+      'launchctl',
+      ['print', `gui/${uid}/${label}`],
+      { timeout: 5000 },
+    );
+    const exitMatch = stdout.match(/last exit code\s*=\s*(-?\d+)/i);
+    const runsMatch = stdout.match(/^\s*runs\s*=\s*(\d+)/im);
+    return {
+      lastExitCode: exitMatch ? Number(exitMatch[1]) : null,
+      runs: runsMatch ? Number(runsMatch[1]) : null,
+    };
+  } catch {
+    // Not loaded, or launchctl refused — the caller already knows from `list`.
+    return { lastExitCode: null, runs: null };
+  }
+}
+
+function heartbeatAgeSec(file: string): number | null {
+  try {
+    return (Date.now() - fs.statSync(file).mtimeMs) / 1000;
+  } catch {
+    return null;
+  }
+}
+
+function formatAge(sec: number): string {
+  if (sec < 90) return `${Math.round(sec)} с`;
+  if (sec < 5400) return `${Math.round(sec / 60)} мин`;
+  if (sec < 172800) return `${Math.round(sec / 3600)} ч`;
+  return `${Math.round(sec / 86400)} дн`;
+}
 
 export async function collectServices(
   deps: { launchctlExecutor?: LaunchctlListExecutor } = {},
@@ -49,16 +127,13 @@ export async function collectServices(
   } catch (err) {
     logger.warn({ err }, 'dashboard: invalid main service label');
   }
-  const units: Array<{
-    id: string;
-    name: string;
-    label: string | null;
-  }> = [
-    { id: 'main', name: 'Скуби', label: mainLabel },
+  const units: LaunchdUnit[] = [
+    { id: 'main', name: 'Скуби', label: mainLabel, kind: 'daemon' },
     {
       id: 'dashboard',
       name: 'Локальная панель',
       label: 'com.skoobi.dashboard',
+      kind: 'daemon',
     },
   ];
   let listOut = '';
@@ -75,6 +150,23 @@ export async function collectServices(
     const m = line.match(/^(\S+)\s+(\S+)\s+(\S+)$/);
     if (m) rows.set(m[3], { pid: m[1], status: m[2] });
   }
+
+  // One `launchctl print` per unit: run them concurrently so the dashboard's
+  // /api/overview does not serialise a process spawn per row.
+  const details = new Map<
+    string,
+    { lastExitCode: number | null; runs: number | null }
+  >();
+  await Promise.all(
+    units.map(async (unit) => {
+      if (!unit.label) return;
+      details.set(
+        unit.label,
+        await readLaunchdDetail(unit.label, deps.launchctlExecutor),
+      );
+    }),
+  );
+
   const services: ServiceStatus[] = [];
   for (const unit of units) {
     if (!unit.label) {
@@ -87,31 +179,89 @@ export async function collectServices(
       continue;
     }
     const row = rows.get(unit.label);
+    const detail = details.get(unit.label) ?? {
+      lastExitCode: null,
+      runs: null,
+    };
+    const { lastExitCode, runs } = detail;
+
     if (!row) {
       services.push({
         id: unit.id,
         name: unit.name,
         state: 'down',
         detail: 'служба не загружена',
+        lastExitCode,
+        runs,
+        heartbeatAgeSec: null,
+        stale: false,
       });
-    } else if (row.pid !== '-') {
-      services.push({
-        id: unit.id,
-        name: unit.name,
-        state: 'ok',
-        detail: 'работает',
-      });
-    } else {
-      services.push({
-        id: unit.id,
-        name: unit.name,
-        state: row.status === '0' ? 'warn' : 'down',
-        detail:
+      continue;
+    }
+
+    const ageSec = unit.heartbeatLog
+      ? heartbeatAgeSec(unit.heartbeatLog)
+      : null;
+    const staleLimit = unit.periodSec ? unit.periodSec * 2 : null;
+    const stale =
+      ageSec !== null && staleLimit !== null ? ageSec > staleLimit : false;
+
+    const notes: string[] = [];
+    let state: ServiceStatus['state'];
+
+    if (unit.kind === 'daemon') {
+      if (row.pid !== '-') {
+        state = 'ok';
+        notes.push('работает');
+      } else {
+        // A KeepAlive job with no pid is genuinely down, whatever the code.
+        state = row.status === '0' ? 'warn' : 'down';
+        notes.push(
           row.status === '0'
             ? 'остановлена (без ошибки)'
             : `остановлена, код ${row.status}`,
-      });
+        );
+      }
+    } else {
+      // Periodic: idle between runs is the healthy steady state.
+      if (row.pid !== '-') {
+        state = 'ok';
+        notes.push('выполняется сейчас');
+      } else if (lastExitCode !== null && lastExitCode !== 0) {
+        state = 'warn';
+        notes.push(`последний запуск с ошибкой, код ${lastExitCode}`);
+      } else if (stale) {
+        state = 'warn';
+        notes.push('давно не отчитывалась');
+      } else {
+        state = 'ok';
+        notes.push('ждёт следующего запуска');
+      }
     }
+
+    // Surface a bad exit code even on a currently-running daemon: that is the
+    // crash-loop signal the old two-unit collector could not show at all.
+    if (unit.kind === 'daemon' && lastExitCode !== null && lastExitCode !== 0) {
+      notes.push(`прошлый выход с кодом ${lastExitCode}`);
+      if (state === 'ok') state = 'warn';
+    }
+    if (stale && ageSec !== null && !notes.some((n) => n.includes('давно'))) {
+      notes.push(`лог молчит ${formatAge(ageSec)}`);
+      if (state === 'ok') state = 'warn';
+    } else if (ageSec !== null && !stale) {
+      notes.push(`отчёт ${formatAge(ageSec)} назад`);
+    }
+
+    services.push({
+      id: unit.id,
+      name: unit.name,
+      state,
+      detail: notes.join(', '),
+      lastExitCode,
+      runs,
+      heartbeatAgeSec: ageSec === null ? null : Math.round(ageSec),
+      stale,
+    });
   }
   return services;
 }
@@ -135,6 +285,7 @@ export function collectOverviewNumbers(): {
   events5m: number;
   errors24h: number;
   tasksToday: number;
+  toolErrors24h: number;
 } {
   const db = readDb();
   const now = Date.now();
@@ -161,7 +312,47 @@ export function collectOverviewNumbers(): {
       )
       .get(endOfDay.toISOString()) as { c: number }
   ).c;
-  return { events5m, errors24h, tasksToday };
+  return {
+    events5m,
+    errors24h,
+    tasksToday,
+    toolErrors24h: countToolErrorsSince(now - 24 * 3600_000),
+  };
+}
+
+/**
+ * Сбои инструментов: tool_errors, которые раннер пишет в
+ * session_finished, — только «Script failed» и isError; ненулевой код выхода
+ * команды сбоем не считается. Сторож шлёт сведение при ≥ 3 сбоях одного
+ * инструмента за сутки; здесь — общая цифра.
+ */
+export function countToolErrorsSince(sinceMs: number): number {
+  let total = 0;
+  try {
+    const rows = readDb()
+      .prepare(
+        `SELECT json_extract(payload_json, '$.tool_errors') AS errors FROM events
+         WHERE type = 'session_finished' AND created_at >= ?
+           AND json_extract(payload_json, '$.tool_errors') IS NOT NULL`,
+      )
+      .all(sinceMs) as Array<{ errors: string | null }>;
+    for (const row of rows) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(row.errors ?? '');
+      } catch {
+        continue;
+      }
+      if (!parsed || typeof parsed !== 'object') continue;
+      for (const count of Object.values(parsed as Record<string, unknown>)) {
+        const n = Number(count);
+        if (Number.isFinite(n) && n > 0) total += n;
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'dashboard: tool error count failed');
+  }
+  return total;
 }
 
 // Ошибки за сутки — ровно та же выборка, по которой collectOverviewNumbers
@@ -761,8 +952,20 @@ export type TaskRow = {
   statusRaw: string;
   nextRun: string;
   lastResult: string;
+  /**
+   * Разовая задача, чей последний результат целиком служебный (<internal>):
+   * роутер его вырезает, в чат ничего не уходит. Бейдж «результат скрыт».
+   */
+  resultHidden: boolean;
   hasCalendar: boolean;
 };
+
+export function taskResultHidden(
+  scheduleType: string | null,
+  lastResult: string | null,
+): boolean {
+  return scheduleType === 'once' && /^\s*<internal>/iu.test(lastResult || '');
+}
 
 export function collectTasks(): TaskRow[] {
   const names = chatNameMap();
@@ -807,6 +1010,7 @@ export function collectTasks(): TaskRow[] {
           })
         : '—',
       lastResult: String(r.last_result || '').slice(0, 160),
+      resultHidden: taskResultHidden(r.schedule_type, r.last_result),
       hasCalendar: calendarIds.has(r.id),
     };
   });

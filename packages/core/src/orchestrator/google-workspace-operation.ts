@@ -887,3 +887,29 @@ export function googleWorkspaceOperationFingerprint(
   };
   return sha256Hex(JSON.stringify(operation));
 }
+
+/**
+ * The same fingerprint without the read precondition a write carries
+ * (expectedDigest, expectedRevisionId): tool, target, payload and every other
+ * argument stay in. Two calls that differ only in what the caller read before
+ * writing describe the same write. Used only to journal the sheet appends of
+ * one scheduled-task occurrence (GoogleOperationPolicy.scheduledOccurrence).
+ */
+export function googleWorkspaceWriteFingerprintWithoutPrecondition(
+  raw: GoogleWorkspaceOperation,
+): Sha256Hex {
+  const canonical = canonicalGoogleWorkspaceEnvelopeObject(raw);
+  const {
+    expectedDigest: _expectedDigest,
+    expectedRevisionId: _expectedRevisionId,
+    ...args
+  } = canonical.args as unknown as Record<string, unknown>;
+  return sha256Hex(
+    JSON.stringify([
+      'skoobi.google.write-without-precondition.v1',
+      canonical.type,
+      canonical.tool,
+      args,
+    ]),
+  );
+}

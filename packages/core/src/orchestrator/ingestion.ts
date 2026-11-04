@@ -17,6 +17,14 @@ import { randomUUID } from 'crypto';
 import { storeMessage } from './db.js';
 import { logger } from './logger.js';
 
+/** No inbound record was committed; the caller may safely retry this request. */
+export class IngestionPersistenceError extends Error {
+  constructor(cause: unknown) {
+    super('Inbound message could not be persisted', { cause });
+    this.name = 'IngestionPersistenceError';
+  }
+}
+
 export interface IngestionDeps {
   /** Check if a group requires trigger and whether the message has one */
   checkTrigger: (
@@ -83,15 +91,12 @@ export function createMessageIngestion(
       if (current.triggerType !== 'channel') {
         // Append randomUUID() so two deliveries to the same group within the
         // same millisecond can't produce an identical id (storeMessage uses
-        // INSERT OR REPLACE keyed on (id, chat_jid), which would otherwise
+        // an upsert keyed on (id, chat_jid), which would otherwise
         // silently overwrite the first message with the second).
         const msgId = `${current.triggerType}-${Date.now()}-${randomUUID()}`;
-        // Defense in depth (finding #48): never let a DB error (e.g. a
-        // transient SQLITE_BUSY during the retention VACUUM window, or disk
-        // full) propagate out of the ingestion handler and abort/destabilize
-        // the single shared inbound path for all tenants. The WAL + busy_timeout
-        // pragmas make SQLITE_BUSY unlikely; if a write still fails, log it and
-        // continue — the message simply isn't persisted, same as a dropped one.
+        // Acknowledgement means durable acceptance, not merely an enqueue
+        // attempt. Surface a typed retryable failure without invoking hooks
+        // or the queue when storage did not commit the inbound record.
         try {
           storeMessage({
             id: msgId,
@@ -104,8 +109,9 @@ export function createMessageIngestion(
         } catch (err) {
           logger.error(
             { err, chatJid: current.chatJid },
-            'Failed to persist ingested message (continuing)',
+            'Failed to persist ingested message; rejecting acceptance',
           );
+          throw new IngestionPersistenceError(err);
         }
       }
 

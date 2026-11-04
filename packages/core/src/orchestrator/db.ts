@@ -9,10 +9,12 @@ import {
 } from '@skoobi/shared/telegram-identity';
 
 import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
+import { scheduledBotReplyId } from './continuation-context.js';
 import { createEventStoreSchema } from './event-store.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { createProviderCircuitSchema } from './provider-circuit-breaker.js';
+import { ensureMemoryStateSchema } from './memory-state-store.js';
 import { createQuotaSchema } from './quota.js';
 import {
   CalendarEventLink,
@@ -25,6 +27,172 @@ import {
 
 let db: Database.Database;
 let botReplySequence = 0;
+
+export const INITIAL_INGESTION_CURSOR = 'i:0000000000000000';
+const INGESTION_CURSOR_PATTERN = /^i:\d{16}$/;
+
+export function ingestionCursor(sequence: number): string {
+  if (!Number.isSafeInteger(sequence) || sequence < 0) {
+    throw new Error('Invalid message ingestion sequence');
+  }
+  return `i:${String(sequence).padStart(16, '0')}`;
+}
+
+/** Display time is not a delivery checkpoint: channel times can arrive late. */
+export function messageCursor(message: NewMessage): string {
+  return message.ingestion_cursor || message.timestamp;
+}
+
+function isIngestionCursor(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    INGESTION_CURSOR_PATTERN.test(value) &&
+    Number.isSafeInteger(Number(value.slice(2)))
+  );
+}
+
+export function loadMessageIngestionState(): {
+  lastCursor: string;
+  agentCursors: Record<string, string>;
+} {
+  const lastCursor = getRouterState('last_ingestion_cursor');
+  const parsed: unknown = JSON.parse(
+    getRouterState('last_agent_ingestion_cursor') || 'null',
+  );
+  if (
+    !isIngestionCursor(lastCursor) ||
+    !parsed ||
+    typeof parsed !== 'object' ||
+    Array.isArray(parsed) ||
+    !Object.values(parsed).every(isIngestionCursor)
+  ) {
+    // Resetting a corrupt delivery checkpoint would replay historical chats.
+    throw new Error(
+      'Invalid persisted message ingestion state; manual recovery required',
+    );
+  }
+  return { lastCursor, agentCursors: parsed as Record<string, string> };
+}
+
+export function saveMessageIngestionState(
+  lastCursor: string,
+  agentCursors: Record<string, string>,
+): void {
+  if (
+    !isIngestionCursor(lastCursor) ||
+    !Object.values(agentCursors).every(isIngestionCursor)
+  ) {
+    throw new Error('Refusing non-ingestion delivery checkpoint');
+  }
+  db.transaction(() => {
+    setRouterState('last_ingestion_cursor', lastCursor);
+    setRouterState('last_agent_ingestion_cursor', JSON.stringify(agentCursors));
+  })();
+}
+
+/**
+ * One-time, prospective migration. Historical rows are seeded in display-time
+ * order ONLY here so legacy timestamp checkpoints map without replaying their
+ * acknowledged history. All later rows use insertion order, including delayed
+ * media and events older than an already-acknowledged display timestamp.
+ * Keep legacy router keys unchanged for diagnosis; a binary downgrade requires
+ * deliberate cursor conversion, not restoring a stale database snapshot.
+ */
+export function migrateMessageIngestionCursors(
+  database: Database.Database,
+): void {
+  const migration = 'messages.ingestion_cursor.v1';
+  if (
+    database
+      .prepare('SELECT 1 FROM schema_migrations WHERE name = ?')
+      .get(migration)
+  )
+    return;
+  database
+    .transaction(() => {
+      database.exec(`
+      CREATE TABLE message_ingestion (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL,
+        chat_jid TEXT NOT NULL,
+        UNIQUE(id, chat_jid),
+        FOREIGN KEY (id, chat_jid) REFERENCES messages(id, chat_jid) ON DELETE CASCADE
+      );
+      CREATE INDEX idx_message_ingestion_chat ON message_ingestion(chat_jid, sequence);
+      INSERT INTO message_ingestion (id, chat_jid)
+        SELECT id, chat_jid FROM messages
+        WHERE content IS NOT NULL AND content != ''
+        ORDER BY timestamp, rowid;
+    `);
+      const read = (key: string): string | undefined =>
+        (
+          database
+            .prepare('SELECT value FROM router_state WHERE key = ?')
+            .get(key) as { value: string } | undefined
+        )?.value;
+      const write = database.prepare(
+        'INSERT INTO router_state(key, value) VALUES (?, ?)',
+      );
+      const convert = (timestamp: string, jid?: string): string => {
+        const row = database
+          .prepare(
+            `
+        SELECT COALESCE(MAX(mi.sequence), 0) AS sequence
+        FROM message_ingestion mi JOIN messages m ON m.id = mi.id AND m.chat_jid = mi.chat_jid
+        WHERE m.timestamp <= ? ${jid === undefined ? '' : 'AND m.chat_jid = ?'}
+      `,
+          )
+          .get(...(jid === undefined ? [timestamp] : [timestamp, jid])) as {
+          sequence: number;
+        };
+        return ingestionCursor(row.sequence);
+      };
+      const legacyAgent = read('last_agent_timestamp');
+      let parsed: unknown = legacyAgent ? JSON.parse(legacyAgent) : {};
+      if (
+        !parsed ||
+        typeof parsed !== 'object' ||
+        Array.isArray(parsed) ||
+        Object.values(parsed).some((value) => typeof value !== 'string')
+      ) {
+        throw new Error(
+          'Cannot safely migrate malformed agent delivery cursors',
+        );
+      }
+      const agentCursors = Object.fromEntries(
+        Object.entries(parsed).map(([jid, timestamp]) => [
+          jid,
+          convert(timestamp as string, jid),
+        ]),
+      );
+      write.run('last_ingestion_cursor', convert(read('last_timestamp') || ''));
+      write.run('last_agent_ingestion_cursor', JSON.stringify(agentCursors));
+      database.exec(`
+      CREATE TRIGGER message_ingestion_insert AFTER INSERT ON messages
+      WHEN NEW.content IS NOT NULL AND NEW.content != ''
+      BEGIN
+        INSERT OR IGNORE INTO message_ingestion(id, chat_jid) VALUES(NEW.id, NEW.chat_jid);
+      END;
+      CREATE TRIGGER message_ingestion_materialized AFTER UPDATE OF content ON messages
+      WHEN (OLD.content IS NULL OR OLD.content = '') AND NEW.content IS NOT NULL AND NEW.content != ''
+      BEGIN
+        INSERT OR IGNORE INTO message_ingestion(id, chat_jid) VALUES(NEW.id, NEW.chat_jid);
+      END;
+      -- The retention connection may not enable SQLite foreign keys. Keep
+      -- this small index in step with message retention in either case.
+      CREATE TRIGGER message_ingestion_delete AFTER DELETE ON messages
+      BEGIN
+        DELETE FROM message_ingestion WHERE id = OLD.id AND chat_jid = OLD.chat_jid;
+      END;
+    `);
+      database
+        .prepare(
+          'INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)',
+        )
+        .run(migration, new Date().toISOString());
+    })
+    .immediate();
+}
 
 /**
  * better-sqlite3 throws `duplicate column name: X` when an ALTER TABLE ADD
@@ -208,6 +376,11 @@ export function createSchema(
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
     CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp);
+    -- Горячий запрос — история КОНКРЕТНОГО чата по времени. Глобального
+    -- idx_timestamp для него мало: планировщик берёт по времени и фильтрует
+    -- chat_jid уже строками.
+    CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
+      ON messages(chat_jid, timestamp DESC);
     CREATE TABLE IF NOT EXISTS message_metadata (
       id TEXT,
       chat_jid TEXT,
@@ -241,6 +414,7 @@ export function createSchema(
       ON observed_whatsapp_messages(timestamp DESC, message_id DESC);
     CREATE INDEX IF NOT EXISTS idx_observed_whatsapp_chat_timestamp
       ON observed_whatsapp_messages(chat_jid, timestamp DESC, message_id DESC);
+
 
     CREATE TABLE IF NOT EXISTS scheduled_tasks (
       id TEXT PRIMARY KEY,
@@ -377,7 +551,6 @@ export function createSchema(
   `);
 
   createEventStoreSchema(database);
-  createQuotaSchema(database);
   createProviderCircuitSchema(database);
 
   // Run plugin DB schema (plugins register on import before DB init)
@@ -388,6 +561,7 @@ export function createSchema(
   // Each migration below is idempotent: ALTER TABLE ADD COLUMN throws
   // "duplicate column name" on already-migrated DBs (swallowed by
   // runMigration), while genuine failures are logged and rethrown.
+
 
   // Existing journal rows predate exact-payload binding. The added column is
   // deliberately nullable on migrated databases: there is not enough durable
@@ -474,6 +648,11 @@ export function createSchema(
       `ALTER TABLE scheduled_tasks ADD COLUMN creator_sender_id TEXT`,
     );
   });
+  // Nullable on purpose: legacy and IPC-created rows keep the normal run.
+  // 'read_only' pins a task (the nightly review) to reading only.
+  runMigration('scheduled_tasks.run_profile', () => {
+    database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN run_profile TEXT`);
+  });
 
   // Add is_bot_message column if it doesn't exist (migration for existing DBs).
   // The ALTER and its backfill are wrapped in a transaction so the column add
@@ -519,6 +698,8 @@ export function createSchema(
     database.exec(`ALTER TABLE registered_groups ADD COLUMN runtime TEXT`);
   });
 
+  createQuotaSchema(database);
+
   backfillLegacyOwnerDmTaskProvenance(database, ownerAllowlist);
 
   // Add channel and is_group columns if they don't exist (migration for
@@ -558,6 +739,8 @@ export function createSchema(
       );
     })();
   });
+  // Additive tables only: historical notes and conversations stay intact.
+  ensureMemoryStateSchema(database);
 }
 
 export function initDatabase(pluginDbSchema: string[] = []): void {
@@ -581,12 +764,21 @@ export function initDatabase(pluginDbSchema: string[] = []): void {
   // no-op there, so they are intentionally NOT set inside createSchema().
   db.pragma('journal_mode = WAL');
   db.pragma('busy_timeout = 5000');
+  // Cap the WAL file. wal_autocheckpoint only lets SQLite REUSE space inside
+  // the WAL — it never shrinks the file, so the WAL keeps whatever high-water
+  // mark it ever reached. The nightly db-retention VACUUM above rewrites the
+  // entire DB through the WAL, which is how a 51 MB messages.db ended up with a
+  // 55 MB messages.db-wal beside it. journal_size_limit makes each checkpoint
+  // truncate the file back down to this bound instead.
+  db.pragma('journal_size_limit = 16777216'); // 16 MB
   hardenDatabaseFilePermissions(dbPath);
 
   createSchema(db, pluginDbSchema);
 
   // Migrate from JSON files if they exist
   migrateJsonState();
+
+  migrateMessageIngestionCursors(db);
 
   hardenDatabaseFilePermissions(dbPath);
 }
@@ -624,6 +816,7 @@ export function hardenDatabaseFilePermissions(databasePath: string): void {
 export function _initTestDatabase(): void {
   db = new Database(':memory:');
   createSchema(db);
+  migrateMessageIngestionCursors(db);
 }
 
 /**
@@ -711,6 +904,7 @@ function ensureChatExists(chatJid: string): void {
 }
 
 type StoredMessageRow = Omit<NewMessage, 'sender_identity'> & {
+  ingestion_sequence?: number;
   is_from_me?: number | boolean;
   is_bot_message?: number | boolean;
   telegram_update_id?: string | null;
@@ -762,6 +956,11 @@ function hydrateStoredMessage(row: StoredMessageRow): NewMessage {
     sender_name: row.sender_name,
     content: row.content,
     timestamp: row.timestamp,
+    ...(row.ingestion_sequence === undefined
+      ? {}
+      : {
+          ingestion_cursor: ingestionCursor(row.ingestion_sequence),
+        }),
     is_from_me: row.is_from_me as boolean | undefined,
     is_bot_message: row.is_bot_message as boolean | undefined,
     tenant_id: row.tenant_id,
@@ -792,24 +991,58 @@ function storeMessageMetadata(msg: NewMessage): void {
 }
 
 /**
+ * True when exactly this message — same id, same non-empty content — is
+ * already stored, i.e. a channel redelivery that adds nothing new.
+ */
+export function isStoredDuplicateMessage(
+  id: string,
+  chatJid: string,
+  content: string,
+): boolean {
+  if (!id || !content) return false;
+  const row = db
+    .prepare(`SELECT content FROM messages WHERE id = ? AND chat_jid = ?`)
+    .get(id, chatJid) as { content?: string } | undefined;
+  return row?.content === content;
+}
+
+/**
  * Store a message with full content.
  * Only call this for registered groups where message history is needed.
  */
 export function storeMessage(msg: NewMessage): void {
-  ensureChatExists(msg.chat_jid);
-  db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    msg.id,
-    msg.chat_jid,
-    msg.sender,
-    msg.sender_name,
-    msg.content,
-    msg.timestamp,
-    msg.is_from_me ? 1 : 0,
-    msg.is_bot_message ? 1 : 0,
-  );
-  storeMessageMetadata(msg);
+  db.transaction(() => {
+    ensureChatExists(msg.chat_jid);
+    // REPLACE is a DELETE+INSERT: it cascades away metadata and would allocate
+    // another ingestion sequence on channel redelivery. UPSERT preserves both.
+    db.prepare(
+      `
+      INSERT INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id, chat_jid) DO UPDATE SET
+        sender = excluded.sender, sender_name = excluded.sender_name,
+        content = CASE WHEN excluded.content = '' THEN messages.content ELSE excluded.content END,
+        -- A channel redelivery reuses the id with a new server time: keep the
+        -- first-seen time. WhatsApp re-sent one old self-chat message 218
+        -- times, and each copy made it the newest message in the recent
+        -- context (health walk 27.09).
+        timestamp = messages.timestamp, is_from_me = excluded.is_from_me,
+        is_bot_message = excluded.is_bot_message
+    `,
+    ).run(
+      msg.id,
+      msg.chat_jid,
+      msg.sender,
+      msg.sender_name,
+      msg.content,
+      msg.timestamp,
+      msg.is_from_me ? 1 : 0,
+      msg.is_bot_message ? 1 : 0,
+    );
+    // The trigger-generated ingestion record and provenance must commit with
+    // the message. A storage error means NONE of this ingestion was committed.
+    storeMessageMetadata(msg);
+  })();
 }
 
 /**
@@ -825,29 +1058,58 @@ export function storeMessageDirect(msg: {
   is_from_me: boolean;
   is_bot_message?: boolean;
 }): void {
-  ensureChatExists(msg.chat_jid);
-  db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    msg.id,
-    msg.chat_jid,
-    msg.sender,
-    msg.sender_name,
-    msg.content,
-    msg.timestamp,
-    msg.is_from_me ? 1 : 0,
-    msg.is_bot_message ? 1 : 0,
-  );
+  storeMessage(msg);
+}
+
+function getMessagesAfterIngestionCursor(
+  jids: string[],
+  cursor: string,
+  botPrefix: string,
+  limit: number,
+): NewMessage[] {
+  if (
+    !INGESTION_CURSOR_PATTERN.test(cursor) ||
+    !Number.isSafeInteger(Number(cursor.slice(2)))
+  ) {
+    throw new Error('Invalid persisted message ingestion cursor');
+  }
+  if (jids.length === 0) return [];
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10000) {
+    throw new Error('Invalid message ingestion page size');
+  }
+  const rows = db
+    .prepare(
+      `
+    SELECT m.*, mi.sequence AS ingestion_sequence, mm.telegram_update_id, mm.sender_identity_json
+    FROM message_ingestion mi
+    JOIN messages m ON m.id = mi.id AND m.chat_jid = mi.chat_jid
+    LEFT JOIN message_metadata mm ON mm.id = m.id AND mm.chat_jid = m.chat_jid
+    WHERE mi.sequence > ? AND mi.chat_jid IN (${jids.map(() => '?').join(',')})
+      AND m.is_bot_message = 0 AND m.content NOT LIKE ?
+      AND m.content != '' AND m.content IS NOT NULL
+    ORDER BY mi.sequence ASC LIMIT ?
+  `,
+    )
+    .all(
+      Number(cursor.slice(2)),
+      ...jids,
+      `[${botPrefix}]%`,
+      limit,
+    ) as StoredMessageRow[];
+  return hydrateStoredMessages(rows);
 }
 
 export function storeBotReply(
   chatJid: string,
   content: string,
   timestamp: string = new Date().toISOString(),
+  origin?: 'scheduled-task',
 ): void {
   botReplySequence = (botReplySequence + 1) % Number.MAX_SAFE_INTEGER;
   storeMessageDirect({
-    id: `bot-${timestamp}-${botReplySequence}`,
+    id: origin === 'scheduled-task'
+      ? scheduledBotReplyId(timestamp, botReplySequence)
+      : `bot-${timestamp}-${botReplySequence}`,
     chat_jid: chatJid,
     sender: ASSISTANT_NAME,
     sender_name: ASSISTANT_NAME,
@@ -864,6 +1126,20 @@ export function getNewMessages(
   botPrefix: string,
   limit: number = 200,
 ): { messages: NewMessage[]; newTimestamp: string } {
+  if (lastTimestamp.startsWith('i:')) {
+    const messages = getMessagesAfterIngestionCursor(
+      jids,
+      lastTimestamp,
+      botPrefix,
+      limit,
+    );
+    return {
+      messages,
+      newTimestamp: messages.length
+        ? messageCursor(messages[messages.length - 1])
+        : lastTimestamp,
+    };
+  }
   if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
 
   const placeholders = jids.map(() => '?').join(',');
@@ -931,12 +1207,36 @@ export function getNewMessages(
   return { messages: hydrateStoredMessages(rows), newTimestamp };
 }
 
+/** Exact host-checkpoint recovery, independent of an already advanced cursor. */
+export function getMessagesByIds(chatJid: string, ids: readonly string[]): NewMessage[] {
+  const unique = [...new Set(ids)].filter((id) => typeof id === 'string' && id.length > 0 && id.length <= 256);
+  if (!unique.length || unique.length > 1000) return [];
+  const rows = db.prepare(`
+    SELECT m.*, mi.sequence AS ingestion_sequence, mm.telegram_update_id, mm.sender_identity_json
+    FROM messages m
+    JOIN message_ingestion mi ON mi.id = m.id AND mi.chat_jid = m.chat_jid
+    LEFT JOIN message_metadata mm ON mm.id = m.id AND mm.chat_jid = m.chat_jid
+    WHERE m.chat_jid = ? AND m.id IN (${unique.map(() => '?').join(',')})
+      AND m.is_bot_message = 0 AND m.content IS NOT NULL AND m.content != ''
+    ORDER BY mi.sequence
+  `).all(chatJid, ...unique) as StoredMessageRow[];
+  return hydrateStoredMessages(rows);
+}
+
 export function getMessagesSince(
   chatJid: string,
   sinceTimestamp: string,
   botPrefix: string,
   limit: number = 200,
 ): NewMessage[] {
+  if (sinceTimestamp.startsWith('i:')) {
+    return getMessagesAfterIngestionCursor(
+      [chatJid],
+      sinceTimestamp,
+      botPrefix,
+      limit,
+    );
+  }
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   // Subquery takes the N most recent, outer query re-sorts chronologically.
@@ -1084,9 +1384,9 @@ export function createTask(
     INSERT INTO scheduled_tasks (
       id, group_folder, chat_jid, prompt, schedule_type, schedule_value,
       context_mode, next_run, status, created_at, creator_authorization,
-      creator_identity_id, creator_sender_id
+      creator_identity_id, creator_sender_id, run_profile
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
@@ -1102,6 +1402,7 @@ export function createTask(
     task.creator_authorization || null,
     task.creator_identity_id || null,
     task.creator_sender_id || null,
+    task.run_profile || null,
   );
 }
 
@@ -1280,6 +1581,23 @@ export function updateTaskAfterRun(
     WHERE id = ?
   `,
   ).run(nextRun, now, lastResult, nextRun, id);
+}
+
+
+
+export function consecutiveTaskFailures(taskId: string, limit = 10): number {
+  const rows = db
+    .prepare(
+      `SELECT status FROM task_run_logs
+       WHERE task_id = ? ORDER BY run_at DESC, rowid DESC LIMIT ?`,
+    )
+    .all(taskId, limit) as { status: string }[];
+  let streak = 0;
+  for (const row of rows) {
+    if (row.status !== 'error') break;
+    streak += 1;
+  }
+  return streak;
 }
 
 export function logTaskRun(log: TaskRunLog): void {

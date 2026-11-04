@@ -16,11 +16,6 @@ import {
   resetProviderCircuit,
   type ProviderCircuitConfig,
 } from './provider-circuit-breaker.js';
-import {
-  chargeQuotaUsage,
-  loadBillingConfig,
-  quotaIdempotencyKey,
-} from './quota.js';
 import type { TenantRecord } from './tenant-registry.js';
 
 const provider = 'codex_subscription_cli';
@@ -32,7 +27,6 @@ const config: ProviderCircuitConfig = {
   halfOpenProbeWindowMs: 1_000,
   probeTimeoutMarginMs: 0,
 };
-const billingEnabledConfig = loadBillingConfig({ enabled: true });
 
 function tenant(): TenantRecord {
   return {
@@ -132,7 +126,7 @@ describe('provider circuit breaker', () => {
     expect(
       recordProviderCircuitFailure({
         provider,
-        reason: 'timeout',
+        reason: 'unavailable',
         now: 100,
         config,
       }),
@@ -178,11 +172,132 @@ describe('provider circuit breaker', () => {
     });
   });
 
+  it('does not count a turn timeout while closed — the provider was answering', () => {
+    // A task budget expiring during tool work is not a provider outage.
+    for (const now of [100, 200, 300]) {
+      expect(
+        recordProviderCircuitFailure({
+          provider,
+          reason: 'timeout',
+          now,
+          config,
+        }),
+      ).toMatchObject({ state: 'closed', opened: false, ignored: true });
+    }
+    expect(
+      getProviderCircuitSnapshot(provider, { now: 301, config }),
+    ).toMatchObject({ state: 'closed', failure_count: 0 });
+  });
+
+  it('counts an overloaded provider like any failure, with the usual short cooldown', () => {
+    // «at capacity» three turns in a row (each already retried 2/15/45 s by
+    // the runner) is a real provider signal: a pause of cooldownMs is right,
+    // anything longer is not — the chat must not stay blocked once the
+    // provider has room again.
+    for (const now of [100, 200]) {
+      expect(
+        recordProviderCircuitFailure({
+          provider,
+          reason: 'model_overloaded',
+          now,
+          config,
+        }),
+      ).toMatchObject({ state: 'closed', opened: false });
+    }
+    expect(
+      recordProviderCircuitFailure({
+        provider,
+        reason: 'model_overloaded',
+        now: 300,
+        config,
+      }),
+    ).toMatchObject({
+      state: 'open',
+      opened: true,
+      failureCount: 3,
+      openUntil: 300 + config.cooldownMs,
+    });
+    expect(
+      getProviderCircuitSnapshot(provider, { now: 301, config }),
+    ).toMatchObject({
+      state: 'open',
+      open_until: 1_300,
+      last_reason: 'model_overloaded',
+    });
+  });
+
+  it('forgets failures older than the window before counting a new one', () => {
+    const windowed = { ...config, failureWindowMs: 10_000 };
+    recordProviderCircuitFailure({
+      provider,
+      reason: 'unavailable',
+      now: 100,
+      config: windowed,
+    });
+    recordProviderCircuitFailure({
+      provider,
+      reason: 'unavailable',
+      now: 200,
+      config: windowed,
+    });
+    // A third blip long after the first two starts a new count.
+    expect(
+      recordProviderCircuitFailure({
+        provider,
+        reason: 'unavailable',
+        now: 50_000,
+        config: windowed,
+      }),
+    ).toMatchObject({ state: 'closed', opened: false, failureCount: 1 });
+    // Three within the window still open it.
+    recordProviderCircuitFailure({
+      provider,
+      reason: 'unavailable',
+      now: 51_000,
+      config: windowed,
+    });
+    expect(
+      recordProviderCircuitFailure({
+        provider,
+        reason: 'unavailable',
+        now: 52_000,
+        config: windowed,
+      }),
+    ).toMatchObject({ state: 'open', opened: true, failureCount: 3 });
+  });
+
+  it('does not count host policy refusals as provider failures', () => {
+    for (const now of [100, 200, 300]) {
+      expect(
+        recordProviderCircuitFailure({
+          provider,
+          reason: 'policy_blocked',
+          now,
+          config,
+        }),
+      ).toMatchObject({
+        state: 'closed',
+        opened: false,
+        failureCount: 0,
+        ignored: true,
+      });
+    }
+
+    expect(
+      getProviderCircuitSnapshot(provider, { now: 301, config }),
+    ).toMatchObject({
+      state: 'closed',
+      failure_count: 0,
+      last_failure_at: null,
+      last_reason: null,
+    });
+  });
+
   it('skips Codex and calls Claude immediately when the circuit is open', () => {
     for (const now of [100, 200, 300]) {
       recordProviderCircuitFailure({
         provider,
-        reason: 'timeout',
+        reason: 'unavailable',
         now,
         config,
       });
@@ -219,7 +334,7 @@ describe('provider circuit breaker', () => {
     for (const now of [100, 200, 300]) {
       recordProviderCircuitFailure({
         provider,
-        reason: 'timeout',
+        reason: 'unavailable',
         now,
         config,
       });
@@ -282,7 +397,7 @@ describe('provider circuit breaker', () => {
     for (const now of [100, 200, 300]) {
       recordProviderCircuitFailure({
         provider,
-        reason: 'timeout',
+        reason: 'unavailable',
         now,
         config,
       });
@@ -322,7 +437,7 @@ describe('provider circuit breaker', () => {
     for (const now of [100, 200, 300]) {
       recordProviderCircuitFailure({
         provider,
-        reason: 'timeout',
+        reason: 'unavailable',
         now,
         config,
       });
@@ -364,7 +479,7 @@ describe('provider circuit breaker', () => {
     };
     recordProviderCircuitFailure({
       provider,
-      reason: 'timeout',
+      reason: 'unavailable',
       now: 100,
       config: leaseConfig,
     });
@@ -443,7 +558,7 @@ describe('provider circuit breaker', () => {
     };
     recordProviderCircuitFailure({
       provider,
-      reason: 'timeout',
+      reason: 'unavailable',
       now: 100,
       config: longProbeConfig,
     });
@@ -491,6 +606,50 @@ describe('provider circuit breaker', () => {
     });
   });
 
+  it('leases a 90-minute probe turn for its cap, and an early success closes it at once', () => {
+    // Admin turns may run up to 90 minutes (codexTurnMaxMs). The host settles
+    // the probe as soon as codex answers (providerResponded), so the other
+    // chats do not wait for the whole turn.
+    const longProbeConfig: ProviderCircuitConfig = {
+      failuresToOpen: 1,
+      cooldownMs: 1_000,
+      halfOpenProbeWindowMs: 360_000,
+      probeTimeoutMarginMs: 60_000,
+    };
+    recordProviderCircuitFailure({
+      provider,
+      reason: 'unavailable',
+      now: 100,
+      config: longProbeConfig,
+    });
+    const decision = getProviderCircuitDecision({
+      provider,
+      now: 1_101,
+      config: longProbeConfig,
+      probeTimeoutMs: 5_400_000,
+    });
+    expect(decision).toMatchObject({
+      action: 'allow',
+      state: 'half_open',
+      probeExpiresAt: 1_101 + 5_460_000,
+    });
+    expect(
+      recordProviderCircuitSuccess({
+        provider,
+        now: 31_101,
+        config: longProbeConfig,
+        probeToken: decision.probeToken,
+      }),
+    ).toMatchObject({ state: 'closed', closed: true });
+    expect(
+      getProviderCircuitDecision({
+        provider,
+        now: 31_102,
+        config: longProbeConfig,
+      }),
+    ).toMatchObject({ action: 'allow', state: 'closed' });
+  });
+
   it('renews only the matching live probe token and keeps its deadline monotonic', () => {
     const leaseConfig: ProviderCircuitConfig = {
       failuresToOpen: 1,
@@ -500,7 +659,7 @@ describe('provider circuit breaker', () => {
     };
     recordProviderCircuitFailure({
       provider,
-      reason: 'timeout',
+      reason: 'unavailable',
       now: 100,
       config: leaseConfig,
     });
@@ -592,7 +751,7 @@ describe('provider circuit breaker', () => {
     };
     recordProviderCircuitFailure({
       provider,
-      reason: 'timeout',
+      reason: 'unavailable',
       now: 100,
       config: leaseConfig,
     });
@@ -634,7 +793,7 @@ describe('provider circuit breaker', () => {
     };
     recordProviderCircuitFailure({
       provider,
-      reason: 'timeout',
+      reason: 'unavailable',
       now: 100,
       config: leaseConfig,
     });
@@ -724,7 +883,7 @@ describe('provider circuit breaker', () => {
     };
     recordProviderCircuitFailure({
       provider,
-      reason: 'timeout',
+      reason: 'unavailable',
       now: 100,
       config: leaseConfig,
     });
@@ -755,7 +914,7 @@ describe('provider circuit breaker', () => {
     for (const now of [100, 200, 300]) {
       recordProviderCircuitFailure({
         provider,
-        reason: 'timeout',
+        reason: 'unavailable',
         now,
         config,
       });
@@ -805,7 +964,7 @@ describe('provider circuit breaker', () => {
     for (const now of [100, 200, 300]) {
       recordProviderCircuitFailure({
         provider,
-        reason: 'timeout',
+        reason: 'unavailable',
         now,
         config,
       });
@@ -885,7 +1044,7 @@ describe('provider circuit breaker', () => {
     for (const now of [100, 200, 300]) {
       recordProviderCircuitFailure({
         provider,
-        reason: 'timeout',
+        reason: 'unavailable',
         now,
         config,
       });
@@ -933,11 +1092,11 @@ describe('provider circuit breaker', () => {
     });
   });
 
-  it('records circuit-open event and avoids duplicate answers or double charges during fallback', () => {
+  it('records circuit-open event and avoids duplicate answers during fallback', () => {
     const t = tenant();
     const opened = recordProviderCircuitFailure({
       provider,
-      reason: 'timeout',
+      reason: 'unavailable',
       now: 100,
       config: { failuresToOpen: 1, cooldownMs: 1_000 },
     });
@@ -971,61 +1130,10 @@ describe('provider circuit breaker', () => {
       telegramAnswers += 1;
     }
 
-    const sessionId = eventSessionIdForTenant(t);
-    const idempotencyKey = quotaIdempotencyKey({
-      tenantId: t.tenant_id,
-      sessionId,
-      channel: t.channel,
-      chatId: t.chat_id,
-      channelUserId: '42',
-      targetCursor: 'same-open-circuit-request',
-    });
-    const firstCharge = chargeQuotaUsage({
-      tenantId: t.tenant_id,
-      sessionId,
-      channel: t.channel,
-      chatId: t.chat_id,
-      channelUserId: '42',
-      modelRole: 'default',
-      providerModel: 'claude-opus-4-7',
-      inputTokens: 10,
-      outputTokens: 5,
-      providerCostUsd: null,
-      idempotencyKey,
-      runStatus: 'success',
-      isShadow: false,
-      config: billingEnabledConfig,
-    });
-    const duplicateCharge = chargeQuotaUsage({
-      tenantId: t.tenant_id,
-      sessionId,
-      channel: t.channel,
-      chatId: t.chat_id,
-      channelUserId: '42',
-      modelRole: 'default',
-      providerModel: 'claude-opus-4-7',
-      inputTokens: 10,
-      outputTokens: 5,
-      providerCostUsd: null,
-      idempotencyKey,
-      runStatus: 'success',
-      isShadow: false,
-      config: billingEnabledConfig,
-    });
-
     expect(decision.action).toBe('skip');
     expect(codexCalls).toBe(0);
     expect(claudeCalls).toBe(1);
     expect(telegramAnswers).toBe(1);
-    expect(firstCharge.charged).toBe(true);
-    expect(duplicateCharge.duplicate).toBe(true);
-    expect(
-      (
-        getDb().prepare(`SELECT COUNT(*) AS c FROM usage_ledger`).get() as {
-          c: number;
-        }
-      ).c,
-    ).toBe(1);
     expect(
       getEventsForTenant(t.tenant_id).map((event) => event.type),
     ).toContain('provider_circuit_opened');

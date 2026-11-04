@@ -157,6 +157,7 @@ describe('retention (dry-run, end-to-end)', () => {
     await retentionMain([
       'node',
       'retention.js',
+      '--run',
       '--config',
       configPath,
       '--groups-dir',
@@ -246,6 +247,7 @@ describe('retention (dry-run, end-to-end)', () => {
     await retentionMain([
       'node',
       'retention.js',
+      '--run',
       '--config',
       configPath,
       '--groups-dir',
@@ -337,6 +339,7 @@ describe('retention (dry-run, end-to-end)', () => {
     await retentionMain([
       'node',
       'retention.js',
+      '--run',
       '--config',
       configPath,
       '--groups-dir',
@@ -420,6 +423,7 @@ describe('retention (dry-run, end-to-end)', () => {
     await retentionMain([
       'node',
       'retention.js',
+      '--run',
       '--config',
       configPath,
       '--groups-dir',
@@ -527,6 +531,7 @@ describe('retention path-traversal containment (RUN mode)', () => {
     await retentionMain([
       'node',
       'retention.js',
+      '--run',
       '--config',
       runConfigPath,
       '--groups-dir',
@@ -567,6 +572,7 @@ describe('retention path-traversal containment (RUN mode)', () => {
     await retentionMain([
       'node',
       'retention.js',
+      '--run',
       '--config',
       runConfigPath,
       '--groups-dir',
@@ -630,6 +636,81 @@ describe('retention path-traversal containment (RUN mode)', () => {
     expect(await fs.readFile(path.join(outside, 'candidate.oga'), 'utf8')).toBe(
       'outside-sentinel',
     );
+  });
+});
+
+describe('safe-unlink helper identity expectation', () => {
+  let root: string;
+  let folderAbs: string;
+  let file: string;
+
+  beforeEach(async () => {
+    root = await fs.realpath(
+      await fs.mkdtemp(path.join(tmpdir(), 'safe-unlink-expect-')),
+    );
+    folderAbs = path.join(root, 'group');
+    await fs.mkdir(path.join(folderAbs, 'received'), { recursive: true });
+    file = path.join(folderAbs, 'received', 'clip.mp4');
+    await fs.writeFile(file, 'archived-bytes');
+  });
+
+  afterEach(async () => {
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  const helper = (...args: string[]) =>
+    JSON.parse(
+      execFileSync(PYTHON_BIN, ['-I', SAFE_UNLINK_HELPER, ...args], {
+        encoding: 'utf8',
+        timeout: 10_000,
+      }),
+    ) as { status: string; reason?: string };
+
+  const identity = async () => {
+    const st = await fs.stat(file, { bigint: true });
+    return { size: st.size, mtimeNs: st.mtimeNs, ino: st.ino };
+  };
+
+  it('refuses when size, nanosecond mtime or inode differ from the verified copy', async () => {
+    const { size, mtimeNs, ino } = await identity();
+    for (const expect_ of [
+      `${size + 1n}:${mtimeNs}`,
+      `${size}:${mtimeNs + 1n}`,
+      `${size}:${mtimeNs}:${ino + 1n}`,
+    ]) {
+      expect(helper(folderAbs, 'clip.mp4', expect_)).toEqual({
+        status: 'unsafe',
+        reason: 'entry-changed',
+      });
+    }
+    expect(await fs.readFile(file, 'utf8')).toBe('archived-bytes');
+  });
+
+  it('unlinks when observed metadata matches the verified copy', async () => {
+    const { size, mtimeNs, ino } = await identity();
+    expect(helper(folderAbs, 'clip.mp4', `${size}:${mtimeNs}:${ino}`)).toEqual({
+      status: 'deleted',
+    });
+    await expect(fs.stat(file)).rejects.toThrow();
+    expect(helper(folderAbs, 'clip.mp4', `${size}:${mtimeNs}`)).toEqual({
+      status: 'missing',
+    });
+  });
+
+  it('rejects a malformed expectation and keeps the two-argument form unchanged', async () => {
+    for (const bad of ['', 'abc', '1', '1:2:3:4', '-1:2', '１:2']) {
+      expect(helper(folderAbs, 'clip.mp4', bad)).toEqual({
+        status: 'unsafe',
+        reason: 'invalid-arguments',
+      });
+    }
+    expect(helper(folderAbs, 'clip.mp4', '1', '2', '3')).toEqual({
+      status: 'unsafe',
+      reason: 'invalid-arguments',
+    });
+    await expect(fs.stat(file)).resolves.toBeDefined();
+    // Retention's call shape: no expectation at all.
+    expect(helper(folderAbs, 'clip.mp4')).toEqual({ status: 'deleted' });
   });
 });
 

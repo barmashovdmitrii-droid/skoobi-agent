@@ -6,12 +6,14 @@ import {
   timingSafeEqual,
 } from 'crypto';
 
+import { readEnvFile } from './env.js';
 import type { SenderIdentity } from './types.js';
 import type { GoogleOperationPolicy } from './google-workspace-policy.js';
 import {
   GOOGLE_WORKSPACE_DESTRUCTIVE_TOOLS,
   GOOGLE_WORKSPACE_WRITE_TOOLS,
   googleWorkspaceOperationFingerprint,
+  googleWorkspaceWriteFingerprintWithoutPrecondition,
   parseGoogleWorkspaceOperation,
   type GoogleWorkspaceOperation,
   type GoogleWorkspaceTool,
@@ -75,6 +77,7 @@ interface ActiveTaskOperationGrant {
   googleOperationKey?: string;
   googleTool?: GoogleWorkspaceTool;
   googleResponseKey?: string;
+  googleJournalFingerprint?: string;
 }
 
 export interface TaskAuthorizationResponse {
@@ -101,6 +104,12 @@ export interface ConsumedTaskOwnerAuthorization {
   googleOperationKey?: string;
   googleTool?: GoogleWorkspaceTool;
   googleResponseKey?: string;
+  /**
+   * Fingerprint the mutation journal compares for this write, when it is not
+   * the exact operation fingerprint: a scheduled-task occurrence's standing
+   * sheet append, journaled without its read digest.
+   */
+  googleJournalFingerprint?: string;
 }
 
 const activeCapabilities = new Map<string, ActiveTaskCapability>();
@@ -538,6 +547,7 @@ function authorizeGoogleOperationForCapability(
       intentId: string;
       operationKey: string;
       responseKey: string;
+      journalFingerprint?: string;
     }
   | { ok: false; error: string } {
   const policy = capability.googleOperationPolicy;
@@ -551,9 +561,13 @@ function authorizeGoogleOperationForCapability(
   // These provider APIs offer no atomic compare-and-swap precondition. A
   // read-digest-then-PUT sequence can overwrite a concurrent owner edit, so
   // policy construction and this authoritative host boundary both deny them.
+
+  // scooter ledger lives on cell updates, and without them the agent wrote to
+  // the sheet around the gate altogether.
   if (
-    operation.tool === 'google_sheets_update_values' ||
-    operation.tool === 'google_apps_script_update_file'
+    !policy.standing &&
+    (operation.tool === 'google_sheets_update_values' ||
+      operation.tool === 'google_apps_script_update_file')
   ) {
     return {
       ok: false,
@@ -563,22 +577,60 @@ function authorizeGoogleOperationForCapability(
   if (!policy.allowedTools.includes(operation.tool)) {
     return { ok: false, error: 'google_tool_not_allowed_for_turn' };
   }
-  if (!googleOperationResourceAllowed(policy, operation)) {
+  if (!policy.standing && !googleOperationResourceAllowed(policy, operation)) {
     return { ok: false, error: 'google_resource_not_allowed_for_turn' };
   }
-  if (!googleDestructiveOperationConfirmed(policy, operation)) {
+  if (
+    !policy.standing &&
+    !googleDestructiveOperationConfirmed(policy, operation)
+  ) {
     return { ok: false, error: 'google_destructive_confirmation_required' };
   }
-  const mutationSlot = GOOGLE_WORKSPACE_WRITE_TOOLS.has(operation.tool)
-    ? googleMutationSlotDescriptor(policy, operation)
+  // Standing access journals each distinct write of the turn under its exact
+  // fingerprint: a retry of the same write is answered from the journal, a
+  // different row or range still goes through.
+  //
+  // A scheduled-task occurrence drops the read digest from the key of its
+  // appends. Its intent is the occurrence, so a crash re-dispatch runs under
+  // the same intent — and the agent, as the append tool tells it, first
+  // re-reads the range. The row it already added changes the digest, so under
+  // the exact fingerprint the same append was a new slot and went through
+  // again: a duplicate row. Keyed by tool, table and rows, it is answered
+  // from the journal; the price is that one occurrence cannot append the
+  // same rows twice. Overwrites (cell updates, document and script
+  // replacement) keep the exact key: repeating one after a re-read writes the
+  // same content again, which duplicates nothing, while a digest-free key
+  // would silently skip the last step of A → B → A on the same range.
+  const isWrite = GOOGLE_WORKSPACE_WRITE_TOOLS.has(operation.tool);
+  const occurrenceJournalFingerprint =
+    operation.tool === 'google_sheets_append_values' &&
+    policy.standing &&
+    policy.scheduledOccurrence === true
+      ? googleWorkspaceWriteFingerprintWithoutPrecondition(operation)
+      : undefined;
+  const mutationSlot = isWrite
+    ? policy.standing
+      ? occurrenceJournalFingerprint
+        ? ['standing-occurrence', operation.tool, occurrenceJournalFingerprint]
+        : [
+            'standing',
+            operation.tool,
+            googleWorkspaceOperationFingerprint(operation),
+          ]
+      : googleMutationSlotDescriptor(policy, operation)
     : null;
-  if (GOOGLE_WORKSPACE_WRITE_TOOLS.has(operation.tool) && !mutationSlot) {
+  if (isWrite && !mutationSlot) {
     return { ok: false, error: 'google_mutation_target_unavailable' };
   }
   return {
     ok: true,
     operation,
     intentId: policy.intentId,
+    // The journal compares this instead of the exact operation fingerprint,
+    // or the re-read append above would come back as payload_mismatch.
+    ...(occurrenceJournalFingerprint
+      ? { journalFingerprint: occurrenceJournalFingerprint }
+      : {}),
     // Exact envelope integrity is already enforced by the one-use grant. For
     // mutations the durable journal uses a stable owner-authorized target slot
     // so fallback cannot repeat a write by varying payload/digest, while one
@@ -781,6 +833,25 @@ function validProof(secret: string, record: Record<string, unknown>): boolean {
  * The bearer itself never becomes durable task provenance: it can only ask the
  * host for a short-lived, exact-envelope operation grant below.
  */
+
+
+export function senderMayUseGoogleWorkspace(telegramUserId: string): boolean {
+  const raw = (
+    process.env.SKOOBI_GOOGLE_OWNER_TELEGRAM_USER_IDS ||
+    readEnvFile(['SKOOBI_GOOGLE_OWNER_TELEGRAM_USER_IDS'])
+      .SKOOBI_GOOGLE_OWNER_TELEGRAM_USER_IDS ||
+    ''
+  ).trim();
+  if (!raw) return true;
+  const allowed = new Set(
+    raw
+      .split(/[\s,]+/)
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+  return allowed.has(String(telegramUserId));
+}
+
 export function registerTaskAuthorizationCapability(input: {
   groupFolder: string;
   isMain: boolean;
@@ -798,6 +869,16 @@ export function registerTaskAuthorizationCapability(input: {
     !input.senderIdentity.identity_id ||
     !input.senderIdentity.telegram_user_id
   ) {
+    return null;
+  }
+
+  // Google Workspace (mail, Drive, Calendar). Authority for it came from
+  // OWNER_TELEGRAM_USER_IDS, which is a SHARED admin list — so a second admin
+  // could ask the bot to "check my mail" and be shown the primary owner's
+  // personal correspondence. Host access and mailbox access are not the same
+  // grant. SKOOBI_GOOGLE_OWNER_TELEGRAM_USER_IDS narrows it to named ids when
+  // set; unset keeps the previous behaviour so nothing changes silently.
+  if (!senderMayUseGoogleWorkspace(input.senderIdentity.telegram_user_id)) {
     return null;
   }
   const id = randomBytes(16).toString('base64url');
@@ -924,6 +1005,12 @@ export function authorizeTaskOperationRequest(
           googleOperationKey: googleAuthorization.operationKey,
           googleTool: googleAuthorization.operation.tool,
           googleResponseKey: googleAuthorization.responseKey,
+          ...(googleAuthorization.journalFingerprint
+            ? {
+                googleJournalFingerprint:
+                  googleAuthorization.journalFingerprint,
+              }
+            : {}),
         }
       : {}),
   });
@@ -969,6 +1056,9 @@ export function consumeTaskOperationGrant(
     ...(grant.googleTool ? { googleTool: grant.googleTool } : {}),
     ...(grant.googleResponseKey
       ? { googleResponseKey: grant.googleResponseKey }
+      : {}),
+    ...(grant.googleJournalFingerprint
+      ? { googleJournalFingerprint: grant.googleJournalFingerprint }
       : {}),
   };
 }

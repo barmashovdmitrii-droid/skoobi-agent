@@ -115,6 +115,11 @@ describe('memory context', () => {
     expect(context).toContain('Likes short answers');
     expect(context).not.toContain('secret');
     expect(context).not.toContain('telegram_admin');
+    // Unscoped legacy notes carry no empty scope attributes.
+    expect(context).toContain('provenance="missing"');
+    expect(context).not.toContain('sender_id=""');
+    expect(context).not.toContain('identity_id=""');
+    expect(context).not.toContain('persona_id=""');
   });
 
   it('lazy mode injects a bounded file index instead of markdown body', () => {
@@ -136,6 +141,108 @@ describe('memory context', () => {
     expect(context).toContain('large="true"');
     expect(context).not.toContain('Detailed rollout context.');
     expect(context).not.toContain('<chat_memory_context>');
+  });
+
+  it('lazy index keeps one line per file with the volatile attributes the runner strips', () => {
+    // The Codex runner (agent/runner/src/index.ts, standingBlockCanonicalForm)
+    // hashes the index without size_bytes/size/modified and without order, so
+    // a memory_save does not re-send it. This pins the entry shape it parses.
+    writeMemory('telegram_main', 'topics/first.md', '- One');
+    writeMemory('telegram_main', 'topics/second.md', '- Two');
+
+    const context = loadGroupMemoryContext(root, 'telegram_main', {
+      lazyMemory: true,
+    });
+    const entries = context
+      .split('\n')
+      .filter((line) => line.startsWith('<memory_file '));
+    expect(entries).toHaveLength(2);
+    for (const entry of entries) {
+      expect(entry).toMatch(
+        /^<memory_file file="memory\/topics\/(?:first|second)\.md" size_bytes="\d+" size="[^"]+" modified="\d{4}-\d{2}-\d{2}T[^"]+" source_type="[^"]+" confidence="\d\.\d{2}" provenance="[^"]+" \/>$/,
+      );
+      const stable = entry.replace(
+        /\s(?:size_bytes|size|modified)="[^"]*"/g,
+        '',
+      );
+      expect(stable).not.toMatch(/size|modified/);
+      expect(stable).toMatch(/^<memory_file file="[^"]+" source_type=/);
+    }
+  });
+
+  it('lazy index omits empty scope attributes but keeps provenance', () => {
+    writeMemory('telegram_main', 'topics/legacy.md', '- Old fact without meta');
+
+    const context = loadGroupMemoryContext(root, 'telegram_main', {
+      lazyMemory: true,
+    });
+
+    expect(context).toContain('file="memory/topics/legacy.md"');
+    expect(context).toContain('provenance="missing"');
+    expect(context).not.toContain('sender_id=""');
+    expect(context).not.toContain('identity_id=""');
+    expect(context).not.toContain('persona_id=""');
+    expect(context).toMatch(
+      /<memory_file file="memory\/topics\/legacy\.md" [^>]*provenance="missing" \/>/,
+    );
+  });
+
+  it('lazy index keeps non-empty scope attributes', () => {
+    writeMemory(
+      'telegram_group',
+      'topics/scoped.md',
+      `- Scoped note ${memoryMeta({
+        sender_id: 'sender_a',
+        tenant_id: 't',
+        identity_id: 'telegram_user_a',
+        persona_id: 'p',
+        source_type: 'user_message',
+        confidence: 0.8,
+      })}`,
+    );
+
+    const context = loadGroupMemoryContext(root, 'telegram_group', {
+      lazyMemory: true,
+      senderId: 'sender_a',
+      tenantId: 't',
+    });
+
+    expect(context).toContain('file="memory/topics/scoped.md"');
+    expect(context).toContain('provenance="present"');
+    expect(context).toContain('sender_id="sender_a"');
+    expect(context).toContain('identity_id="telegram_user_a"');
+    expect(context).toContain('persona_id="p"');
+    // tenant_id is used for filtering only and never rendered.
+    expect(context).not.toContain('tenant_id=');
+  });
+
+  it('lazy index and file walk skip dot-directories such as .archive', () => {
+    writeMemory('telegram_main', '.archive/2026-09-28/topics/old.md', '- Archived');
+    writeMemory('telegram_main', 'topics/live.md', '- Live note');
+
+    const context = loadGroupMemoryContext(root, 'telegram_main', {
+      lazyMemory: true,
+    });
+
+    expect(context).toContain('file="memory/topics/live.md"');
+    expect(context).not.toContain('old.md');
+    expect(context).not.toContain('<memory_index_truncated');
+  });
+
+  it('truncation marker counts only non-dot files', () => {
+    writeMemory('telegram_main', 'topics/a.md', '- A');
+    writeMemory('telegram_main', 'topics/b.md', '- B');
+    writeMemory('telegram_main', 'topics/c.md', '- C');
+    writeMemory('telegram_main', '.archive/topics/d.md', '- D');
+
+    const context = loadGroupMemoryContext(root, 'telegram_main', {
+      lazyMemory: true,
+      lazyMaxFiles: 2,
+    });
+
+    expect(context.match(/<memory_file /g)).toHaveLength(2);
+    expect(context).toContain('<memory_index_truncated shown="2" total="3" />');
+    expect(context).not.toContain('d.md');
   });
 
   it('lazy mode injects bounded curated summaries when present', () => {

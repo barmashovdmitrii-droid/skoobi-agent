@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  OBSERVER_MEDIA_RETRY_EXHAUSTED,
   ObserverMediaQueue,
   type ObserverMediaQueueLifecycleEvent,
 } from './observer-media-queue.js';
@@ -15,6 +16,171 @@ function deferred(): {
   });
   return { promise, resolve };
 }
+
+// Retry a transient download failure while its live media URL is fresh.
+describe('ObserverMediaQueue retry', () => {
+  function collectingQueue(retryDelayMs = 30_000) {
+    const events: ObserverMediaQueueLifecycleEvent[] = [];
+    const queue = new ObserverMediaQueue({
+      maxWaiting: 2,
+      retryDelayMs: () => retryDelayMs,
+      onLifecycle: (event) => {
+        events.push(event);
+      },
+    });
+    return { queue, events };
+  }
+
+  it('re-runs a job once after the delay, keeping its key reserved meanwhile', async () => {
+    vi.useFakeTimers();
+    try {
+      const { queue, events } = collectingQueue(30_000);
+      const run = vi
+        .fn<(signal: AbortSignal) => Promise<'retry' | void>>()
+        .mockResolvedValueOnce('retry')
+        .mockResolvedValueOnce(undefined);
+
+      expect(queue.enqueue({ key: 'voice-1', priority: 'notify', run })).toEqual(
+        { accepted: true },
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(queue.snapshot()).toMatchObject({
+        active: 0,
+        waiting: 0,
+        retrying: 1,
+      });
+      expect(events.at(-1)).toMatchObject({
+        phase: 'retry_scheduled',
+        priority: 'notify',
+        attempt: 1,
+        retryDelayMs: 30_000,
+      });
+      // The parked job does not block idleness or capacity, but the key stays
+      // deduplicated until the retry has run.
+      await queue.waitForIdle();
+      expect(
+        queue.enqueue({ key: 'voice-1', priority: 'notify', run }),
+      ).toEqual({ accepted: false, reason: 'duplicate' });
+
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(run).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(run).toHaveBeenCalledTimes(2);
+      await queue.waitForIdle();
+
+      expect(events.map((event) => event.phase)).toEqual([
+        'enqueued',
+        'started',
+        'retry_scheduled',
+        'rejected', // the duplicate enqueue above
+        'enqueued',
+        'started',
+        'succeeded',
+      ]);
+      expect(events.at(-1)).toMatchObject({ attempt: 1 });
+      expect(queue.snapshot()).toMatchObject({ retrying: 0 });
+      expect(
+        queue.enqueue({
+          key: 'voice-1',
+          priority: 'notify',
+          run: async () => {},
+        }),
+      ).toEqual({ accepted: true });
+      await queue.waitForIdle();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('grants exactly one retry; a second request ends the job as failed', async () => {
+    vi.useFakeTimers();
+    try {
+      const { queue, events } = collectingQueue(45_000);
+      const run = vi.fn(async () => 'retry' as const);
+
+      queue.enqueue({ key: 'voice-2', priority: 'append', run });
+      await vi.advanceTimersByTimeAsync(45_000);
+      await queue.waitForIdle();
+
+      expect(run).toHaveBeenCalledTimes(2);
+      expect(events.at(-1)).toMatchObject({
+        phase: 'failed',
+        priority: 'append',
+        attempt: 1,
+        errorKind: OBSERVER_MEDIA_RETRY_EXHAUSTED,
+      });
+      expect(queue.snapshot()).toMatchObject({ retrying: 0, waiting: 0 });
+      // Nothing else is pending: a third run never happens.
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(run).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('close() and clearPending() cancel a parked retry and release its key', async () => {
+    vi.useFakeTimers();
+    try {
+      const { queue, events } = collectingQueue(30_000);
+      const run = vi.fn(async () => 'retry' as const);
+      queue.enqueue({ key: 'voice-3', priority: 'notify', run });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(queue.snapshot()).toMatchObject({ retrying: 1 });
+
+      expect(queue.clearPending()).toBe(1);
+      expect(queue.snapshot()).toMatchObject({ retrying: 0 });
+      expect(events.at(-1)).toMatchObject({
+        phase: 'cancelled',
+        cancellationReason: 'cleared',
+        attempt: 1,
+      });
+      expect(
+        queue.enqueue({ key: 'voice-3', priority: 'notify', run }),
+      ).toEqual({ accepted: true });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(queue.snapshot()).toMatchObject({ retrying: 1 });
+
+      expect(queue.close()).toEqual({
+        cancelledPending: 1,
+        activeAbortRequested: false,
+      });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(run).toHaveBeenCalledTimes(2);
+      expect(
+        events.filter((event) => event.cancellationReason === 'closed'),
+      ).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('falls back to the 30–60 s window when the delay provider misbehaves', async () => {
+    vi.useFakeTimers();
+    try {
+      const events: ObserverMediaQueueLifecycleEvent[] = [];
+      const queue = new ObserverMediaQueue({
+        maxWaiting: 1,
+        retryDelayMs: () => Number.NaN,
+        onLifecycle: (event) => {
+          events.push(event);
+        },
+      });
+      queue.enqueue({
+        key: 'voice-4',
+        priority: 'notify',
+        run: async () => 'retry' as const,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const scheduled = events.find((event) => event.phase === 'retry_scheduled');
+      expect(scheduled?.retryDelayMs).toBeGreaterThanOrEqual(30_000);
+      expect(scheduled?.retryDelayMs).toBeLessThanOrEqual(60_000);
+      queue.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe('ObserverMediaQueue', () => {
   it('runs one job at a time and prioritises notify over waiting append jobs', async () => {
@@ -248,9 +414,11 @@ describe('ObserverMediaQueue', () => {
         }),
       ]),
     );
+    // `retrying` joined the snapshot with the one-retry feature.
     expect(queue.snapshot()).toEqual({
       active: 0,
       waiting: 0,
+      retrying: 0,
       waitingNotify: 0,
       waitingAppend: 0,
       closed: true,

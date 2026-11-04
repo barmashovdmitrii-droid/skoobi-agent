@@ -340,7 +340,8 @@ export function storeObservedWhatsAppMessagesBatch(
              THEN observed_whatsapp_messages.content
            ELSE excluded.content
          END,
-         timestamp = excluded.timestamp,
+         -- a redelivered copy carries a newer server time; keep the earliest
+         timestamp = MIN(observed_whatsapp_messages.timestamp, excluded.timestamp),
          from_me = excluded.from_me,
          message_kind = excluded.message_kind,
          upsert_type = excluded.upsert_type,

@@ -1,5 +1,7 @@
 import {
   createHmac,
+  createCipheriv,
+  createDecipheriv,
   generateKeyPairSync,
   randomBytes,
   randomUUID,
@@ -36,6 +38,8 @@ export interface MemoryWriteCapabilityContext {
   senderIdentity?: SenderIdentity;
   /** False for an initial batch containing more than one member identity. */
   memoryWriteAllowed?: boolean;
+  /** Exact direct input IDs selected by the host for this live message run. */
+  currentMessageIds?: readonly string[];
 }
 
 interface ActiveMemoryCapability extends MemoryWriteCapabilityContext {
@@ -178,9 +182,10 @@ function readPrivateKey(dataDir: string): string | null {
   }
 }
 
-export function ensureMemoryProvenanceKeyPair(
-  dataDir = DATA_DIR,
-): { privateKeyPem: string; publicKeyPem: string } {
+export function ensureMemoryProvenanceKeyPair(dataDir = DATA_DIR): {
+  privateKeyPem: string;
+  publicKeyPem: string;
+} {
   const existing = readPrivateKey(dataDir);
   if (existing) {
     return {
@@ -320,10 +325,7 @@ function groupMemoryLabel(
   if (category === 'daily') label = `memory/${date}.md`;
   else if (category === 'topic' && safeTopic)
     label = `memory/topics/${safeTopic}.md`;
-  else if (
-    !context.isMain &&
-    isMultiSenderChatJid(context.chatJid)
-  ) {
+  else if (!context.isMain && isMultiSenderChatJid(context.chatJid)) {
     // A multi-member workspace has one shared CLAUDE.md, which both Claude
     // and Codex treat as executable standing instructions. Long-term personal
     // memory must therefore stay in the signed per-entry memory tree; writing
@@ -332,7 +334,22 @@ function groupMemoryLabel(
       context.senderIdentity?.telegram_user_id || 'unknown',
     );
     label = `memory/topics/member-${senderKey}-longterm.md`;
-  } else label = 'CLAUDE.md';
+  } else {
+
+    // Agent SDK loads VERBATIM as standing instructions at the start of every
+    // session — including unattended scheduled runs. That made "запомни
+    // навсегда" a write primitive into the agent's own orders, reachable by any
+    // untrusted text the turn processed (a fetched web page, a forwarded
+    // message, a document), and the signed-memory verification never ran on
+    // that path. Route it into the memory tree instead, where
+    // loadGroupMemoryContext applies extractVerifiedMemoryEntries + escapeXml
+    // and wraps the result as hints rather than instructions. CLAUDE.md stays
+    // editable by the operator directly; the agent no longer writes to it.
+    // `memory/topics/[a-z0-9-]+\.md` is already accepted by
+    // isAllowedSignedGroupLabel (agent/runner/src/ipc-mcp-stdio.ts:1078), so the
+    // signing path needs no change.
+    label = 'memory/topics/longterm.md';
+  }
   return {
     label,
     scope: `group:${context.groupFolder}:${label}`,
@@ -345,10 +362,7 @@ function validOptionalId(value: unknown): string | undefined {
   return trimmed && trimmed.length <= 256 ? trimmed : undefined;
 }
 
-function denyResponse(
-  requestId: string,
-  error: string,
-): MemorySigningResponse {
+function denyResponse(requestId: string, error: string): MemorySigningResponse {
   return {
     type: 'memory_sign_result',
     request_id: requestId,
@@ -586,4 +600,360 @@ export function signMemoryWriteRequest(
 /** @internal tests only */
 export function _clearMemoryWriteCapabilities(): void {
   activeCapabilities.clear();
+}
+
+export interface MemoryStateProofFields {
+  type: 'memory_state';
+  request_id: string;
+  payload: unknown;
+}
+
+function memoryStateProofPayload(raw: MemoryStateProofFields): string {
+  return JSON.stringify([
+    'skoobi.memory_state.v1',
+    raw.type,
+    raw.request_id,
+    raw.payload,
+  ]);
+}
+
+/** Same run capability, separate domain: a memory_sign proof cannot be reused. */
+export function authorizeMemoryStateRequest(
+  capability: string,
+  raw: MemoryStateProofFields,
+): { capability_id: string; proof: string } {
+  const parsed = parseMemoryCapability(capability);
+  if (!parsed) throw new Error('Invalid memory write capability');
+  return {
+    capability_id: parsed.id,
+    proof: createHmac('sha256', parsed.secret)
+      .update(memoryStateProofPayload(raw))
+      .digest('base64url'),
+  };
+}
+
+export type AuthenticatedMemoryStateContext = MemoryWriteCapabilityContext & {
+  tenantId: string;
+  senderIdentity: SenderIdentity;
+  currentMessageIds: readonly string[];
+};
+
+/** Authenticate before source lookup. Only host-owned scope is returned. */
+export function authenticateMemoryStateRequest(
+  raw: unknown,
+  sourceGroup: string,
+):
+  | {
+      ok: true;
+      requestId: string;
+      context: AuthenticatedMemoryStateContext;
+      payload: unknown;
+    }
+  | { ok: false; requestId: string; error: string } {
+  const record =
+    raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : {};
+  const requestId =
+    typeof record.request_id === 'string' &&
+    /^[A-Za-z0-9_-]{8,128}$/.test(record.request_id)
+      ? record.request_id
+      : 'invalid';
+  const deny = (error: string) => ({ ok: false as const, requestId, error });
+  if (record.type !== 'memory_state' || requestId === 'invalid')
+    return deny('invalid_memory_state_request');
+  if (typeof record.capability_id !== 'string')
+    return deny('missing_capability_id');
+  const context = activeCapabilities.get(record.capability_id);
+  if (!context || context.expiresAt < Date.now()) {
+    activeCapabilities.delete(record.capability_id);
+    return deny('invalid_or_expired_capability');
+  }
+  if (context.groupFolder !== sourceGroup)
+    return deny('capability_group_mismatch');
+  if (
+    typeof record.proof !== 'string' ||
+    !/^[A-Za-z0-9_-]{43}$/.test(record.proof)
+  )
+    return deny('invalid_proof');
+  let payload: string;
+  try {
+    payload = memoryStateProofPayload(
+      record as unknown as MemoryStateProofFields,
+    );
+  } catch {
+    return deny('invalid_payload');
+  }
+  if (Buffer.byteLength(payload, 'utf8') > 64 * 1024)
+    return deny('payload_too_large');
+  const expected = createHmac('sha256', context.secret)
+    .update(payload)
+    .digest();
+  const supplied = Buffer.from(record.proof, 'base64url');
+  if (
+    supplied.length !== expected.length ||
+    !timingSafeEqual(supplied, expected)
+  )
+    return deny('invalid_proof');
+  if (context.usedRequestIds.has(requestId)) return deny('replayed_request_id');
+  if (context.requests >= MAX_MEMORY_REQUESTS_PER_CAPABILITY)
+    return deny('memory_request_limit_reached');
+  context.usedRequestIds.add(requestId);
+  context.requests++;
+  const identity = context.senderIdentity;
+  if (
+    !context.tenantId ||
+    !identity?.identity_id ||
+    !identity.telegram_user_id ||
+    identity.channel !== 'telegram' ||
+    identity.telegram_message_origin !== 'direct' ||
+    identity.chat_id !== telegramChatIdFromJid(context.chatJid) ||
+    context.memoryWriteAllowed !== true ||
+    !context.currentMessageIds?.length ||
+    context.currentMessageIds.length > 200
+  )
+    return deny('authoritative_direct_message_run_required');
+  const mutating = Boolean(
+    record.payload &&
+    typeof record.payload === 'object' &&
+    (record.payload as Record<string, unknown>).action === 'mutate',
+  );
+  if (mutating) {
+    if (context.writes >= MAX_MEMORY_WRITES_PER_CAPABILITY)
+      return deny('memory_write_limit_reached');
+    context.writes++;
+  }
+  return {
+    ok: true,
+    requestId,
+    payload: record.payload,
+    context: {
+      groupFolder: context.groupFolder,
+      chatJid: context.chatJid,
+      isMain: context.isMain,
+      tenantId: context.tenantId,
+      senderIdentity: { ...identity },
+      memoryWriteAllowed: true,
+      currentMessageIds: [...context.currentMessageIds],
+    },
+  };
+}
+
+/** Host ingestion hook only: late direct inputs may authorize the current run. */
+export function extendMemoryWriteCapabilitiesForChat(
+  groupFolder: string,
+  chatJid: string,
+  messageIds: readonly string[],
+): void {
+  const ids = messageIds.filter(
+    (id) => typeof id === 'string' && id.length > 0 && id.length <= 256,
+  );
+  if (!ids.length) return;
+  for (const context of activeCapabilities.values()) {
+    if (
+      context.groupFolder !== groupFolder ||
+      context.chatJid !== chatJid ||
+      context.expiresAt < Date.now()
+    )
+      continue;
+    context.currentMessageIds = [
+      ...new Set([...(context.currentMessageIds ?? []), ...ids]),
+    ].slice(-200);
+  }
+}
+
+/** Authenticate the result too: the shared IPC result file is not authority. */
+export function signMemoryStateResponse(
+  rawRequest: unknown,
+  response: {
+    type: string;
+    request_id: string;
+    ok: boolean;
+    data?: unknown;
+    error?: string;
+    currentRevision?: number;
+  },
+): string | undefined {
+  const capabilityId =
+    rawRequest && typeof rawRequest === 'object'
+      ? (rawRequest as Record<string, unknown>).capability_id
+      : undefined;
+  const context =
+    typeof capabilityId === 'string'
+      ? activeCapabilities.get(capabilityId)
+      : undefined;
+  if (!context || context.expiresAt < Date.now()) return undefined;
+  return createHmac('sha256', context.secret)
+    .update(
+      JSON.stringify([
+        'skoobi.memory_state.response.v1',
+        response.type,
+        response.request_id,
+        response.ok,
+        response.data ?? null,
+        response.error ?? null,
+        response.currentRevision ?? null,
+      ]),
+    )
+    .digest('base64url');
+}
+
+interface MemoryStateWireEnvelope {
+  v: 1;
+  iv: string;
+  ciphertext: string;
+  tag: string;
+}
+function memoryStateWireKey(
+  secret: Buffer,
+  purpose: 'request' | 'response',
+): Buffer {
+  return createHmac('sha256', secret)
+    .update(`skoobi.memory_state.${purpose}.key.v1`)
+    .digest();
+}
+function memoryStateWireAad(
+  purpose: 'request' | 'response',
+  requestId: string,
+  capabilityId: string,
+  sourceGroup: string,
+): Buffer {
+  return Buffer.from(
+    JSON.stringify([
+      `skoobi.memory_state.${purpose}.v1`,
+      requestId,
+      capabilityId,
+      sourceGroup,
+    ]),
+  );
+}
+/** Only ciphertext is allowed on the new shared-directory transport. */
+export function openMemoryStateWireRequest(
+  raw: unknown,
+  sourceGroup: string,
+): unknown {
+  const record =
+    raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  const id = record.capability_id;
+  const requestId = record.request_id;
+  const context =
+    typeof id === 'string' ? activeCapabilities.get(id) : undefined;
+  if (
+    record.type !== 'memory_state' ||
+    typeof requestId !== 'string' ||
+    !/^[A-Za-z0-9_-]{8,128}$/.test(requestId) ||
+    !context ||
+    context.expiresAt < Date.now() ||
+    context.groupFolder !== sourceGroup
+  )
+    throw new Error('invalid_memory_state_transport');
+  if ('payload' in record || 'proof' in record)
+    throw new Error('sealed_memory_state_required');
+  const sealed = record.sealed_payload as MemoryStateWireEnvelope | undefined;
+  if (
+    !sealed ||
+    sealed.v !== 1 ||
+    typeof sealed.iv !== 'string' ||
+    typeof sealed.tag !== 'string' ||
+    typeof sealed.ciphertext !== 'string' ||
+    sealed.ciphertext.length > 100_000 ||
+    !/^[A-Za-z0-9_-]+$/.test(sealed.ciphertext) ||
+    !/^[A-Za-z0-9_-]{16}$/.test(sealed.iv) ||
+    !/^[A-Za-z0-9_-]{22}$/.test(sealed.tag)
+  )
+    throw new Error('invalid_memory_state_envelope');
+  const key = memoryStateWireKey(context.secret, 'request');
+  let plaintext: Buffer | undefined;
+  try {
+    const decipher = createDecipheriv(
+      'aes-256-gcm',
+      key,
+      Buffer.from(sealed.iv, 'base64url'),
+    );
+    decipher.setAAD(
+      memoryStateWireAad('request', requestId, id as string, sourceGroup),
+    );
+    decipher.setAuthTag(Buffer.from(sealed.tag, 'base64url'));
+    plaintext = Buffer.concat([
+      decipher.update(Buffer.from(sealed.ciphertext, 'base64url')),
+      decipher.final(),
+    ]);
+    if (plaintext.length > 70_000)
+      throw new Error('memory_state_payload_too_large');
+    const opened = JSON.parse(plaintext.toString('utf8'));
+    if (
+      opened?.type !== 'memory_state' ||
+      opened.request_id !== requestId ||
+      opened.capability_id !== id
+    )
+      throw new Error('memory_state_envelope_binding');
+    return opened;
+  } finally {
+    key.fill(0);
+    plaintext?.fill(0);
+  }
+}
+
+export function sealMemoryStateWireResponse(
+  raw: unknown,
+  sourceGroup: string,
+  response: unknown,
+): Record<string, unknown> {
+  const record =
+    raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  const id = record.capability_id;
+  const requestId =
+    typeof record.request_id === 'string' &&
+    /^[A-Za-z0-9_-]{8,128}$/.test(record.request_id)
+      ? record.request_id
+      : 'invalid';
+  const context =
+    typeof id === 'string' ? activeCapabilities.get(id) : undefined;
+  if (
+    !context ||
+    context.expiresAt < Date.now() ||
+    context.groupFolder !== sourceGroup
+  )
+    return {
+      type: 'memory_state_result',
+      request_id: requestId,
+      ok: false,
+      error: 'invalid_memory_state_transport',
+    };
+  const key = memoryStateWireKey(context.secret, 'response');
+  const plaintext = Buffer.from(JSON.stringify(response));
+  try {
+    const iv = randomBytes(12);
+    const cipher = createCipheriv('aes-256-gcm', key, iv);
+    cipher.setAAD(
+      memoryStateWireAad('response', requestId, id as string, sourceGroup),
+    );
+    const ciphertext = Buffer.concat([
+      cipher.update(plaintext),
+      cipher.final(),
+    ]);
+    const succeeded = Boolean(
+      response &&
+      typeof response === 'object' &&
+      (response as Record<string, unknown>).ok === true,
+    );
+    return {
+      type: 'memory_state_result',
+      request_id: requestId,
+      capability_id: id,
+      // Host IPC activity/accounting consumes only this non-content status.
+      // The client trusts the authenticated status inside the sealed result.
+      ok: succeeded,
+      ...(!succeeded ? { error: 'memory_state_rejected' } : {}),
+      sealed_payload: {
+        v: 1,
+        iv: iv.toString('base64url'),
+        ciphertext: ciphertext.toString('base64url'),
+        tag: cipher.getAuthTag().toString('base64url'),
+      },
+    };
+  } finally {
+    key.fill(0);
+    plaintext.fill(0);
+  }
 }

@@ -8,6 +8,11 @@ export type EventType =
   | 'telegram_inbound_message'
   | 'telegram_inbound_callback_query'
   | 'telegram_outbound_message'
+  // WhatsApp counterparts (finding M2). Separate types rather than renaming the
+  // Telegram pair: existing dashboards and queries read those names, and the
+  // channel column alone would have made every historical row ambiguous.
+  | 'whatsapp_inbound_message'
+  | 'whatsapp_outbound_message'
   | 'admin_fast_command_handled'
   | 'session_started'
   | 'session_finished'
@@ -17,6 +22,23 @@ export type EventType =
   | 'codex_model_unavailable'
   | 'codex_model_downgraded'
   | 'codex_circuit_open'
+  // The runner dropped a chat's Codex thread (context changed, too old, too
+  // big) and started a fresh one. Until 28.09 this showed up only in
+  // debug-level runner logs.
+  | 'codex_thread_rotated'
+  // The runner stopped an early codex turn because newer messages arrived
+  // and restarted it with them (one answer to a burst). Until 09.10 this was
+  // visible only in the runner's stderr, which is kept for failed runs only.
+  | 'supersede_restart'
+  // A turn failed before codex started (lost login, failed routing, open
+  // breaker): its messages are held for a replay instead of «повтори»
+  // (prestart-replay.ts) — held, answered later, or given up after 6 h.
+  | 'codex_prestart_held'
+  | 'codex_prestart_replay_settled'
+  | 'codex_prestart_replay_expired'
+  // The answer was ready while newer messages waited: whether the runner's
+  // finalize hold folded them into it (C12, 26.10).
+  | 'late_followup_merged'
   | 'provider_failover_attempt'
   | 'provider_failover_used'
   | 'provider_failover_exhausted'
@@ -29,11 +51,26 @@ export type EventType =
   | 'image_generation_requested'
   | 'image_generation_completed'
   | 'image_generation_failed'
+  // An image drawn in an ordinary turn that the model did not send itself:
+  // the host sent it before the turn's text (C06), or could not.
+  | 'image_generated_late_delivery'
+  | 'image_late_delivery_failed'
+  // Markdown links to files on the Mac in a final answer, and what the host
+  // made of them (file attached / already sent / name only) — C38.
+  | 'local_file_link'
   | 'tool_call_requested'
   | 'tool_policy_allowed'
   | 'tool_policy_denied'
   | 'tool_call_executed'
   | 'tool_call_failed'
+  // Ход, в промпт которого подмешан текст третьих лиц. Раньше следа не
+  // оставалось вовсе, и расследовать инцидент было нечем
+  // (ULTRAREVIEW 2026-07-28, S5).
+  | 'untrusted_context_attached'
+  // Промежуточная реплика модели доставлена пользователю (не ответ).
+  | 'agent_progress_delivered'
+  // Итог проверки ссылок финального ответа: счётчики и хосты, без ссылок.
+  | 'agent_link_check'
   | 'quota_account_created'
   | 'quota_checked'
   | 'quota_blocked'

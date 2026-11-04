@@ -78,6 +78,32 @@ describe('ModelGateway config', () => {
     expect(loaded.codex?.reasoningEffort).toBe('xhigh');
   });
 
+  it('reads the fast-tier switch and its quota ceiling from .env', () => {
+    // The first version of the switch was missing from the keys readEnvFile
+    // is asked for, so setting it in .env silently did nothing.
+    const dir = fs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'skoobi-mg-'));
+    const envPath = path.join(dir, '.env');
+    fs.writeFileSync(
+      envPath,
+      [
+        'SKOOBI_MODEL_GATEWAY_TYPE=codex_subscription_cli',
+        'SKOOBI_CODEX_SUBSCRIPTION_ENABLED=true',
+        'SKOOBI_CODEX_SERVICE_TIER=priority',
+      ].join('\n'),
+    );
+    process.env.CLAUDECLAW_ENV_FILE = envPath;
+    expect(loadModelGatewayConfig().codex).toMatchObject({
+      serviceTier: 'priority',
+      serviceTierMaxUsedPercent: 80,
+    });
+
+    fs.appendFileSync(envPath, '\nSKOOBI_CODEX_SERVICE_TIER_MAX_USED_PERCENT=70\n');
+    expect(loadModelGatewayConfig().codex?.serviceTierMaxUsedPercent).toBe(70);
+
+    fs.writeFileSync(envPath, 'SKOOBI_CODEX_SUBSCRIPTION_ENABLED=true\n');
+    expect(loadModelGatewayConfig().codex?.serviceTier).toBeUndefined();
+  });
+
   it('ignores invalid Codex reasoning effort env values', () => {
     const envPath = path.join(
       fs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'skoobi-mg-')),

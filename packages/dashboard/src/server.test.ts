@@ -706,3 +706,28 @@ describe('Google dashboard verification route', () => {
     expect(verifyCalendar).not.toHaveBeenCalled();
   });
 });
+
+describe('reply latency API («Сколько ждут ответа»)', () => {
+  it('needs the token, returns the report and recomputes at most once a minute', async () => {
+    const report = { generatedAt: '2026-10-20T12:00:00.000Z', windows: [] };
+    const collectReplyLatency = vi.fn(() => report);
+    const server = createDashboardServer(
+      { host: '127.0.0.1', port: 0, token: TOKEN },
+      { collectReplyLatency },
+    );
+    const base = await listen(server);
+
+    const anonymous = await fetch(`${base}/api/speed`);
+    expect(anonymous.status).toBe(401);
+    expect(collectReplyLatency).not.toHaveBeenCalled();
+
+    const headers = { Authorization: `Bearer ${TOKEN}` };
+    const first = await fetch(`${base}/api/speed`, { headers });
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual(report);
+    const second = await fetch(`${base}/api/speed`, { headers });
+    expect(await second.json()).toEqual(report);
+    expect(collectReplyLatency).toHaveBeenCalledOnce();
+    expect(collectReplyLatency).toHaveBeenCalledWith(expect.any(Number));
+  });
+});

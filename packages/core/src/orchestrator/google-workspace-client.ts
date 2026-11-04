@@ -768,12 +768,63 @@ export function convertBasicMarkdownToDocs(
   return { text, requests: [...paragraphRequests, ...styleRequests] };
 }
 
-function normalizeSheetValues(raw: unknown): SheetCell[][] {
+function columnLetters(column: number): string {
+  let letters = '';
+  for (let rest = column; rest > 0; rest = Math.floor((rest - 1) / 26)) {
+    letters = String.fromCharCode(65 + ((rest - 1) % 26)) + letters;
+  }
+  return letters;
+}
+
+
+
+function oversizedSheetReadHint(raw: unknown[], range: string): string {
+  const shownRange = range.length > 160 ? `${range.slice(0, 160)}…` : range;
+  const separator = range.lastIndexOf('!');
+  const sheetPrefix = separator >= 0 ? range.slice(0, separator + 1) : '';
+  const a1 = /^\$?([A-Za-z]{1,3})\$?([1-9]\d{0,6})(?::\$?([A-Za-z]{1,3})\$?[1-9]\d{0,6})?$/.exec(
+    range.slice(separator + 1),
+  );
+  const facts = `Google returned ${raw.length} rows for ${shownRange}. One read takes at most ${MAX_SHEET_ROWS} rows and ${MAX_GOOGLE_SHEET_CELLS} cells.`;
+  if (!a1) return facts;
+  const columnNumber = (letters: string): number =>
+    [...letters.toUpperCase()].reduce(
+      (sum, char) => sum * 26 + char.charCodeAt(0) - 64,
+      0,
+    );
+  const firstColumn = columnNumber(a1[1]);
+  const lastColumn = a1[3] ? columnNumber(a1[3]) : firstColumn;
+  const widestRow = raw.reduce<number>(
+    (widest, row) => (Array.isArray(row) ? Math.max(widest, row.length) : widest),
+    0,
+  );
+  const width = Math.max(1, lastColumn - firstColumn + 1, widestRow);
+  const rowsPerRead = Math.max(
+    1,
+    Math.min(MAX_SHEET_ROWS, Math.floor(MAX_GOOGLE_SHEET_CELLS / width)),
+  );
+  const firstRow = Number(a1[2]);
+  const lastRow = firstRow + raw.length - 1;
+  const lastColumnLetters = columnLetters(firstColumn + width - 1);
+  const tail = `${sheetPrefix}${a1[1].toUpperCase()}${Math.max(firstRow, lastRow - rowsPerRead + 1)}:${lastColumnLetters}${lastRow}`;
+  return `${facts} Data rows ${firstRow}-${lastRow}; read ${rowsPerRead} rows at a time, the last ones are ${tail}.`;
+}
+
+function normalizeSheetValues(
+  raw: unknown,
+  readRange?: string,
+): SheetCell[][] {
   if (!Array.isArray(raw)) return [];
   const rows: SheetCell[][] = [];
   let cells = 0;
+  const oversized = (message: string): never =>
+    failInput(
+      readRange === undefined
+        ? message
+        : `${message} ${oversizedSheetReadHint(raw, readRange)}`,
+    );
   if (raw.length > MAX_SHEET_ROWS)
-    failInput('Sheet response has too many rows.');
+    oversized('Sheet response has too many rows.');
   for (const rawRow of raw) {
     if (!Array.isArray(rawRow) || rawRow.length > MAX_SHEET_COLUMNS) {
       failInput('Sheet values must be a bounded two-dimensional array.');
@@ -797,7 +848,7 @@ function normalizeSheetValues(raw: unknown): SheetCell[][] {
       row.push(rawCell as SheetCell);
       cells += 1;
       if (cells > MAX_GOOGLE_SHEET_CELLS) {
-        failInput(`Sheet values exceed ${MAX_GOOGLE_SHEET_CELLS} cells.`);
+        oversized(`Sheet values exceed ${MAX_GOOGLE_SHEET_CELLS} cells.`);
       }
     }
     rows.push(row);
@@ -1823,7 +1874,7 @@ export class GoogleWorkspaceClient {
     );
     const returnedRange =
       typeof raw.range === 'string' && raw.range ? raw.range : range;
-    const values = normalizeSheetValues(raw.values);
+    const values = normalizeSheetValues(raw.values, returnedRange);
     return {
       spreadsheetId,
       range: returnedRange,

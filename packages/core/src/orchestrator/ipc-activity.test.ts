@@ -24,15 +24,25 @@ vi.mock('./config.js', async (importOriginal) => ({
   GROUPS_DIR: '/tmp/claudeclaw-ipc-activity-test/groups',
 }));
 
-import { _initTestDatabase } from './db.js';
-import { startIpcWatcher, IpcDeps } from './ipc.js';
+import { _initTestDatabase, getRecentConversationMessages } from './db.js';
+import { getEventsForTenant } from './event-store.js';
+import {
+  ipcDocumentHistoryPlaceholder,
+  ipcPhotoHistoryPlaceholder,
+  ipcVoiceHistoryPlaceholder,
+  startIpcWatcher,
+  IpcDeps,
+} from './ipc.js';
+import { logger } from './logger.js';
 import { onRunIpcActivity, RunIpcActivityKind } from './run-activity.js';
+import { recentChatFileSend } from './chat-file-sends.js';
 import {
   _clearTaskAuthorizationState,
   authorizeTaskOperationRequest,
   registerTaskAuthorizationCapability,
 } from './task-authorization.js';
 import { signedTaskAuthorizationRequestForTest } from './task-authorization.test-helpers.js';
+import { defaultWhatsappTenantId } from './tenant-registry.js';
 import { MessageRouter, RegisteredGroup } from './types.js';
 
 const MAIN_FOLDER = 'ipc-act-main';
@@ -77,7 +87,8 @@ const GROUPS: Record<string, RegisteredGroup> = {
 };
 
 // route(): null = dropped/no user-visible text (NOT a delivery);
-// sendPhoto(): caption 'fail' simulates a failed channel send (ok=false).
+// sendPhoto()/sendDocument(): caption 'fail' and sendVoice(): text 'fail'
+// simulate a failed channel send (ok=false).
 const observedStagedPaths: string[] = [];
 const router: MessageRouter = {
   route: async (envelope) =>
@@ -90,9 +101,9 @@ const router: MessageRouter = {
   sendDocument: async (_jid, filePath, caption) => {
     if (filePath.includes('ipc-staging')) observedStagedPaths.push(filePath);
     if (caption === 'throw') throw new Error('simulated channel failure');
-    return true;
+    return caption !== 'fail';
   },
-  sendVoice: async () => true,
+  sendVoice: async (_jid, text) => text !== 'fail',
   addPreHook: () => {},
   addPostHook: () => {},
 };
@@ -347,5 +358,222 @@ describe('IPC watcher → run-activity liveness notifications', () => {
     expect(
       fs.readdirSync(path.join(IPC_BASE, MAIN_FOLDER, 'messages')),
     ).toEqual([]);
+  });
+
+
+  // deliveries were never written to messages, so the dashboard chat, the
+  // bot's recent_conversation_context and chat_history saw «no answer» after
+  // a voice-only turn. Same rule as the text branch: ok=true → storeBotReply
+  // with a placeholder; a failed send stores nothing; text is not duplicated.
+  it('подтверждённые голос/фото/документ попадают в историю чата плейсхолдерами; срыв отправки — нет', async () => {
+    const before = getRecentConversationMessages('main@g.us', '', 100);
+    const beforeContents = before.map((m) => m.content);
+    // Passes 1–3 above: the text send is stored once (no duplicate from the
+    // media branches), the three confirmed media sends are stored, and the
+    // failed photo send (caption 'fail', ok=false) is not.
+    expect(beforeContents.filter((c) => c === 'hello')).toHaveLength(1);
+    expect(beforeContents).toContain(
+      '[Photo: report.png] site walkthrough step 4',
+    );
+    expect(beforeContents).toContain('[Document: report.png]');
+    expect(beforeContents).toContain('[Voice: voice progress note]');
+    expect(beforeContents).not.toContain('[Photo: report.png] fail');
+    expect(before.every((m) => Boolean(m.is_bot_message))).toBe(true);
+
+    const chartPath = path.join(tmpDir, 'график.png');
+    const estimatePath = path.join(tmpDir, 'смета.pdf');
+    fs.writeFileSync(chartPath, 'png-bytes');
+    fs.writeFileSync(estimatePath, 'pdf-bytes');
+    writeEnvelope(
+      MAIN_FOLDER,
+      'm7.json',
+      ownerEnvelope({
+        type: 'voice',
+        chatJid: 'main@g.us',
+        text: '  Отчёт готов, смотри документ.  ',
+      }),
+    );
+    writeEnvelope(
+      MAIN_FOLDER,
+      'm8.json',
+      ownerEnvelope({
+        type: 'photo',
+        chatJid: 'main@g.us',
+        filePath: chartPath,
+        caption: 'график продаж',
+      }),
+    );
+    writeEnvelope(
+      MAIN_FOLDER,
+      'm9.json',
+      ownerEnvelope({
+        type: 'document',
+        chatJid: 'main@g.us',
+        filePath: estimatePath,
+        caption: 'смета на октябрь',
+      }),
+    );
+    vi.advanceTimersByTime(1000);
+    await flushWatcherPass();
+
+    const after = getRecentConversationMessages('main@g.us', '', 100);
+    const added = after.slice(before.length);
+    expect(added).toHaveLength(3);
+    expect(added.every((m) => Boolean(m.is_bot_message))).toBe(true);
+    // One pass under fake timers shares a timestamp, so compare as a set.
+    expect(added.map((m) => m.content).sort()).toEqual(
+      [
+        '[Voice: Отчёт готов, смотри документ.]',
+        '[Photo: график.png] график продаж',
+        '[Document: смета.pdf] смета на октябрь',
+      ].sort(),
+    );
+    expect(mainEvents.slice(-3).sort()).toEqual(['document', 'photo', 'voice']);
+    // C38: the final answer that links one of these files must not attach it
+    // a second time — the watcher notes every confirmed file send.
+    expect(recentChatFileSend(MAIN_FOLDER, fs.realpathSync(chartPath))).toBe(
+      'sent',
+    );
+    expect(recentChatFileSend(MAIN_FOLDER, fs.realpathSync(estimatePath))).toBe(
+      'sent',
+    );
+  });
+
+
+  // turn as answered as soon as the envelope is written, so a channel refusal
+  // (send → false) used to leave only an INFO line with ok=false — the user
+  // got no answer and neither the dashboard's error badge nor the event store
+  // saw anything. Now: WARN + an `error` event (kind ipc_delivery_failed);
+  // still not a delivery (no liveness signal, nothing in the chat history).
+  it('срыв доставки голоса/фото/документа — WARN и событие error ipc_delivery_failed', async () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const tenantId = defaultWhatsappTenantId('main');
+    const errorEvents = () =>
+      getEventsForTenant(tenantId).filter((event) => event.type === 'error');
+    const errorsBefore = errorEvents().length;
+    const historyBefore = getRecentConversationMessages('main@g.us', '', 100)
+      .length;
+    const livenessBefore = mainEvents.length;
+    try {
+      const failPhoto = path.join(tmpDir, 'fail-photo.png');
+      const failDocument = path.join(tmpDir, 'fail-doc.pdf');
+      fs.writeFileSync(failPhoto, 'png-bytes');
+      fs.writeFileSync(failDocument, 'pdf-bytes');
+      writeEnvelope(
+        MAIN_FOLDER,
+        'm10.json',
+        ownerEnvelope({ type: 'voice', chatJid: 'main@g.us', text: 'fail' }),
+      );
+      writeEnvelope(
+        MAIN_FOLDER,
+        'm11.json',
+        ownerEnvelope({
+          type: 'photo',
+          chatJid: 'main@g.us',
+          filePath: failPhoto,
+          caption: 'fail',
+        }),
+      );
+      writeEnvelope(
+        MAIN_FOLDER,
+        'm12.json',
+        ownerEnvelope({
+          type: 'document',
+          chatJid: 'main@g.us',
+          filePath: failDocument,
+          caption: 'fail',
+        }),
+      );
+      vi.advanceTimersByTime(1000);
+      await flushWatcherPass();
+
+      const added = errorEvents().slice(errorsBefore);
+      const payloads = added.map(
+        (event) => JSON.parse(event.payload_json) as Record<string, unknown>,
+      );
+      expect(payloads.map((payload) => payload.medium).sort()).toEqual([
+        'document',
+        'photo',
+        'voice',
+      ]);
+      for (const payload of payloads) {
+        expect(payload).toMatchObject({
+          kind: 'ipc_delivery_failed',
+          chat_jid: 'main@g.us',
+          sourceGroup: MAIN_FOLDER,
+          reason: 'channel_send_failed',
+        });
+      }
+      expect(added.every((event) => event.actor === 'system')).toBe(true);
+
+      const warned = warnSpy.mock.calls.map((call) => String(call[1]));
+      expect(warned).toEqual(
+        expect.arrayContaining([
+          'IPC voice delivery failed',
+          'IPC photo delivery failed',
+          'IPC document delivery failed',
+        ]),
+      );
+      const warnedFields = warnSpy.mock.calls.map((call) => call[0]);
+      expect(warnedFields).toContainEqual(
+        expect.objectContaining({
+          chatJid: 'main@g.us',
+          sourceGroup: MAIN_FOLDER,
+          medium: 'voice',
+          reason: 'channel_send_failed',
+        }),
+      );
+
+      // Not a delivery: no liveness signal, no history placeholder, and the
+      // envelopes were consumed rather than parked in errors/.
+      expect(mainEvents).toHaveLength(livenessBefore);
+      expect(getRecentConversationMessages('main@g.us', '', 100)).toHaveLength(
+        historyBefore,
+      );
+      expect(
+        fs.readdirSync(path.join(IPC_BASE, MAIN_FOLDER, 'messages')),
+      ).toEqual([]);
+      // A refused file is not «already sent»: a later link may attach it.
+      expect(
+        recentChatFileSend(MAIN_FOLDER, fs.realpathSync(failDocument)),
+      ).toBeNull();
+      expect(
+        recentChatFileSend(MAIN_FOLDER, fs.realpathSync(failPhoto)),
+      ).toBeNull();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});
+
+describe('IPC delivery history placeholders', () => {
+  // The prefixes must stay the inbound ones ('[Voice: …]', '[Photo…]',
+  // '[Document: …]'): chat_history's BOT_KIND_SQL, cleanBotContent and the
+  // dashboard's message_kind all key on them.
+  it('voice keeps the spoken text, trimmed', () => {
+    expect(ipcVoiceHistoryPlaceholder(' Привет, это Скуби. ')).toBe(
+      '[Voice: Привет, это Скуби.]',
+    );
+  });
+
+  it('photo names the agent-side file and keeps an optional caption', () => {
+    expect(
+      ipcPhotoHistoryPlaceholder('/workspace/group/out/chart.png', ' подпись '),
+    ).toBe('[Photo: chart.png] подпись');
+    expect(ipcPhotoHistoryPlaceholder('/tmp/out/chart.png')).toBe(
+      '[Photo: chart.png]',
+    );
+    expect(ipcPhotoHistoryPlaceholder('/tmp/out/chart.png', '   ')).toBe(
+      '[Photo: chart.png]',
+    );
+  });
+
+  it('document names the file and keeps an optional caption', () => {
+    expect(
+      ipcDocumentHistoryPlaceholder('/tmp/out/Смета.2026.pdf', 'смета'),
+    ).toBe('[Document: Смета.2026.pdf] смета');
+    expect(ipcDocumentHistoryPlaceholder('/tmp/out/Смета.2026.pdf')).toBe(
+      '[Document: Смета.2026.pdf]',
+    );
   });
 });

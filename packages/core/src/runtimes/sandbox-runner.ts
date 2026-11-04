@@ -19,13 +19,21 @@ import path from 'path';
 
 import { readEnvFile } from '../orchestrator/env.js';
 import {
+  isolatedObserverForRun,
+  type RunTrust,
+} from '../orchestrator/run-trust.js';
+import {
   CODE_ROOT,
   CONTAINER_MAX_OUTPUT_SIZE,
+  CODEX_THREAD_MAX_ROLLOUT_BYTES,
+  CODEX_THREAD_OVERSIZE_IDLE_MS,
+  CODEX_THREAD_ROLLOUT_HARD_BYTES,
   CONTAINER_TIMEOUT,
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
   RUNNER_IDLE_WAIT_MS,
+  SKILLS_CURATOR_FOLDER,
   TIMEZONE,
 } from '../orchestrator/config.js';
 import {
@@ -260,6 +268,16 @@ export function redactSandboxOutput(
     ...(typeof output.error === 'string'
       ? {
           error: redactContainerRuntimeDiagnostics(output.error, exactSecrets),
+        }
+      : {}),
+    // Промежуточная реплика идёт пользователю в чат, значит чистится тем же
+    // конвейером, что result и error.
+    ...(typeof output.progressText === 'string'
+      ? {
+          progressText: redactContainerRuntimeDiagnostics(
+            output.progressText,
+            exactSecrets,
+          ),
         }
       : {}),
   };
@@ -940,9 +958,11 @@ export function ensureSandboxRuntimeAvailable(): void {
 
 // A per-run policy/settings file (data/sandbox-settings/<processName>.json) or
 // PID file older than this is considered orphaned from a crashed/SIGKILLed run.
-// The longest possible run is bounded by timeoutMs (max(configTimeout,
-// IDLE_TIMEOUT+30s) ≈ 30.5 min) plus the 5s SIGKILL escalation, so a 2h floor
-// can never delete a file belonging to a live in-process run.
+// The longest possible run is bounded by timeoutMs (resolveSandboxGlobalTimeoutMs:
+// max(configTimeout, IDLE_TIMEOUT+30s, codex turn cap+2min) — 92 min for the
+// 90-minute cap of the admin chats) plus the 5s SIGKILL escalation, so a 2h
+// floor can never delete a file belonging to a live in-process run. Keep any
+// codexTurnMaxMs comfortably under ~115 min, or raise this floor with it.
 const SANDBOX_FILE_STALE_MS = 2 * 60 * 60 * 1000; // 2h
 
 /**
@@ -1057,14 +1077,18 @@ export function buildSandboxMounts(
   senderIdentity?: SenderIdentity,
   credentialProxyTier: 'owner' | 'guest' = 'guest',
   chatJid?: string,
+  runTrust?: RunTrust,
 ): SandboxMount[] {
   const mounts: SandboxMount[] = [];
   const projectRoot = process.cwd();
   const groupDir = resolveGroupFolderPath(group.folder);
-  const restrictedWhatsAppObserver =
-    isMain &&
-    group.agentConfig?.whatsappObserverAccess === true &&
-    Boolean(chatJid?.endsWith('@s.whatsapp.net'));
+  // Honor the host-derived trust decision. Recompute only for legacy callers
+  // that do not supply runTrust.
+  const restrictedWhatsAppObserver = isolatedObserverForRun(runTrust, {
+    groupIsMain: isMain,
+    chatJid,
+    whatsappObserverAccess: group.agentConfig?.whatsappObserverAccess,
+  });
   const trustedOwner =
     isMain && credentialProxyTier === 'owner' && !restrictedWhatsAppObserver;
   const identityId =
@@ -1228,6 +1252,10 @@ export function buildSandboxMounts(
     // Payment certificates and private keys may live here — never
     // expose them to a guest sandbox, same as .env above.
     alwaysDenyPath(path.join(projectRoot, 'secrets'));
+
+    // Host scratch files may contain copied state or setup artifacts.
+    // Guests must not read the project-level scratch directory.
+    alwaysDenyPath(path.join(projectRoot, 'tmp'));
     for (const entry of fs.existsSync(GROUPS_DIR)
       ? fs.readdirSync(GROUPS_DIR)
       : []) {
@@ -1309,7 +1337,7 @@ export function buildSandboxMounts(
     // (store, .env, secrets, other groups, sensitive home dirs) were just a
     // blacklist — a guest with Bash could still read ANY un-listed host path:
     // the owner's private files, other users' homes (/Users/example/Documents,
-    // /Users/you/...), Desktop, etc.
+    // /Users/example/...), Desktop, etc.
     //
     // We do NOT blanket-deny the top-level dir: srt pairs every read-deny with
     // a file-write-unlink deny over the SAME subtree (a move-bypass guard) and
@@ -1368,10 +1396,23 @@ export function buildSandboxMounts(
   // proposals are routed to the host over IPC (`propose_skill`), which writes
   // them to `.proposals` for operator approval — see ipc.ts and the runner's
   // skill_propose tool.
+
+  // group, not just the one operator who curates the registry. With more than
+  // one full-access admin that is cross-admin prompt injection: admin B's agent
+  // writes data/skills/<n>/SKILL.md, and because scoreSkill treats an absent
+  // `folders:` as "applies everywhere", the text is injected into admin A's
+  // prompt — an agent with an unsandboxed host shell. The `skill_propose` IPC
+  // gate does not help: it constrains the TOOL, not the filesystem.
+  // SKOOBI_SKILLS_CURATOR_FOLDER names the single group allowed to write the
+  // shared registry directly; everyone else proposes over IPC. Unset keeps the
+  // previous behaviour so existing deployments do not change silently.
+  const maySkillsWrite = SKILLS_CURATOR_FOLDER
+    ? trustedOwner && group.folder === SKILLS_CURATOR_FOLDER
+    : trustedOwner;
   mounts.push({
     hostPath: skillsDir,
     containerPath: '/workspace/skills',
-    readonly: !trustedOwner,
+    readonly: !maySkillsWrite,
   });
 
   // Per-group IPC namespace
@@ -1990,6 +2031,42 @@ export function shouldPersistCodexAuthRefresh(
   return trustedOwner && !isolatedObserverAuth;
 }
 
+/**
+ * The link check probes URLs straight from the runner. Inside the sandbox the
+ * egress is an allowlist behind srt's proxy, and Node's fetch ignores
+ * HTTPS_PROXY — so a check there would measure the sandbox, not the link, and
+ * could read the proxy's refusal as a dead site. Only a direct-network
+ * (bypass) run keeps it.
+ */
+export function stripLinkCheckUnlessDirectNetwork(
+  input: ContainerInput,
+  bypassSandbox: boolean,
+  groupName?: string,
+): ContainerInput {
+  if (bypassSandbox || !input.linkCheck) return input;
+  logger.info(
+    { group: groupName },
+    'Link check dropped: sandboxed run has no direct network',
+  );
+  const stripped = { ...input };
+  delete stripped.linkCheck;
+  return stripped;
+}
+
+
+export function resolveSandboxGlobalTimeoutMs(input: {
+  configTimeout: number;
+  idleTimeout: number;
+  codexTurnTimeoutMs?: number;
+}): number {
+  const codexBudget =
+    Number.isFinite(input.codexTurnTimeoutMs) &&
+    Number(input.codexTurnTimeoutMs) > 0
+      ? Number(input.codexTurnTimeoutMs) + 120_000
+      : 0;
+  return Math.max(input.configTimeout, input.idleTimeout + 30_000, codexBudget);
+}
+
 export async function runSandboxAgent(
   group: RegisteredGroup,
   input: ContainerInput,
@@ -2102,6 +2179,7 @@ export async function runSandboxAgent(
     input.senderIdentity,
     input.credentialProxyTier,
     input.chatJid,
+    input.runTrust,
   );
   const settingsDir = path.join(DATA_DIR, 'sandbox-settings');
   fs.mkdirSync(settingsDir, { recursive: true });
@@ -2113,6 +2191,7 @@ export async function runSandboxAgent(
     trustedOwner &&
     (group.agentConfig?.noSandbox === true ||
       group.agentConfig?.fullAccess === true);
+  input = stripLinkCheckUnlessDirectNetwork(input, bypassSandbox, group.name);
 
   // Codex provider (reserve fallback): every codex run gets a per-group
   // CODEX_HOME (auth + sessions + our generated config.toml), never the real
@@ -2340,6 +2419,13 @@ export async function runSandboxAgent(
     pathEnv = {
       CLAUDECLAW_IPC_DIR: fs.realpathSync(resolveGroupIpcPath(group.folder)),
     };
+    // Enforce tool restrictions at the MCP server: excluded tools are never
+    // registered. This also protects Codex runs; SDK allowedTools controls
+    // approval prompts rather than removing tool capabilities.
+    const runDisallowedTools = input.agentConfig?.disallowedTools || [];
+    if (runDisallowedTools.length > 0) {
+      pathEnv.CLAUDECLAW_DISALLOWED_TOOLS = runDisallowedTools.join(',');
+    }
     const extraHostPaths: string[] = [];
     for (const mount of mounts) {
       if (mount.containerPath === '/workspace/group')
@@ -2621,6 +2707,19 @@ export async function runSandboxAgent(
             ? { HELPER_PORT: secrets.HELPER_PORT }
             : {}),
           CLAUDECLAW_RUNNER_IDLE_WAIT_MS: String(RUNNER_IDLE_WAIT_MS),
+          // Codex thread rotation rule (.env-tunable host-side). Forwarded so
+          // the runner's rotation guard uses the operator's configured values
+          // instead of its compiled-in defaults (512MB soft after 3h idle,
+          // 2GB hard).
+          CLAUDECLAW_CODEX_THREAD_MAX_ROLLOUT_BYTES: String(
+            CODEX_THREAD_MAX_ROLLOUT_BYTES,
+          ),
+          CLAUDECLAW_CODEX_THREAD_ROLLOUT_HARD_BYTES: String(
+            CODEX_THREAD_ROLLOUT_HARD_BYTES,
+          ),
+          CLAUDECLAW_CODEX_THREAD_OVERSIZE_IDLE_MS: String(
+            CODEX_THREAD_OVERSIZE_IDLE_MS,
+          ),
           ...pathEnv,
         },
       });
@@ -2664,7 +2763,11 @@ export async function runSandboxAgent(
 
     // Timeout handling — declared before event handlers so closures can reference them
     const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
-    const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
+    const timeoutMs = resolveSandboxGlobalTimeoutMs({
+      configTimeout,
+      idleTimeout: IDLE_TIMEOUT,
+      codexTurnTimeoutMs: input.codex?.timeoutMs,
+    });
 
     // HANG timeout — separate, much shorter cap that fires when the sandbox
     // goes silent on BOTH streams for a sustained window. Distinct from the
@@ -3033,7 +3136,7 @@ export async function runSandboxAgent(
           resolve({
             status: 'error',
             result: null,
-            error: `Sandbox timed out after ${configTimeout}ms`,
+            error: `Sandbox timed out after ${timeoutMs}ms`,
           });
         });
         return;

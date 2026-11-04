@@ -75,7 +75,12 @@ export function runtimeVisibleTasks<T>(
   policy: RuntimePersistencePolicy,
   tasks: readonly T[],
 ): T[] {
-  return policy.exposeCanonicalTasks ? [...tasks] : [];
+  if (!policy.exposeCanonicalTasks) return [];
+  // cancel_task keeps the row for history (status 'cancelled'); the agent's
+  // snapshot (current_tasks.json → list_tasks) is a schedule, not an archive.
+  return tasks.filter(
+    (task) => (task as { status?: unknown } | null)?.status !== 'cancelled',
+  );
 }
 
 export function persistRuntimeSessionIfAllowed(

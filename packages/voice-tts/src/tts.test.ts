@@ -15,11 +15,15 @@ import {
 } from './tts.js';
 import {
   EDGE_DMITRY_LANG,
+  EDGE_DMITRY_ATTEMPTS,
+  EDGE_DMITRY_MAX_TIMEOUT_MS,
   EDGE_DMITRY_OUTPUT_FORMAT,
   EDGE_DMITRY_PITCH,
   EDGE_DMITRY_RATE,
   EDGE_DMITRY_TIMEOUT_MS,
   EDGE_DMITRY_VOICE,
+  edgeDmitryCliArgs,
+  edgeDmitryTimeoutMs,
   edgeDmitryTtsConfig,
   sanitizeDmitryVoiceText,
   telegramVoiceFfmpegArgs,
@@ -176,6 +180,7 @@ describe('Edge Dmitry TTS helpers', () => {
   });
 
   it('uses the requested Microsoft Edge Dmitry voice config', () => {
+    expect(EDGE_DMITRY_ATTEMPTS).toBe(2);
     expect(edgeDmitryTtsConfig()).toEqual({
       voice: EDGE_DMITRY_VOICE,
       lang: EDGE_DMITRY_LANG,
@@ -184,6 +189,34 @@ describe('Edge Dmitry TTS helpers', () => {
       pitch: EDGE_DMITRY_PITCH,
       timeout: EDGE_DMITRY_TIMEOUT_MS,
     });
+  });
+
+  it('allows enough synthesis time for long voice replies', () => {
+    expect(edgeDmitryTimeoutMs('Короткий ответ')).toBe(EDGE_DMITRY_TIMEOUT_MS);
+    expect(edgeDmitryTimeoutMs('а'.repeat(1300))).toBe(160_000);
+    expect(edgeDmitryTimeoutMs('а'.repeat(5000))).toBe(
+      EDGE_DMITRY_MAX_TIMEOUT_MS,
+    );
+  });
+
+  it('builds current edge-tts CLI args without exposing message text', () => {
+    expect(
+      edgeDmitryCliArgs(
+        '/tmp/reply.txt',
+        '/tmp/reply.mp3',
+        '/app/scripts/edge-tts-dmitry.py',
+      ),
+    ).toEqual([
+      '/app/scripts/edge-tts-dmitry.py',
+      '--voice',
+      EDGE_DMITRY_VOICE,
+      `--rate=${EDGE_DMITRY_RATE}`,
+      `--pitch=${EDGE_DMITRY_PITCH}`,
+      '--file',
+      '/tmp/reply.txt',
+      '--write-media',
+      '/tmp/reply.mp3',
+    ]);
   });
 
   it('normalizes and truncates long text before synthesis', () => {

@@ -36,6 +36,7 @@ import {
   type ToolExecutionResult,
 } from './tool-registry.js';
 import type { SenderIdentity } from './types.js';
+import type { LinkCheckRunConfig } from '../runtimes/container-runner.js';
 
 export type LiveCanaryConfig = {
   enabled: boolean;
@@ -257,7 +258,13 @@ function isInsideDir(child: string, parent: string): boolean {
 export function resolvePromptImageAttachments(
   prompt: string,
   groupFolder: string,
-  options: { groupsDir?: string; maxImages?: number } = {},
+  options: {
+    groupsDir?: string;
+    maxImages?: number;
+    /** Skip files received longer ago than this (by mtime). */
+    maxAgeMs?: number;
+    now?: number;
+  } = {},
 ): string[] {
   const maxImages = Math.max(
     0,
@@ -294,6 +301,12 @@ export function resolvePromptImageAttachments(
       ) {
         continue;
       }
+      if (
+        options.maxAgeMs !== undefined &&
+        (options.now ?? Date.now()) - stat.mtimeMs > options.maxAgeMs
+      ) {
+        continue;
+      }
       images.push(real);
       if (images.length >= maxImages) break;
     } catch {
@@ -318,13 +331,17 @@ function promptReferencesVisualMedia(prompt: string): boolean {
   );
 }
 
+
+
+export const HISTORY_IMAGE_FALLBACK_MAX_AGE_MS = 30 * 60 * 1000;
+
 export function resolveCurrentTurnImageAttachments(
   input: {
     currentPrompt: string;
     fullPrompt: string;
     groupFolder: string;
   },
-  options: { groupsDir?: string; maxImages?: number } = {},
+  options: { groupsDir?: string; maxImages?: number; now?: number } = {},
 ): string[] {
   const currentImages = resolvePromptImageAttachments(
     input.currentPrompt,
@@ -334,11 +351,10 @@ export function resolveCurrentTurnImageAttachments(
   if (currentImages.length > 0) return currentImages;
   if (promptHasCurrentVisualMedia(input.currentPrompt)) return [];
   if (!promptReferencesVisualMedia(input.currentPrompt)) return [];
-  return resolvePromptImageAttachments(
-    input.fullPrompt,
-    input.groupFolder,
-    options,
-  );
+  return resolvePromptImageAttachments(input.fullPrompt, input.groupFolder, {
+    ...options,
+    maxAgeMs: HISTORY_IMAGE_FALLBACK_MAX_AGE_MS,
+  });
 }
 
 function safeErrorPayload(err: Error): Record<string, unknown> {
@@ -966,6 +982,246 @@ export async function runLiveModelTurn(
       error,
     };
   }
+}
+
+/**
+ * Промежуточные реплики модели: для каких групп включены.
+ *
+ * Раскатка поштучно и выключение мгновенное — потому что цена ошибки здесь
+ * не «медленнее», а «в чате шум и непонятно, где ответ». Никакого кэша в
+ * модульной константе: и список групп, и киллсвитч читаются НА КАЖДОМ ХОДЕ,
+ * чтобы `touch store/progress-messages.disabled` останавливал функцию со
+ * следующего же хода — без рестарта и без пересборки.
+ */
+export function progressMessagesEnabledForGroup(folder: string): boolean {
+  return groupListedInEnvGate(
+    folder,
+    'SKOOBI_PROGRESS_MESSAGES_GROUPS',
+    'progress-messages.disabled',
+  );
+}
+
+/**
+ * Хост сам отвечает на «ау» во время долгого хода и ставит 👀 на остальные
+ * сообщения, пришедшие, пока модель занята. Для каких групп включено.
+ *
+ * Та же схема, что у промежуточных реплик: список групп в
+ * SKOOBI_ACTIVE_RUN_ACK_GROUPS и киллсвитч store/active-run-ack.disabled,
+ * оба читаются при каждом вызове. `touch store/active-run-ack.disabled`
+ * возвращает ровно прежнее поведение со следующего же сообщения — без
+ * рестарта и без пересборки.
+ */
+export function activeRunAckEnabledForGroup(folder: string): boolean {
+  return groupListedInEnvGate(
+    folder,
+    'SKOOBI_ACTIVE_RUN_ACK_GROUPS',
+    'active-run-ack.disabled',
+  );
+}
+
+function groupListedInEnvGate(
+  folder: string,
+  envKey: string,
+  killSwitchFile: string,
+): boolean {
+  if (!folder) return false;
+  try {
+    if (fs.existsSync(path.join(STATE_ROOT, 'store', killSwitchFile))) {
+      return false;
+    }
+  } catch {
+    // не смогли проверить киллсвитч — считаем, что он взведён
+    return false;
+  }
+  const raw = process.env[envKey] || readEnvFile([envKey])[envKey] || '';
+  return raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .includes(folder);
+}
+
+/** Чат владельца: без ключа в .env доработка включена только там. */
+export const FINALIZE_HOLD_DEFAULT_GROUPS: readonly string[] = [
+  'telegram_main',
+];
+
+/**
+ * «Доработка перед отправкой»: для каких групп раннер вливает
+ * короткие сообщения, пришедшие посреди хода, в готовый ответ.
+ *
+ * Без записи в БД и, как остальные гейты, без кэша — на каждом ходе:
+ * - SKOOBI_FINALIZE_HOLD_GROUPS — папки через запятую; ключа нет —
+ *   FINALIZE_HOLD_DEFAULT_GROUPS (только чат владельца); `off` или `none` —
+ *   выключено везде (пустое значение .env-читатель не отличает от отсутствия);
+ * - store/finalize-hold.disabled — выключает везде без рестарта.
+ */
+export function finalizeHoldEnabledForGroup(folder: string): boolean {
+  if (!folder) return false;
+  try {
+    if (
+      fs.existsSync(path.join(STATE_ROOT, 'store', 'finalize-hold.disabled'))
+    ) {
+      return false;
+    }
+  } catch {
+    // не смогли проверить киллсвитч — считаем, что он взведён
+    return false;
+  }
+  const key = 'SKOOBI_FINALIZE_HOLD_GROUPS';
+  const raw = (process.env[key] || readEnvFile([key])[key] || '').trim();
+  const groups = raw
+    ? raw
+        .split(',')
+        .map((entry) => entry.trim())
+        .filter((entry) => entry && !/^(?:off|none)$/i.test(entry))
+    : FINALIZE_HOLD_DEFAULT_GROUPS;
+  return groups.includes(folder);
+}
+
+const LINK_FIX_EFFORTS = new Set([
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+]);
+
+/**
+ * Проверка ссылок финального ответа: для каких групп и в каком режиме.
+ *
+ * Как и промежуточные реплики — поштучно и без кэша: список, режим и оба
+ * киллсвитча читаются НА КАЖДОМ ХОДЕ, так что правка .env или `touch` действуют
+ * со следующего хода без рестарта.
+ *
+ * - SKOOBI_LINK_CHECK_GROUPS — папки через запятую; пусто — выключено везде.
+ * - SKOOBI_LINK_CHECK_MODE — shadow (по умолчанию: только замер, ответ не
+ *   меняется) | mark (пометка у мёртвых ссылок) | fix (один ход-исправление).
+ *   Непонятное значение — shadow.
+ * - SKOOBI_LINK_FIX_REASONING_EFFORT — усилие хода-исправления, по умолчанию
+ *   medium; inherit — как у самого хода.
+ * - store/link-check.disabled — выключает всё; store/link-fix.disabled — fix
+ *   превращается в mark.
+ */
+export function linkCheckConfigForGroup(
+  folder: string,
+): LinkCheckRunConfig | null {
+  if (!folder) return null;
+  try {
+    if (fs.existsSync(path.join(STATE_ROOT, 'store', 'link-check.disabled'))) {
+      return null;
+    }
+  } catch {
+    // не смогли проверить киллсвитч — считаем, что он взведён
+    return null;
+  }
+  const keys = [
+    'SKOOBI_LINK_CHECK_GROUPS',
+    'SKOOBI_LINK_CHECK_MODE',
+    'SKOOBI_LINK_FIX_REASONING_EFFORT',
+  ] as const;
+  const fromFile = keys.every((key) => process.env[key])
+    ? {}
+    : readEnvFile([...keys]);
+  const value = (key: (typeof keys)[number]): string =>
+    (process.env[key] || fromFile[key] || '').trim();
+  const enabled = value('SKOOBI_LINK_CHECK_GROUPS')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .includes(folder);
+  if (!enabled) return null;
+  const rawMode = value('SKOOBI_LINK_CHECK_MODE').toLowerCase();
+  let mode: LinkCheckRunConfig['mode'] =
+    rawMode === 'mark' || rawMode === 'fix' ? rawMode : 'shadow';
+  if (mode === 'fix') {
+    try {
+      if (fs.existsSync(path.join(STATE_ROOT, 'store', 'link-fix.disabled'))) {
+        mode = 'mark';
+      }
+    } catch {
+      mode = 'mark';
+    }
+  }
+  if (mode !== 'fix') return { mode };
+  const rawEffort = value('SKOOBI_LINK_FIX_REASONING_EFFORT').toLowerCase();
+  if (rawEffort === 'inherit') return { mode };
+  return {
+    mode,
+    fixReasoningEffort: LINK_FIX_EFFORTS.has(rawEffort) ? rawEffort : 'medium',
+  };
+}
+
+function nonNegativeInt(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? Math.min(Math.round(value), 10_000_000)
+    : undefined;
+}
+
+/**
+ * Итог проверки ссылок из кадра раннера → payload события agent_link_check.
+ * Кадр пишет процесс раннера, поэтому поля берутся по белому списку и по
+ * форме: числа, короткие коды и только имена хостов — ни путей, ни ссылок.
+ */
+export function linkCheckEventPayload(
+  raw: unknown,
+): Record<string, unknown> | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const summary = raw as Record<string, unknown>;
+  const payload: Record<string, unknown> = {};
+  for (const key of [
+    'found',
+    'checked',
+    'ok',
+    'dead',
+    'unknown',
+    'skipped',
+    'truncated',
+    'marked',
+    'check_ms',
+    'fix_ms',
+    'recheck_checked',
+    'recheck_dead',
+  ]) {
+    const number = nonNegativeInt(summary[key]);
+    if (number !== undefined) payload[key] = number;
+  }
+  if (
+    summary.mode === 'shadow' ||
+    summary.mode === 'mark' ||
+    summary.mode === 'fix'
+  ) {
+    payload.mode = summary.mode;
+  }
+  for (const key of ['correction', 'fix_reject']) {
+    const code = summary[key];
+    if (typeof code === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(code)) {
+      payload[key] = code;
+    }
+  }
+  if (Array.isArray(summary.dead_hosts)) {
+    payload.dead_hosts = summary.dead_hosts
+      .filter(
+        (host): host is string =>
+          typeof host === 'string' &&
+          /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/i.test(host),
+      )
+      .slice(0, 24);
+  }
+  if (summary.reasons && typeof summary.reasons === 'object') {
+    const reasons: Record<string, number> = {};
+    for (const [key, count] of Object.entries(
+      summary.reasons as Record<string, unknown>,
+    ).slice(0, 40)) {
+      const number = nonNegativeInt(count);
+      if (/^[a-z]+:[a-z0-9-]{1,40}$/.test(key) && number !== undefined) {
+        reasons[key] = number;
+      }
+    }
+    payload.reasons = reasons;
+  }
+  return payload;
 }
 
 export function chargeLiveUsage(

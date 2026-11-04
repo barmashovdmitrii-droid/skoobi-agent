@@ -120,7 +120,7 @@ directly in a shell command.
 Download both assets from the tagged release:
 
 ```bash
-VERSION=v2.0.0
+VERSION=v2.1.0
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh"
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh.sha256"
 ```
@@ -303,6 +303,14 @@ resolve to the exact supplied commit, builds in a private staging directory,
 and does not replace the active release unless the build succeeds.
 If `--no-start` is supplied, an existing managed service is stopped before
 the release swap and deliberately left stopped.
+
+### Upgrading from 2.0.0 to 2.1.0
+
+Use the normal checksum-verified release installer. Existing instance data
+and optional accounting records are preserved. Structured memory adds new
+database tables; project cards start accumulating as the assistant uses the
+new tools. Existing notes are not automatically rewritten into structured
+facts. Keep the normal private instance backup before upgrading.
 
 ### Upgrading from 2.0.0-rc.1
 

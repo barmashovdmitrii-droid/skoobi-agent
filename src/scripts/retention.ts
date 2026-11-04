@@ -1,23 +1,23 @@
 #!/usr/bin/env node
 /**
- * Retention sweep (Tier 1, dry-by-default).
+ * Retention sweep (Tier 1). DESTRUCTIVE — requires an explicit `--run`.
  *
  * For each `groups/<folder>/`, read `.media-index.jsonl`, classify
  * entries as `keep` or `candidate` for deletion, and either:
- *   - mode === 'dry'  → log aggregate counts to `logs/retention.log`,
- *   - mode === 'run'  → unlink the candidate files and patch the
+ *   - dry (default)   → log aggregate counts to `logs/retention.log`,
+ *   - `--run`         → unlink the candidate files and patch the
  *     manifest entry with `deleted_at`.
  *
- * Phase 5 (this commit) ships the script wired to `mode: dry` for every
- * media type in `config/retention.json`. The `run` path is implemented
- * but inactive — operators flip the mode after observing dry-run output
- * over a week.
+ * Deletion requires --run even when a configuration entry allows removal.
+ * Scheduled callers must opt in explicitly; an invocation without flags
+ * only reports candidates.
  *
  * Usage:
- *   node dist/scripts/retention.js [--dry] [--config <path>] \
+ *   node dist/scripts/retention.js [--run] [--dry] [--config <path>] \
  *        [--groups-dir <path>] [--report-chat <int>] [--no-report]
  *
- *   --dry          force dry mode regardless of config (default off)
+ *   --run          actually delete (default: report only)
+ *   --dry          force dry mode; wins over --run if both are given
  *   --config       path to retention.json (default: <cwd>/config/retention.json)
  *   --groups-dir   override groups directory (default: <cwd>/groups)
  *   --report-chat  Telegram chat_id (int) to send the daily summary to
@@ -126,17 +126,22 @@ function parseArgs(argv: string[]): Args {
   const defaultReportChat = /^-?[1-9]\d*$/u.test(configuredReportChat)
     ? Number(configuredReportChat)
     : DEFAULT_OWNER_CHAT_ID;
+  // dry is the DEFAULT now; deletion requires --run.
   const args: Args = {
-    dry: false,
+    dry: true,
     configPath: path.resolve(process.cwd(), 'config/retention.json'),
     groupsDir: path.resolve(process.cwd(), 'groups'),
     reportChat: defaultReportChat,
     sendReport: defaultReportChat !== null,
     logsDir: path.resolve(process.cwd(), 'logs'),
   };
+  // `--dry` is a hard override: if it appears anywhere it wins over `--run`,
+  // regardless of order, so a safety flag can never be cancelled by a later arg.
+  let forceDry = false;
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--dry') args.dry = true;
+    if (a === '--dry') forceDry = true;
+    else if (a === '--run') args.dry = false;
     else if (a === '--config') args.configPath = path.resolve(argv[++i]);
     else if (a === '--groups-dir') args.groupsDir = path.resolve(argv[++i]);
     else if (a === '--report-chat') {
@@ -147,11 +152,14 @@ function parseArgs(argv: string[]): Args {
     else if (a === '--logs-dir') args.logsDir = path.resolve(argv[++i]);
     else if (a === '-h' || a === '--help') {
       console.log(
-        'Usage: retention [--dry] [--config <path>] [--groups-dir <path>] [--report-chat <id>] [--no-report]',
+        'Usage: retention [--run] [--dry] [--config <path>] [--groups-dir <path>] [--report-chat <id>] [--no-report]\n' +
+          '  --run   actually delete expired media (default: report only)\n' +
+          '  --dry   force report-only; overrides --run wherever it appears',
       );
       process.exit(0);
     }
   }
+  if (forceDry) args.dry = true;
   return args;
 }
 

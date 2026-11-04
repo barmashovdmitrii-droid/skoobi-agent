@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   createBaileysPrivateConsoleMethod,
   isBaileysPrivateConsoleStack,
+  summarizeBaileysLogCall,
 } from './baileys-log-privacy.js';
 
 describe('Baileys direct-console privacy guard', () => {
@@ -79,5 +80,38 @@ describe('Baileys direct-console privacy guard', () => {
     guarded('ordinary application status');
 
     expect(sink).toHaveBeenCalledWith('ordinary application status');
+  });
+});
+
+describe('summarizeBaileysLogCall', () => {
+  it('keeps the message text and the error name and code, never the objects', () => {
+    expect(
+      summarizeBaileysLogCall([
+        { reasonNode: { attrs: { code: '515' } }, fullErrorNode: { tag: 'stream:error' } },
+        'stream errored out',
+      ]),
+    ).toEqual({ baileysMessage: 'stream errored out' });
+    // Phone numbers and LIDs interpolated without a JID suffix are masked;
+    // full JIDs become the stable peer label of redactString.
+    const masked = summarizeBaileysLogCall([
+      'Invalid LID-PN mapping: 123456789012345, 15551234567 for 15551234567@s.whatsapp.net',
+    ]);
+    expect(masked.baileysMessage).not.toMatch(/\d{6,}/);
+    expect(masked.baileysMessage).toContain('Invalid LID-PN mapping: <n>, <n> for <whatsapp-peer:');
+    // A Boom-style error: name and output.statusCode; its message never.
+    const boom = Object.assign(new Error('Connection Closed by 15551234567'), {
+      output: { statusCode: 428 },
+    });
+    expect(summarizeBaileysLogCall([{ err: boom }, 'error in socket end handler'])).toEqual({
+      baileysMessage: 'error in socket end handler',
+      errorName: 'Error',
+      statusCode: 428,
+    });
+    expect(summarizeBaileysLogCall([{ error: new RangeError('x') }])).toEqual({
+      errorName: 'RangeError',
+    });
+    expect(summarizeBaileysLogCall([{ e: 'not an error', statusCode: 'no' }])).toEqual({});
+    expect(summarizeBaileysLogCall([])).toEqual({});
+    expect(summarizeBaileysLogCall(['x'.repeat(500)]).baileysMessage).toHaveLength(160);
   });
 });

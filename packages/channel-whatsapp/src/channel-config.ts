@@ -47,9 +47,8 @@ export const ASSISTANT_NAME = normalizeAssistantName(
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME,
 );
 
-export const ASSISTANT_HAS_OWN_NUMBER =
-  (process.env.ASSISTANT_HAS_OWN_NUMBER ||
-    envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
+const assistantNumberMode = envValue('ASSISTANT_HAS_OWN_NUMBER')?.trim();
+export const ASSISTANT_HAS_OWN_NUMBER = assistantNumberMode === 'true';
 
 /**
  * npm changes cwd to the workspace for `npm run auth -w ...`. INIT_CWD keeps

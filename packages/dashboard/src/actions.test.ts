@@ -222,6 +222,196 @@ describe('allowlist панели', () => {
   });
 });
 
+describe('task_pause: включение задачи, которую поставил на паузу планировщик', () => {
+  const NOW = Date.parse('2026-09-28T10:00:00.000Z');
+
+  function tasksDb(): InstanceType<typeof Database> {
+    const db = new Database(':memory:');
+    db.exec(`
+      CREATE TABLE scheduled_tasks (id TEXT PRIMARY KEY, group_folder TEXT NOT NULL,
+        chat_jid TEXT NOT NULL, prompt TEXT NOT NULL, schedule_type TEXT NOT NULL,
+        schedule_value TEXT NOT NULL, next_run TEXT, last_run TEXT, last_result TEXT,
+        status TEXT DEFAULT 'active', created_at TEXT NOT NULL);
+    `);
+    const insert = db.prepare(
+      `INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type,
+         schedule_value, next_run, status, created_at)
+       VALUES (?, 'telegram_main', 'tg:1', 'x', ?, ?, ?, ?, '2026-09-01T00:00:00.000Z')`,
+    );
+    // Paused by the scheduler after an uncertain run: next_run NULL.
+    insert.run('daily', 'cron', '0 9 * * *', null, 'paused');
+    insert.run('hourly', 'interval', String(60 * 60 * 1000), null, 'paused');
+    insert.run('once', 'once', '2026-09-28T09:00:00.000Z', null, 'paused');
+    // Paused by hand: keeps its next_run.
+    insert.run(
+      'armed',
+      'cron',
+      '0 9 * * *',
+      '2026-09-29T04:00:00.000Z',
+      'paused',
+    );
+    insert.run('done', 'cron', '0 9 * * *', null, 'completed');
+    // Soft-cancelled by the bot (cancel_task keeps the row).
+    insert.run('cancelled', 'once', '2026-09-20T09:00:00.000Z', null, 'cancelled');
+    return db;
+  }
+
+  const toggle = (id: string, value: boolean) =>
+    runAction({ type: 'task_pause', params: { id, value } });
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('повторяющейся задаче снова назначается ближайший запуск', async () => {
+    const db = tasksDb();
+    vi.mocked(writeDb).mockReturnValue(db as never);
+    const row = (id: string) =>
+      db
+        .prepare('SELECT status, next_run FROM scheduled_tasks WHERE id = ?')
+        .get(id) as { status: string; next_run: string | null };
+
+    expect(await toggle('daily', false)).toMatchObject({ ok: true });
+    expect(await toggle('hourly', false)).toMatchObject({ ok: true });
+    expect(await toggle('once', false)).toMatchObject({ ok: true });
+    expect(await toggle('armed', false)).toMatchObject({ ok: true });
+    expect(await toggle('done', false)).toMatchObject({ ok: false });
+    // A cancelled task is history: neither ▶ nor ⏸ may revive it (it would
+    // otherwise become active with next_run = now and fire immediately).
+    expect(await toggle('cancelled', false)).toMatchObject({ ok: false });
+    expect(await toggle('cancelled', true)).toMatchObject({ ok: false });
+
+    const daily = row('daily');
+    expect(daily.status).toBe('active');
+    expect(daily.next_run).not.toBeNull();
+    expect(Date.parse(daily.next_run!)).toBeGreaterThan(NOW);
+    expect(Date.parse(daily.next_run!)).toBeLessThanOrEqual(
+      NOW + 24 * 60 * 60 * 1000,
+    );
+    expect(row('hourly')).toEqual({
+      status: 'active',
+      next_run: new Date(NOW + 60 * 60 * 1000).toISOString(),
+    });
+    // A once-task the scheduler gave up on is due again right away (its time
+    // has passed); a task that still had next_run and a completed task stay
+    // as they were.
+    expect(row('once')).toEqual({
+      status: 'active',
+      next_run: new Date(NOW).toISOString(),
+    });
+    expect(row('armed')).toEqual({
+      status: 'active',
+      next_run: '2026-09-29T04:00:00.000Z',
+    });
+    expect(row('done')).toEqual({ status: 'completed', next_run: null });
+    expect(row('cancelled')).toEqual({ status: 'cancelled', next_run: null });
+  });
+
+  it('пауза из панели next_run не трогает', async () => {
+    const db = tasksDb();
+    db.prepare(
+      `UPDATE scheduled_tasks SET status = 'active', next_run = ? WHERE id = 'daily'`,
+    ).run('2026-09-29T04:00:00.000Z');
+    vi.mocked(writeDb).mockReturnValue(db as never);
+
+    expect(await toggle('daily', true)).toMatchObject({
+      ok: true,
+      message: 'Задача на паузе',
+    });
+    expect(
+      db
+        .prepare('SELECT status, next_run FROM scheduled_tasks WHERE id = ?')
+        .get('daily'),
+    ).toEqual({ status: 'paused', next_run: '2026-09-29T04:00:00.000Z' });
+  });
+});
+
+// Previously: «▶️ сейчас» у отменённой/завершённой задачи
+// отвечал «не найдена или на паузе (включи кнопкой ▶)», а та кнопка для
+// таких строк отключена — тупик без объяснения.
+describe('task_run_now: отменённую и завершённую задачу не оживить', () => {
+  const NOW = Date.parse('2026-10-09T10:00:00.000Z');
+
+  function tasksDb(): InstanceType<typeof Database> {
+    const db = new Database(':memory:');
+    db.exec(`
+      CREATE TABLE scheduled_tasks (id TEXT PRIMARY KEY, group_folder TEXT NOT NULL,
+        chat_jid TEXT NOT NULL, prompt TEXT NOT NULL, schedule_type TEXT NOT NULL,
+        schedule_value TEXT NOT NULL, next_run TEXT, last_run TEXT, last_result TEXT,
+        status TEXT DEFAULT 'active', created_at TEXT NOT NULL);
+    `);
+    const insert = db.prepare(
+      `INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type,
+         schedule_value, next_run, status, created_at)
+       VALUES (?, 'telegram_main', 'tg:1', 'x', 'cron', '0 9 * * *', ?, ?, '2026-09-01T00:00:00.000Z')`,
+    );
+    insert.run('active', '2026-10-10T04:00:00.000Z', 'active');
+    insert.run('paused', '2026-10-10T04:00:00.000Z', 'paused');
+    insert.run('done', null, 'completed');
+    insert.run('cancelled', null, 'cancelled');
+    return db;
+  }
+
+  const runNow = (id: string) =>
+    runAction({ type: 'task_run_now', params: { id } });
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('активная запускается, паузная просит включить, история — создать заново', async () => {
+    const db = tasksDb();
+    vi.mocked(writeDb).mockReturnValue(db as never);
+    const row = (id: string) =>
+      db
+        .prepare('SELECT status, next_run FROM scheduled_tasks WHERE id = ?')
+        .get(id) as { status: string; next_run: string | null };
+
+    expect(await runNow('active')).toMatchObject({ ok: true });
+    expect(row('active')).toEqual({
+      status: 'active',
+      next_run: new Date(NOW).toISOString(),
+    });
+
+    const paused = await runNow('paused');
+    expect(paused.ok).toBe(false);
+    expect(paused.message).toMatch(/на паузе/);
+    expect(paused.message).toMatch(/▶/);
+
+    const cancelled = await runNow('cancelled');
+    expect(cancelled.ok).toBe(false);
+    expect(cancelled.message).toMatch(/отменена/);
+    expect(cancelled.message).toMatch(/создай заново/);
+    expect(cancelled.message).not.toMatch(/на паузе/);
+
+    const done = await runNow('done');
+    expect(done.ok).toBe(false);
+    expect(done.message).toMatch(/завершена/);
+    expect(done.message).toMatch(/создай заново/);
+
+    expect(await runNow('missing')).toMatchObject({
+      ok: false,
+      message: 'Задача не найдена',
+    });
+
+    // History rows are untouched: no next_run, same status.
+    expect(row('paused')).toEqual({
+      status: 'paused',
+      next_run: '2026-10-10T04:00:00.000Z',
+    });
+    expect(row('done')).toEqual({ status: 'completed', next_run: null });
+    expect(row('cancelled')).toEqual({ status: 'cancelled', next_run: null });
+  });
+});
+
 describe('setEnvToggle', () => {
   it('атомарно правит ключ, делает бэкап и не трогает остальное', () => {
     const envFile = path.join(dir, '.env');

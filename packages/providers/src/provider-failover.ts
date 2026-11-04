@@ -1,6 +1,7 @@
 export type ProviderRuntime = 'codex_subscription_cli' | 'claude_sdk';
 
 export type ProviderFailoverReason =
+  | 'policy_blocked'
   | 'unavailable'
   | 'auth_error'
   | 'timeout'
@@ -8,6 +9,8 @@ export type ProviderFailoverReason =
   | 'runtime_error'
   | 'rate_limit'
   | 'model_unavailable'
+  // The provider is overloaded: waiting can help; changing auth cannot.
+  | 'model_overloaded'
   | 'circuit_open';
 
 export type ProviderAttempt = {
@@ -35,6 +38,7 @@ export const DEFAULT_PROVIDER_FAILOVER_POLICY: ProviderFailoverPolicy = {
     'runtime_error',
     'rate_limit',
     'model_unavailable',
+    'model_overloaded',
     'circuit_open',
   ],
 };
@@ -50,12 +54,31 @@ function errorMessage(err: unknown): string {
 export function classifyProviderFailure(err: unknown): ProviderFailoverReason {
   const name = errorName(err);
   const message = errorMessage(err).toLowerCase();
+  // A local isolation refusal says nothing about provider availability.
+  if (message.includes('guest_codex_provider_blocked')) {
+    return 'policy_blocked';
+  }
   const classification =
     err && typeof err === 'object' && 'classification' in err
       ? String((err as { classification?: unknown }).classification)
       : '';
 
-  if (name === 'AbortError' || message.includes('timed out')) {
+  // Only our own turn budget running out is a benign «task too long»: the
+  // model was working. A link that timed out is an outage, and a sandbox that
+  // timed out is a wedged runner — both must count toward the breaker and
+  // must not get the «всё сохранено, напиши продолжай» reply. The network
+  // cases are decided below, after auth and limits, so a «stream error: 401»
+  // or «stream disconnected … usage limit» keeps its own meaning.
+  if (message.includes('codex turn timed out')) return 'timeout';
+  if (message.includes('sandbox timed out')) return 'runtime_error';
+  const linkTimedOut =
+    /connection timed out|operation timed out|etimedout|stream (?:error|disconnected)/.test(
+      message,
+    );
+  if (
+    !linkTimedOut &&
+    (name === 'AbortError' || message.includes('timed out'))
+  ) {
     return 'timeout';
   }
   if (classification === 'model_unavailable') {
@@ -71,6 +94,13 @@ export function classifyProviderFailure(err: unknown): ProviderFailoverReason {
   if (classification === 'runtime_error') return 'runtime_error';
   if (message.includes('circuit open')) {
     return 'circuit_open';
+  }
+  // «Selected model is at capacity» and the gateway's «overloaded»: the provider is
+  // busy, not misconfigured. Decided before the model/availability wordings
+  // so the user hears «перегружена», not «причина не установлена»; the runner
+  // has already retried it 2/15/45 s before the error reaches us.
+  if (message.includes('at capacity') || message.includes('overloaded')) {
+    return 'model_overloaded';
   }
   if (
     message.includes('model unavailable') ||
@@ -118,10 +148,12 @@ export function classifyProviderFailure(err: unknown): ProviderFailoverReason {
   }
   if (
     message.includes('empty final answer') ||
-    message.includes('empty output')
+    message.includes('empty output') ||
+    message.includes('produced no final message')
   ) {
     return 'empty_output';
   }
+  if (linkTimedOut) return 'unavailable';
   return 'runtime_error';
 }
 

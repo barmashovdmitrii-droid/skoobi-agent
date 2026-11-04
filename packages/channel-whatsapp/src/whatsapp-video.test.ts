@@ -20,6 +20,7 @@ vi.mock('@skoobi/shared/logger', () => ({
 
 import {
   createWhatsappVideoProcessor,
+  parseWhatsappVideoProbe,
   whatsappVideoFrameTimes,
   type WhatsappVideoExec,
 } from './whatsapp-video.js';
@@ -142,6 +143,94 @@ describe('local WhatsApp video processing', () => {
       }),
       'Processed WhatsApp video locally',
     );
+  });
+
+// Muted clips should skip audio extraction and transcription retries.
+  describe('muted videos', () => {
+    it('parses stream codec types and the duration from the flat ffprobe output', () => {
+      expect(parseWhatsappVideoProbe('video\naudio\n20.000\n')).toEqual({
+        durationSeconds: 20,
+        hasAudioTrack: true,
+      });
+      expect(parseWhatsappVideoProbe('video\n12.5\n')).toEqual({
+        durationSeconds: 12.5,
+        hasAudioTrack: false,
+      });
+      // Older/partial output without stream lines: audio unknown.
+      expect(parseWhatsappVideoProbe('20.000\n')).toEqual({
+        durationSeconds: 20,
+        hasAudioTrack: null,
+      });
+      expect(parseWhatsappVideoProbe('audio\nN/A\n')).toEqual({
+        durationSeconds: null,
+        hasAudioTrack: true,
+      });
+      expect(parseWhatsappVideoProbe('')).toEqual({
+        durationSeconds: null,
+        hasAudioTrack: null,
+      });
+    });
+
+    it('skips Whisper for a video without an audio stream and says so at INFO', async () => {
+      const execLocal: WhatsappVideoExec = vi.fn(async (executable, args) => {
+        if (executable === '/local/ffprobe') {
+          expect(args).toContain('stream=codec_type:format=duration');
+          return { stdout: 'video\n6.000\n', stderr: '' };
+        }
+        await fs.writeFile(args.at(-1)!, JPEG_BYTES);
+        return { stdout: '', stderr: '' };
+      });
+      const transcribe = vi.fn().mockResolvedValue('must not be called');
+      const processor = createWhatsappVideoProcessor({
+        ffmpegBin: '/local/ffmpeg',
+        ffprobeBin: '/local/ffprobe',
+        execLocal,
+        transcribe,
+      });
+
+      const result = await processor(videoPath);
+
+      expect(transcribe).not.toHaveBeenCalled();
+      expect(result.transcript).toBeNull();
+      expect(result.transcriptionAttempted).toBe(false);
+      expect(result.durationSeconds).toBe(6);
+      expect(result.framePaths).toHaveLength(3);
+      expect(loggerMock.info).toHaveBeenCalledWith(
+        expect.objectContaining({
+          via: 'local-whatsapp-video',
+          reason: 'no_audio_track',
+        }),
+        'Local WhatsApp video has no audio track; transcription skipped',
+      );
+      expect(loggerMock.info).toHaveBeenCalledWith(
+        expect.objectContaining({ hasAudioTrack: false, transcriptChars: 0 }),
+        'Processed WhatsApp video locally',
+      );
+      expect(loggerMock.warn).not.toHaveBeenCalled();
+    });
+
+    it('still transcribes when ffprobe lists an audio stream', async () => {
+      const execLocal: WhatsappVideoExec = vi.fn(async (executable, args) => {
+        if (executable === '/local/ffprobe') {
+          return { stdout: 'video\naudio\n6.000\n', stderr: '' };
+        }
+        await fs.writeFile(args.at(-1)!, JPEG_BYTES);
+        return { stdout: '', stderr: '' };
+      });
+      const transcribe = vi.fn().mockResolvedValue('есть звук');
+      const processor = createWhatsappVideoProcessor({
+        ffmpegBin: '/local/ffmpeg',
+        ffprobeBin: '/local/ffprobe',
+        execLocal,
+        transcribe,
+      });
+
+      const result = await processor(videoPath);
+
+      expect(transcribe).toHaveBeenCalledOnce();
+      expect(result.transcript).toBe('есть звук');
+      expect(result.transcriptionAttempted).toBe(true);
+    });
   });
 
   it('keeps usable frames when probing or transcription fails and logs no error text', async () => {

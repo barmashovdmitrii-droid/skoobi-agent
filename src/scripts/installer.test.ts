@@ -8,6 +8,9 @@ import { fileURLToPath } from 'node:url';
 import { readEnvFile } from '@skoobi/shared/env';
 import Database from 'better-sqlite3';
 
+// Installer integration cases launch several Git and shell subprocesses.
+vi.setConfig({ testTimeout: 20_000 });
+
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   '..',
@@ -1575,7 +1578,7 @@ describe('Skoobi installer scripts', () => {
     expect(content).toContain('SKOOBI_CODEX_OWNER_FULL_AGENT_ENABLED="false"');
     expect(content).toContain('SKOOBI_CODEX_OWNER_FULL_AGENT_MODE="auto"');
     expect(content).toContain('SKOOBI_SCHEDULED_TASKS_CODEX_PRIMARY="false"');
-  }, 15_000);
+  }, 30_000);
 
   it('does not require Codex when a normal rerun preserves another provider', () => {
     const prefix = tempDir();

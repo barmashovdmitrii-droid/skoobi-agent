@@ -36,6 +36,10 @@ class FakeClient extends EventEmitter {
     this.cwd = cwd;
     this.calls = [];
     this.readTurnStatus = 'inProgress';
+    this.readTurnItems = [];
+    this.readTurnError = null;
+    this.codeModeHost = true;
+    this.probeExitCode = 0;
     this.threadStatus = 'idle';
     this.threadStatusSequence = [];
     this.nextTurnId = 'turn-1';
@@ -64,6 +68,14 @@ class FakeClient extends EventEmitter {
 
   async request(method, params) {
     this.calls.push({ method, params });
+    if (method === 'config/read')
+      return { config: { features: { code_mode_host: this.codeModeHost } } };
+    if (method === 'command/exec')
+      return {
+        exitCode: this.probeExitCode,
+        stdout: params.command.at(-1),
+        stderr: '',
+      };
     if (method === 'thread/start') {
       if (this.threadStartBlock) await this.threadStartBlock;
       return {
@@ -119,7 +131,8 @@ class FakeClient extends EventEmitter {
                 {
                   id: 'turn-1',
                   status: this.readTurnStatus,
-                  items: [],
+                  items: this.readTurnItems,
+                  error: this.readTurnError,
                 },
               ]
             : [],
@@ -138,7 +151,8 @@ class FakeClient extends EventEmitter {
                 {
                   id: 'turn-1',
                   status: this.readTurnStatus,
-                  items: [],
+                  items: this.readTurnItems,
+                  error: this.readTurnError,
                 },
               ],
         },
@@ -1144,6 +1158,9 @@ describe('CodexDesktopBridge safety', () => {
     ]) {
       const stateFile = path.join(root, `${name}.json`);
       fs.writeFileSync(stateFile, contents, { mode });
+      // The bridge normally inherits umask 077 from Skoobi. Force the fixture
+      // mode so the insecure-state branch is exercised in that environment.
+      fs.chmodSync(stateFile, mode);
       const bridge = new CodexDesktopBridge({
         client,
         stateFile,
@@ -1662,6 +1679,8 @@ describe('Codex Desktop summaries', () => {
     expect(args).toContain('mcp_servers.docs.enabled=false');
     expect(args).toContain('mcp_servers.node_repl.enabled=false');
     expect(args).toContain('sandbox_permissions=[]');
+    expect(args.slice(0, 2)).toEqual(['--enable', 'code_mode_host']);
+    expect(args.join(' ')).not.toContain('--disable code_mode_host');
     expect(args).toContain('browser_use_full_cdp_access');
     expect(args).toContain('tool_call_mcp_elicitation');
     expect(args.slice(-3)).toEqual(['app-server', '--listen', 'stdio://']);
@@ -1929,4 +1948,250 @@ describe('Skoobi helper hardening policy', () => {
       /not a directory/i,
     );
   });
+});
+
+describe('local tools and task result contract', () => {
+  it('probes local read/write under the task sandbox before starting a thread', async () => {
+    const { bridge, client, worktree } = fixture();
+    const started = await bridge.start({
+      cwd: worktree,
+      prompt: 'Implement task',
+    });
+    const methods = client.calls.map((x) => x.method);
+    expect(methods.indexOf('config/read')).toBeLessThan(
+      methods.indexOf('command/exec'),
+    );
+    expect(methods.indexOf('command/exec')).toBeLessThan(
+      methods.indexOf('thread/start'),
+    );
+    const probe = client.calls.find((x) => x.method === 'command/exec').params;
+    expect(probe.sandboxPolicy).toEqual(
+      client.calls.find((x) => x.method === 'turn/start').params.sandboxPolicy,
+    );
+    expect(probe.sandboxPolicy.networkAccess).toBe(false);
+    expect(probe.command.at(-2)).toMatch(/\.skoobi-tool-probe-[a-f0-9-]+$/);
+    expect(started.task.result).toMatchObject({
+      state: 'pending',
+      verified: false,
+    });
+    expect((await bridge.status()).toolRuntime).toMatchObject({
+      state: 'ready',
+      scope: 'sandboxed_command_read_write',
+    });
+  });
+
+  it.each(['host', 'command'])(
+    'fails closed before spending a turn when %s preflight fails',
+    async (failure) => {
+      const { bridge, client, worktree } = fixture();
+      if (failure === 'host') client.codeModeHost = false;
+      else client.probeExitCode = 1;
+      await expect(
+        bridge.start({ cwd: worktree, prompt: 'Implement task' }),
+      ).rejects.toThrow(/local tool preflight failed/);
+      expect(
+        client.calls.some(
+          (x) => x.method === 'thread/start' || x.method === 'turn/start',
+        ),
+      ).toBe(false);
+      const state = await bridge.status();
+      expect(state.task).toBeNull();
+      expect(state.toolRuntime.state).toBe('blocked');
+    },
+  );
+
+  it('reports preflight failure without leaking command errors', () => {
+    expect(
+      codexDesktopErrorResponse(
+        new Error(
+          'Codex local tool preflight failed; no task turn was started.',
+        ),
+      ),
+    ).toMatchObject({
+      status: 503,
+      body: { error: 'codex_tools_unavailable' },
+    });
+  });
+
+  it('does not equate a completed turn and successful command with verified acceptance', async () => {
+    const { bridge, client, worktree } = fixture();
+    await bridge.start({ cwd: worktree, prompt: 'Implement task' });
+    client.readTurnStatus = 'completed';
+    client.readTurnItems = [
+      {
+        type: 'commandExecution',
+        status: 'completed',
+        exitCode: 0,
+        command: 'test',
+        aggregatedOutput: 'PRIVATE_TEST_OUTPUT',
+      },
+      {
+        type: 'agentMessage',
+        phase: 'final_answer',
+        text: 'Everything verified and done.',
+      },
+    ];
+    const result = await bridge.wait({ timeoutMs: 250 });
+    expect(result.task.status).toBe('completed');
+    expect(result.task.result).toMatchObject({
+      state: 'unverified',
+      verified: false,
+      counts: { commandSucceeded: 1 },
+    });
+    expect(result.turn.result).toEqual(result.task.result);
+    expect((await bridge.status()).task.result).toEqual(result.task.result);
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_TEST_OUTPUT');
+  });
+
+  it('finds blocked work in a completed turn and retains it after controller restart', async () => {
+    const { bridge, client, worktree } = fixture();
+    await bridge.start({ cwd: worktree, prompt: 'Implement task' });
+    client.readTurnStatus = 'completed';
+    client.readTurnItems = [
+      {
+        type: 'agentMessage',
+        phase: 'final_answer',
+        text: 'Blocked by the local tool runtime: `code-mode host is disabled`. No files changed.',
+      },
+    ];
+    const status = await bridge.status();
+    expect(status.task.status).toBe('completed');
+    expect(status.task.result).toMatchObject({
+      state: 'blocked',
+      verified: false,
+      reason: 'runtime_unavailable',
+    });
+    const restarted = new CodexDesktopBridge({
+      client,
+      allowedRoots: [worktree],
+      stateFile: bridge.stateFile,
+      openThread: async () => {},
+    });
+    expect((await restarted.status()).task.result).toEqual(status.task.result);
+    const read = await restarted.read(status.task.threadId);
+    expect(read.thread.turns.at(-1).result.state).toBe('blocked');
+  });
+
+  it('enriches empty completion notifications before assessing the result', async () => {
+    const { bridge, client, worktree } = fixture();
+    await bridge.start({ cwd: worktree, prompt: 'Implement task' });
+    client.readTurnStatus = 'completed';
+    client.readTurnItems = [
+      { type: 'agentMessage', text: 'Blocked: code-mode host is disabled.' },
+    ];
+    client.emit('turn/completed', {
+      threadId: 'thread-1',
+      turn: { id: 'turn-1', status: 'completed', items: [] },
+    });
+    expect((await bridge.status()).task.result.state).toBe('blocked');
+  });
+
+  it('preflights a continuation and resets previous result evidence', async () => {
+    const { bridge, client, worktree } = fixture();
+    await bridge.start({ cwd: worktree, prompt: 'Implement task' });
+    client.readTurnStatus = 'completed';
+    await bridge.status();
+    client.probeExitCode = 1;
+    await expect(
+      bridge.continueThread({ threadId: 'thread-1', prompt: 'Next step' }),
+    ).rejects.toThrow(/preflight failed/);
+    expect(client.calls.filter((x) => x.method === 'turn/start')).toHaveLength(
+      1,
+    );
+    client.probeExitCode = 0;
+    client.nextTurnId = 'turn-2';
+    const next = await bridge.continueThread({
+      threadId: 'thread-1',
+      prompt: 'Next step',
+    });
+    expect(next.task.result).toMatchObject({
+      state: 'pending',
+      verified: false,
+      counts: { commandSucceeded: 0 },
+    });
+  });
+});
+
+it('does not erase known blocked evidence when a repeated history response has no items', async () => {
+  const { bridge, client, worktree } = fixture();
+  await bridge.start({ cwd: worktree, prompt: 'Implement task' });
+  client.readTurnStatus = 'completed';
+  client.readTurnItems = [
+    {
+      type: 'agentMessage',
+      phase: 'final_answer',
+      text: 'Blocked: code-mode host is disabled.',
+    },
+  ];
+  expect((await bridge.status()).task.result.state).toBe('blocked');
+  client.readTurnItems = [];
+  expect((await bridge.status()).task.result.state).toBe('blocked');
+  const waited = await bridge.wait({ timeoutMs: 250 });
+  expect(waited.task.result.state).toBe('blocked');
+  expect(waited.turn.result.state).toBe('blocked');
+});
+
+it('invalidates tool readiness after the app-server instance changes', async () => {
+  const { bridge, client, worktree } = fixture();
+  await bridge.start({ cwd: worktree, prompt: 'Implement task' });
+  expect((await bridge.status()).toolRuntime.state).toBe('ready');
+  client.instanceId = 'replacement-server-instance';
+  expect((await bridge.status()).toolRuntime.state).toBe('not_checked');
+});
+
+it('structured errors override retained assessments even with no new items', async () => {
+  const { bridge, client, worktree } = fixture();
+  await bridge.start({ cwd: worktree, prompt: 'Implement task' });
+  client.readTurnStatus = 'completed';
+  expect((await bridge.status()).task.result.state).toBe('unverified');
+  client.readTurnError = { message: 'structured runtime failure' };
+  const waited = await bridge.wait({ timeoutMs: 250 });
+  expect(waited.task.result.state).toBe('failed');
+  expect(waited.turn.result.state).toBe('failed');
+  expect((await bridge.status()).task.result.state).toBe('failed');
+});
+
+it('active wait returns the enriched result consistently in task and turn', async () => {
+  const { bridge, client, worktree } = fixture();
+  await bridge.start({ cwd: worktree, prompt: 'Implement task' });
+  const request = client.request.bind(client);
+  let reads = 0;
+  client.request = async (method, params) => {
+    if (method === 'thread/read') {
+      reads++;
+      client.readTurnStatus = reads === 1 ? 'inProgress' : 'completed';
+      client.readTurnItems =
+        reads < 3
+          ? []
+          : [
+              {
+                type: 'agentMessage',
+                phase: 'final_answer',
+                text: 'Blocked: code-mode host is disabled.',
+              },
+            ];
+    }
+    return request(method, params);
+  };
+  client.waitForTurn = async () => ({
+    id: 'turn-1',
+    status: 'completed',
+    items: [],
+  });
+  const waited = await bridge.wait({ timeoutMs: 250 });
+  expect(waited.task.result.state).toBe('blocked');
+  expect(waited.turn.result).toEqual(waited.task.result);
+});
+
+it('blocks launch if the runtime is replaced during the preflight itself', async () => {
+  const { bridge, client, worktree } = fixture();
+  const request = client.request.bind(client);
+  client.request = async (method, params) => {
+    if (method === 'command/exec') client.instanceId = 'replacement-mid-probe';
+    return request(method, params);
+  };
+  await expect(
+    bridge.start({ cwd: worktree, prompt: 'Implement task' }),
+  ).rejects.toThrow(/preflight failed/);
+  expect(client.calls.some((x) => x.method === 'turn/start')).toBe(false);
 });

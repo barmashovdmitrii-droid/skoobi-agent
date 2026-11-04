@@ -13,6 +13,7 @@ import {
   loadGoogleCalendarConfig,
   normalizeReminderSummary,
   shouldCreateCalendarEventForTask,
+  stripReminderLead,
 } from './calendar-adapter.js';
 
 vi.mock('./env.js', () => ({
@@ -43,6 +44,9 @@ function writeServiceAccountFile(
   tempDirectories.add(directory);
   const keyFile = path.join(directory, 'service-account.json');
   fs.writeFileSync(keyFile, contents, { mode });
+  // Preserve the requested security boundary under the service's umask 077,
+  // especially for the deliberately permissive 0644 fixture.
+  fs.chmodSync(keyFile, mode);
   return keyFile;
 }
 
@@ -252,13 +256,75 @@ describe('Google Calendar reminder task detection', () => {
     ).toBe(true);
   });
 
-  it('skips recurring and internal tasks unless explicitly requested', () => {
+  it('mirrors a recurring reminder whose schedule has an exact RRULE', () => {
+    expect(
+      shouldCreateCalendarEventForTask({
+        schedule_type: 'cron',
+        schedule_value: '0 9 21 * *',
+        prompt: 'Напомни оплатить интернет',
+      }),
+    ).toBe(true);
+    expect(
+      shouldCreateCalendarEventForTask({
+        schedule_type: 'interval',
+        schedule_value: String(86_400_000),
+        prompt: 'Напомни про зарядку',
+      }),
+    ).toBe(true);
+  });
+
+  it('recognises the noun form of reminder', () => {
+    // Regression: the pattern used to be built from the verb stem «напомн-»
+    // with noun endings pinned to it, so it tested for «напомнание» and never
+    // matched «напоминание», which prevented calendar event creation.
+    for (const prompt of [
+      'Напоминание для администратора. 12 сентября тестовая проверка',
+      'напоминания по оплате',
+      'НАПОМНИ ПРО ОПЛАТУ',
+      'Remind me tomorrow',
+    ]) {
+      expect(
+        shouldCreateCalendarEventForTask({
+          schedule_type: 'once',
+          schedule_value: '2026-09-10T12:00:00',
+          prompt,
+        }),
+      ).toBe(true);
+    }
+  });
+
+  it('leaves non-reminder recurring work out of the calendar', () => {
+    expect(
+      shouldCreateCalendarEventForTask({
+        schedule_type: 'cron',
+        schedule_value: '0 10 * * *',
+        prompt: 'Ежедневная утренняя сводка для пользователя по активности',
+      }),
+    ).toBe(false);
+  });
+
+  it('skips a recurring schedule with no exact RRULE, even when asked', () => {
+    // A five-minute cron has no honest calendar shape; asking explicitly must
+    // not produce an event that fires at the wrong times.
+    expect(
+      shouldCreateCalendarEventForTask(
+        {
+          schedule_type: 'cron',
+          schedule_value: '*/5 * * * *',
+          prompt: 'Напомни',
+        },
+        true,
+      ),
+    ).toBe(false);
     expect(
       shouldCreateCalendarEventForTask({
         schedule_type: 'cron',
         prompt: 'Напомни каждый день',
       }),
     ).toBe(false);
+  });
+
+  it('skips internal tasks unless explicitly requested', () => {
     expect(
       shouldCreateCalendarEventForTask({
         schedule_type: 'once',
@@ -294,5 +360,139 @@ describe('normalizeReminderSummary', () => {
     expect(normalizeReminderSummary('Напомни владельцу: купить молоко')).toBe(
       'купить молоко',
     );
+  });
+
+  it('titles the event with the reminder, not the instruction to the bot', () => {
+    expect(
+      normalizeReminderSummary(
+        'Всегда отправляй владельцу одно короткое напоминание на русском: ' +
+          '«Сегодня закончился тестовый доступ. ' +
+          'Напомни продлить доступ». Не добавляй технических подробностей.',
+      ),
+    ).toBe(
+      'Сегодня закончился тестовый доступ. Напомни продлить доступ',
+    );
+  });
+
+  it('falls back to the prompt when nothing is quoted', () => {
+    expect(normalizeReminderSummary('Напомни: оплатить интернет')).toBe(
+      'оплатить интернет',
+    );
+    expect(normalizeReminderSummary('«ок»')).toBe('«ок»');
+  });
+});
+
+describe('stripReminderLead', () => {
+  it('drops the «напомни» lead and the internal note, keeps quotes, never bounds', () => {
+    const long = `Напомни мне: ${'оплатить счёт «Связь» '.repeat(20).trim()}`;
+    expect(stripReminderLead(long)).toBe('оплатить счёт «Связь» '.repeat(20).trim());
+    expect(stripReminderLead('Напомни владельцу:  забрать\n ключи <internal>x</internal>')).toBe(
+      'забрать ключи',
+    );
+    expect(stripReminderLead('Напомни: ')).toBe('');
+    expect(normalizeReminderSummary('Напомни: ')).toBe('Skoobi reminder');
+    expect(normalizeReminderSummary('Напомни: ' + 'оплатить счёт '.repeat(20))).toHaveLength(120);
+  });
+});
+
+describe('createReminderEvent', () => {
+  function adapterWithCapturedInsert(timeZone?: string) {
+    const keyFile = writeServiceAccountFile();
+    const config = calendarConfig(keyFile);
+    const adapter = new GoogleCalendarAdapter(
+      timeZone ? { ...config, timeZone } : config,
+    );
+    const insert = vi.fn(async () => ({
+      data: { id: 'event-1', htmlLink: 'https://calendar.example/e/1' },
+    }));
+    (
+      adapter as unknown as {
+        calendar: { events: { insert: typeof insert } };
+      }
+    ).calendar.events.insert = insert;
+    return { adapter, insert };
+  }
+
+  const requestBody = (insert: ReturnType<typeof vi.fn>) =>
+    insert.mock.calls[0][0].requestBody;
+
+  it('sends the recurrence rule and the first occurrence as the start', async () => {
+    const { adapter, insert } = adapterWithCapturedInsert();
+
+    await adapter.createReminderEvent({
+      taskId: 'task-1784636911585-l76dhg',
+      prompt: 'Напомни оплатить интернет',
+      // What the scheduler stores in next_run: an absolute instant.
+      scheduleValue: '2026-08-21T04:00:00.000Z',
+      recurrence: ['RRULE:FREQ=MONTHLY;BYMONTHDAY=21'],
+    });
+
+    const body = requestBody(insert);
+    expect(body.recurrence).toEqual(['RRULE:FREQ=MONTHLY;BYMONTHDAY=21']);
+    expect(body.start).toEqual({
+      dateTime: '2026-08-21T09:00:00',
+      timeZone: 'Asia/Almaty',
+    });
+    expect(body.end).toEqual({
+      dateTime: '2026-08-21T09:15:00',
+      timeZone: 'Asia/Almaty',
+    });
+  });
+
+  it('resolves an absolute instant in the calendar zone, not the host zone', async () => {
+    // The host running these tests sits in Asia/Almaty (UTC+5). A calendar
+    // configured for Europe/Moscow (UTC+3) must yield 07:00, not 09:00 — which
+    // is what reading the Date local getters would have produced.
+    const { adapter, insert } = adapterWithCapturedInsert('Europe/Moscow');
+
+    await adapter.createReminderEvent({
+      taskId: 'task-tz',
+      prompt: 'Напоминание',
+      scheduleValue: '2026-08-21T04:00:00.000Z',
+    });
+
+    expect(requestBody(insert).start).toEqual({
+      dateTime: '2026-08-21T07:00:00',
+      timeZone: 'Europe/Moscow',
+    });
+  });
+
+  it('keeps a bare wall-clock time verbatim and omits recurrence', async () => {
+    const { adapter, insert } = adapterWithCapturedInsert();
+
+    await adapter.createReminderEvent({
+      taskId: 'task-calendar-wall-clock-fixture',
+      prompt: 'Напоминание для администратора. 12 сентября тестовая проверка',
+      scheduleValue: '2026-09-10T12:00:00',
+    });
+
+    const body = requestBody(insert);
+    expect(body.start.dateTime).toBe('2026-09-10T12:00:00');
+    expect(body.end.dateTime).toBe('2026-09-10T12:15:00');
+    expect(body.recurrence).toBeUndefined();
+  });
+
+  it('rolls the end time over midnight', async () => {
+    const { adapter, insert } = adapterWithCapturedInsert();
+
+    await adapter.createReminderEvent({
+      taskId: 'task-late',
+      prompt: 'Напомни',
+      scheduleValue: '2026-09-10T23:55:00',
+    });
+
+    expect(requestBody(insert).end.dateTime).toBe('2026-09-11T00:10:00');
+  });
+
+  it('rejects a start time it cannot read', async () => {
+    const { adapter } = adapterWithCapturedInsert();
+
+    await expect(
+      adapter.createReminderEvent({
+        taskId: 'task-bad',
+        prompt: 'Напомни',
+        scheduleValue: 'не дата',
+      }),
+    ).rejects.toThrow('Invalid calendar event start time');
   });
 });

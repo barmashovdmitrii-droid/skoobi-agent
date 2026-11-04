@@ -1,14 +1,34 @@
 import { createHash } from 'crypto';
 
 import { readEnvFile } from './env.js';
-import type {
-  GoogleDriveFileType,
-  GoogleWorkspaceTool,
+import {
+  GOOGLE_WORKSPACE_TOOL_CLASSIFICATION,
+  GOOGLE_WORKSPACE_TOOL_NAMES,
+  type GoogleDriveFileType,
+  type GoogleWorkspaceTool,
 } from './google-workspace-operation.js';
 import type { NewMessage } from './types.js';
 
 export interface GoogleOperationPolicy {
   intentId: string;
+  /**
+   * Standing owner access (agentConfig.googleStandingAccess): every tool in
+   * allowedTools on any resource the owner's account can reach, including
+   * sheet cell updates and other destructive tools, still journaled per
+   * operation. Per-resource lists below stay empty and are not consulted.
+   */
+  standing?: boolean;
+  /**
+   * Standing policy of one scheduled-task occurrence (task-scheduler.ts), whose
+   * intentId names that occurrence. Its sheet appends are journaled by table
+   * and rows WITHOUT the read digest (task-authorization.ts). A re-dispatch
+   * of the same occurrence after a crash re-reads the table, gets a new
+   * digest because of the row it already added, and is answered from the
+   * journal instead of appending that row a second time. Chat turns leave it
+   * unset: there each distinct operation, digest included, is its own
+   * journal slot.
+   */
+  scheduledOccurrence?: boolean;
   allowedTools: GoogleWorkspaceTool[];
   allowedDocumentIds: string[];
   allowedSpreadsheetIds: string[];
@@ -2437,7 +2457,11 @@ function isAllowedNamedSheetAppendCommandTail(
   const timeRange = String.raw`(?:с|from)\s+${timePoint}\s+(?:до|to)\s+${timePoint}`;
   const duration = String.raw`\d+(?:[.,]\d+)?\s*(?:час(?:а|ов)?|hours?)`;
   const labeledNumber = String.raw`(?:ставка|сумма|rate|amount)\s*:?\s*\d+(?:[.,]\d+)?(?:\s*(?:₽|руб(?:лей)?|₸|тг|тенге))?`;
-  const date = String.raw`(?:(?:за|на)\s+)?(?:сегодня|вчера|today|yesterday)`;
+  // A calendar date is a structured field, like a relative day or a time range.
+  const monthName = String.raw`(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)[а-яё]*`;
+  const numericDate = String.raw`\d{1,2}[.\-/]\d{1,2}(?:[.\-/]\d{2,4})?`;
+  const spelledDate = String.raw`\d{1,2}\s+${monthName}(?:\s+\d{4}(?:\s*(?:г\.?|года))?)?`;
+  const date = String.raw`(?:(?:за|на)\s+)?(?:сегодня|вчера|today|yesterday|${numericDate}|${spelledDate})`;
   const structuredField = String.raw`(?:${date}|${timeRange}|${duration}|${labeledNumber})`;
   return new RegExp(
     String.raw`^${structuredField}(?:\s*[,;]\s*${structuredField})*$`,
@@ -3612,5 +3636,75 @@ export function buildGoogleOperationPolicy(input: {
     allowUnfilteredDriveList,
     allowRootCreate,
     allowUserEnteredValues,
+  };
+}
+
+
+
+
+
+export function buildStandingGoogleOperationPolicy(input: {
+  chatJid: string;
+  messages: NewMessage[];
+  readOnly?: boolean;
+  /** The messages are one scheduled-task occurrence; see the policy field. */
+  scheduledOccurrence?: boolean;
+}): GoogleOperationPolicy | null {
+  const ownerMessages = currentOwnerMessages(input.messages);
+  if (!ownerMessages) return null;
+  const allowedTools = GOOGLE_WORKSPACE_TOOL_NAMES.filter(
+    (tool) =>
+      !input.readOnly || GOOGLE_WORKSPACE_TOOL_CLASSIFICATION[tool] === 'read',
+  );
+  return {
+    intentId: stableIntentId(input.chatJid, ownerMessages),
+    standing: true,
+    ...(input.scheduledOccurrence === true
+      ? { scheduledOccurrence: true }
+      : {}),
+    allowedTools: [...allowedTools],
+    allowedDocumentIds: [],
+    allowedSpreadsheetIds: [],
+    allowedScriptIds: [],
+    allowedFolderIds: [],
+    allowedCalendarIds: [],
+    allowedSheetRanges: [],
+    allowedSheetTargets: [],
+    allowedSheetAppendTargets: [],
+    allowedScriptFileNames: [],
+    confirmedDocumentReplaceIds: [],
+    confirmedSheetUpdateIds: [],
+    confirmedSheetUpdateTargets: [],
+    confirmedScriptUpdateIds: [],
+    confirmedScriptUpdateTargets: [],
+    allowedDriveSearchTargets: [],
+    allowedCalendarQueries: [],
+    allowedCalendarTargets: [],
+    allowedCreateTargets: [],
+    rootCreateTools: [],
+    allowStatusVerify: true,
+    allowDriveSearch: true,
+    allowUnfilteredDriveList: true,
+    allowRootCreate: !input.readOnly,
+    allowUserEnteredValues: !input.readOnly,
+  };
+}
+
+export function googlePolicyDiagnostics(
+  policy: GoogleOperationPolicy | null,
+): Record<string, unknown> {
+  if (!policy) return { granted: false };
+  return {
+    granted: true,
+    ...(policy.standing ? { standing: true } : {}),
+    ...(policy.scheduledOccurrence ? { scheduledOccurrence: true } : {}),
+    intentId: policy.intentId,
+    tools: [...policy.allowedTools].sort(),
+    spreadsheets: policy.allowedSpreadsheetIds.length,
+    sheetRanges: policy.allowedSheetRanges.length,
+    appendTargets: policy.allowedSheetAppendTargets.length,
+    updateTargets: policy.confirmedSheetUpdateTargets.length,
+    calendars: policy.allowedCalendarIds.length,
+    driveSearch: policy.allowDriveSearch,
   };
 }
