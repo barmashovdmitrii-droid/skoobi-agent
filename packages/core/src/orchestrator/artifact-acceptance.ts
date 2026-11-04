@@ -22,7 +22,7 @@ export const ARTIFACT_VALIDATOR = 'browser-archive-route';
 export const ARTIFACT_VALIDATOR_VERSION = 1;
 // Updated together with the reviewed checker. Never derive this from agent input.
 export const ARTIFACT_CHECKER_SHA256 =
-  '2d33ddf3b2df341766f68383c5c01e02cc2721aa4d147af36f82f0e7ddd433b7';
+  '9cf088c3742976c14c6a6726388e7e0fadfd4d9e55e6763fa9353767e4469dbb';
 const MAX_ARCHIVE_BYTES = 16 * 1024 * 1024;
 const MAX_RECEIPT_BYTES = 8192;
 const MAX_RECEIPT_AGE_MS = 7 * 24 * 60 * 60 * 1000;

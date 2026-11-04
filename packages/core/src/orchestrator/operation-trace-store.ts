@@ -251,6 +251,19 @@ export function findOperationTraceForMessage(
   });
 }
 
+/** A coordinator can correlate an already admitted operation in its pinned
+ * scope. The identifier never creates a user input or execution authority. */
+export function findOperationTraceForOperation(
+  db: Database.Database, scope: OperationTraceScope, operationId: string,
+  options: OperationTraceOptions = {},
+): OperationTraceObserver | undefined {
+  return safe(options,()=>{
+    const key=scopeKey(scope);
+    requireOperations(db,key,inputIds([operationId]));
+    return observer(db,key,[operationId],undefined,options);
+  });
+}
+
 export function getOrCreateOperationTrace(
   db: Database.Database,
   scope: OperationTraceScope,
