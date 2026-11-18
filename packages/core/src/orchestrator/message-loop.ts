@@ -102,6 +102,8 @@ import {
   getRecentConversationMessages,
   getRecentConversationMessagesForExactJids,
   getRecentImageJob,
+  markImageJobFailureNotified,
+  stageImageJobChatFailure,
   getRegisteredGroup,
   getRouterState,
   scrubExpiredReadyTextBodies,
@@ -153,6 +155,8 @@ import {
   noteTimeoutContinuationFailureDelivered, readTimeoutContinuation,
   settleTimeoutContinuation, stageTimeoutContinuation, timeoutContinuationNotices, TIMEOUT_CONTINUATION_NOTE,
 } from './timeout-continuation.js';
+import { sandboxPolicyLimitReason, type SandboxPolicyLimitReason } from '../runtimes/sandbox-policy-budget.js';
+import { sandboxPolicyNotices, type SandboxPolicyNotice } from './sandbox-policy-notice.js';
 import { readyTextFinalJournal, recoverReadyTextFinal, isExplicitReadyTextRequest, readyTextCanSend, READY_TEXT_RECOVERY_WINDOW, type PriorFinishedWork } from './ready-text-final.js';
 import { channelConnectivity, startHeartbeat } from './heartbeat.js';
 import {
@@ -6619,6 +6623,54 @@ async function processGroupMessagesInner(
   const groupIpcDir = resolveGroupIpcPath(group.folder);
   const timeoutStore = { get: getRouterState, set: setRouterState };
   const receiptKey = deferredDeliveryReceiptKey(chatJid);
+  const sandboxNoticeKey = 'sandbox_policy_notice:' + JSON.stringify([chatJid, group.folder]);
+  async function deliverSandboxNotice(notice: SandboxPolicyNotice): Promise<boolean> {
+    // Consume only the refused initial inputs. Work arriving during delivery
+    // remains behind its own host cursor. A restart can finish this idempotently.
+    const inputsStillCurrent = () => {
+      if (readyAccess.pendingMedia()) return false;
+      const newer = readyAccess.readAfter(notice.cursor);
+      return newer.length < 201 && newer.every(message =>
+        readyAccess.acceptsPing(message.content) || isExplicitReadyTextRequest(message.content));
+    };
+    const canRoute = () =>
+      registeredGroups[chatJid]?.folder === group.folder &&
+      registeredGroups[notice.replyJid]?.folder === notice.replyFolder &&
+      shouldAutoRouteAgentOutput(registeredGroups[chatJid]?.agentConfig) &&
+      shouldAutoRouteAgentOutput(registeredGroups[notice.replyJid]?.agentConfig) &&
+      !readyAccess.held() && inputsStillCurrent();
+    if (!notice.attempted && canRoute()) {
+      try {
+        const delivered = await router.route({
+          chatJid: notice.replyJid, groupFolder: notice.replyFolder,
+          text: sandboxPolicyNotices[notice.reason], triggerType: 'agent-response',
+          meta: { kind: 'sandbox_policy_limit', reason: notice.reason },
+        }, () => {
+          if (!canRoute()) return false;
+          if (!notice.attempted) {
+            setRouterState(sandboxNoticeKey, JSON.stringify({ ...notice, attempted: true }));
+            notice.attempted = true;
+          }
+          return true;
+        });
+        if (delivered) {
+          if (notice.imageJobId) markImageJobFailureNotified(notice.imageJobId);
+          storeBotReply(notice.replyJid, delivered);
+        }
+      } catch (err) {
+        // A missing channel is definitely pre-transport. After hand-off an
+        // exception may be a lost acknowledgement; never blind-send a duplicate.
+        logger.warn({ err, chatJid, attempted: Boolean(notice.attempted) }, 'Sandbox refusal delivery interrupted');
+        if (!notice.attempted) return false;
+      }
+    }
+    archiveSupersededContinuationInputs(groupIpcDir, notice.checkpoints);
+    advanceReadyFinalCursor(chatJid, notice.cursor);
+    setRouterState(sandboxNoticeKey, '');
+    return true;
+  }
+  const pendingSandboxNotice = getRouterState(sandboxNoticeKey);
+  if (pendingSandboxNotice && !await deliverSandboxNotice(JSON.parse(pendingSandboxNotice))) return false;
   const supersededTimeoutIdsKey = `timeout_superseded_inputs:${chatJid}`;
   const supersededTimeoutIds: string[] = JSON.parse(getRouterState(supersededTimeoutIdsKey) || '[]');
   const quarantineConfirmedInputs = (names: unknown): void => {
@@ -9545,6 +9597,24 @@ async function processGroupMessagesInner(
     if (idleTimer) clearTimeout(idleTimer);
   }
   unloggedRunCost = agentResult;
+  async function finishSandboxRefusal(reason: SandboxPolicyLimitReason): Promise<boolean> {
+    logFailedTurn();
+    const refusedIds = new Set(missedMessages.map(message => message.id));
+    const notice: SandboxPolicyNotice = {
+      reason, cursor: originalTargetCursor, replyJid, replyFolder: agentGroup.folder,
+      checkpoints: deferredAtStart.filter(entry => entry.recoverable &&
+        entry.messageIds.every(id => refusedIds.has(id))).map(entry => entry.name),
+      ...(imageJobContext?.generationRequired ? { imageJobId: imageJobContext.job.id } : {}),
+    };
+    if (notice.imageJobId) {
+      stageImageJobChatFailure(notice.imageJobId, sandboxPolicyNotices[reason], sandboxNoticeKey, JSON.stringify(notice));
+    } else {
+      setRouterState(sandboxNoticeKey, JSON.stringify(notice));
+    }
+    delete lastPipedTimestamp[chatJid];
+    return deliverSandboxNotice(notice);
+  }
+  if (agentResult.sandboxPolicyLimit) return finishSandboxRefusal(agentResult.sandboxPolicyLimit);
   if (finalDeliveryOutcome === 'unconfirmed' && (agentResult.status === 'error' || hadError)) {
     // A runner can exit abnormally after producing its final. Neither a new
     // provider nor timeout continuation may repeat work already checkpointed.
@@ -9862,6 +9932,7 @@ async function processGroupMessagesInner(
         });
       }
     }
+    if (agentResult.sandboxPolicyLimit) return finishSandboxRefusal(agentResult.sandboxPolicyLimit);
     if (claudeFinalRetained) return true;
   }
 
@@ -10328,6 +10399,7 @@ async function processGroupMessagesInner(
             });
           }
         }
+        if (reserveResult?.sandboxPolicyLimit) return finishSandboxRefusal(reserveResult.sandboxPolicyLimit);
         if (reserveFinalRetained) return true;
         const reserveLatencyMs = Date.now() - reserveStartedAt;
 
@@ -11252,6 +11324,7 @@ async function processGroupMessagesInner(
 }
 
 interface RunAgentResult {
+  sandboxPolicyLimit?: SandboxPolicyLimitReason;
   status: 'success' | 'error';
   usage?: ContainerOutput['usage'];
   durationMs: number;
@@ -12090,6 +12163,10 @@ async function runAgentInner(
     toolTrace.finish();
 
     const durationMs = Date.now() - startTime;
+    const sandboxPolicyLimit = sandboxPolicyLimitReason(output);
+    if (sandboxPolicyLimit) {
+      return { status: 'error', durationMs, sandboxPolicyLimit, error: sandboxPolicyNotices[sandboxPolicyLimit] };
+    }
 
     if (output.newSessionId) {
       persistSession(output.newSessionId);

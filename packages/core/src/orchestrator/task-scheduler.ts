@@ -22,6 +22,8 @@ import {
   type CodexRunnerInputConfig,
 } from '../runtimes/container-runner.js';
 import { runSandboxAgent } from '../runtimes/sandbox-runner.js';
+import { sandboxPolicyLimitReason } from '../runtimes/sandbox-policy-budget.js';
+import { sandboxPolicyNotices } from './sandbox-policy-notice.js';
 import {
   clearSession,
   consecutiveTaskFailures,
@@ -599,8 +601,9 @@ export interface SchedulerDependencies {
 export async function routeAndRecordTaskOutput(
   router: MessageRouter,
   envelope: OutboundEnvelope,
+  canSend?: () => boolean,
 ): Promise<string | null> {
-  const delivered = await router.route(envelope);
+  const delivered = canSend ? await router.route(envelope, canSend) : await router.route(envelope);
   if (delivered) {
     try {
       storeBotReply(envelope.chatJid, delivered, undefined, 'scheduled-task');
@@ -1343,10 +1346,11 @@ export async function runTask(
   // fall back to completing the task (next_run = null) so it stops recurring.
   let nextRun: string | null;
   const failureCount = error ? consecutiveTaskFailures(task.id) : 0;
+  const sandboxLimit = sandboxPolicyLimitReason(finalOutput);
   const uncertainAction = Boolean(error) && observedSideEffect;
-  const giveUp = uncertainAction || failureCount >= MAX_CONSECUTIVE_TASK_FAILURES;
+  const giveUp = (sandboxLimit && task.schedule_type === 'once') || uncertainAction || failureCount >= MAX_CONSECUTIVE_TASK_FAILURES;
   try {
-    nextRun = giveUp ? null : computeNextRunAfterTaskAttempt(task, Boolean(error), Date.now(), failureCount);
+    nextRun = giveUp ? null : computeNextRunAfterTaskAttempt(task, Boolean(error) && !sandboxLimit, Date.now(), failureCount);
   } catch (scheduleErr) {
     logger.error(
       { taskId: task.id, err: scheduleErr },
@@ -1367,7 +1371,9 @@ export async function runTask(
   // reminder died. Always announce a terminal pause, even if the failed run
   // produced text. A notice-delivery failure must not escape this path.
   if (error && (giveUp || !result)) {
-    let noticeText = taskFailureNoticeText({
+    let noticeText = sandboxLimit
+      ? sandboxPolicyNotices[sandboxLimit] + (giveUp ? ' Плановая задача приостановлена.' : '')
+      : taskFailureNoticeText({
       prompt: task.prompt,
       error,
       outcome: uncertainAction
@@ -1379,7 +1385,7 @@ export async function runTask(
             : 'stopped',
       failureCount,
     });
-    if (googleIntentWithoutPolicy) {
+    if (!sandboxLimit && googleIntentWithoutPolicy) {
       noticeText +=
         '\nВозможная причина: в плановом прогоне не было инструментов Google — разбор текста задачи не выдал разрешений.';
     }
@@ -1390,7 +1396,11 @@ export async function runTask(
         triggerType: 'task-result',
         groupFolder: task.group_folder,
         meta: { kind: 'task_failure_notice' },
-      });
+      }, sandboxLimit ? () => {
+        const destination = deps.registeredGroups()[task.chat_jid];
+        return destination?.folder === task.group_folder &&
+          !destination.agentConfig?.inboundOnly && !destination.agentConfig?.suppressAgentStdoutRouting;
+      } : undefined);
     } catch (notifyErr) {
       logger.warn(
         { taskId: task.id, err: notifyErr },

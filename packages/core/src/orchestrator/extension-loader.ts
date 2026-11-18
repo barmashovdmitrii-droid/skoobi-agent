@@ -4,6 +4,7 @@
  * validates them, and dynamically imports their entry points.
  * Extensions self-register via registerChannel() or registerExtension() on import.
  */
+import { SandboxPolicyLimitError } from '../runtimes/sandbox-policy-budget.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -164,9 +165,9 @@ export async function loadExtensions(): Promise<LoadResult[]> {
 
 /**
  * Collect allowedDomains from all installed extension manifests.
- * Returns deduplicated list of domains that extensions need for network access.
+ * The bounded sandbox path checks raw inputs before it performs its own deduplication.
  */
-export function getExtensionAllowedDomains(): string[] {
+export function getExtensionAllowedDomains(maxEntries?: number): string[] {
   const codeRoot = resolveExtensionCodeRootFromModuleUrl(import.meta.url);
   const extensionsDir = path.join(codeRoot, 'extensions');
   const domains: string[] = [];
@@ -182,13 +183,18 @@ export function getExtensionAllowedDomains(): string[] {
     try {
       const raw = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
       const { valid, manifest } = validateManifest(raw);
-      if (valid && manifest?.provides?.allowedDomains) {
-        domains.push(...manifest.provides.allowedDomains);
+      if (valid && Array.isArray(manifest?.provides?.allowedDomains)) {
+        const added = manifest.provides.allowedDomains;
+        if (maxEntries !== undefined && domains.length + added.length > maxEntries) {
+          throw new SandboxPolicyLimitError('list_entries');
+        }
+        for (const domain of added) domains.push(domain);
       }
-    } catch {
+    } catch (err) {
+      if (err instanceof SandboxPolicyLimitError) throw err;
       // Skip invalid manifests
     }
   }
 
-  return [...new Set(domains)];
+  return maxEntries === undefined ? [...new Set(domains)] : domains;
 }

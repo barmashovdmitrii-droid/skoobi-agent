@@ -500,6 +500,7 @@ export function createSchema(
       generation_call_ids_json TEXT,
       delivered_at TEXT,
       failure_notice_claimed_at TEXT,
+      failure_notice_via_chat INTEGER NOT NULL DEFAULT 0,
       failure_notified_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_image_jobs_chat_status
@@ -616,6 +617,9 @@ export function createSchema(
     database.exec(
       `ALTER TABLE image_jobs ADD COLUMN generation_call_ids_json TEXT`,
     );
+  });
+  runMigration('image_jobs.failure_notice_via_chat', () => {
+    database.exec('ALTER TABLE image_jobs ADD COLUMN failure_notice_via_chat INTEGER NOT NULL DEFAULT 0');
   });
   runMigration('image_jobs.failure_notified_at', () => {
     database.transaction(() => {
@@ -2396,6 +2400,15 @@ export function markImageJobFailed(
   ).run(now, error.slice(0, 1000), id);
 }
 
+/** Stop generation and give the originating chat sole responsibility for the notice. */
+export function stageImageJobChatFailure(id: string, error: string, stateKey: string, state: string): void {
+  db.transaction(() => {
+    setRouterState(stateKey, state);
+    markImageJobFailed(id, error);
+    db.prepare('UPDATE image_jobs SET failure_notice_via_chat = 1 WHERE id = ?').run(id);
+  })();
+}
+
 export function getRecentImageJob(
   chatJid: string,
   maxAgeMs = 2 * 60 * 60 * 1000,
@@ -2430,7 +2443,7 @@ export function getImageJobsPendingFailureNotice(): ImageJobRecord[] {
   return db
     .prepare(
       `SELECT * FROM image_jobs
-       WHERE status = 'failed' AND failure_notified_at IS NULL
+       WHERE status = 'failed' AND failure_notified_at IS NULL AND failure_notice_via_chat = 0
        ORDER BY updated_at ASC`,
     )
     .all() as ImageJobRecord[];
@@ -2445,7 +2458,7 @@ export function claimImageJobFailureNotice(
     .prepare(
       `UPDATE image_jobs
      SET failure_notice_claimed_at = ?
-     WHERE id = ? AND status = 'failed' AND failure_notified_at IS NULL
+     WHERE id = ? AND status = 'failed' AND failure_notified_at IS NULL AND failure_notice_via_chat = 0
        AND (
          failure_notice_claimed_at IS NULL
          OR failure_notice_claimed_at <= ?

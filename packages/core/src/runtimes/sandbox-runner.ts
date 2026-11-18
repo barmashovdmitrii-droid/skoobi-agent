@@ -17,6 +17,14 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import {
+  SANDBOX_POLICY_LIMITS,
+  SandboxPolicyLimitError,
+  assertSandboxPolicyInputs,
+  encodeSandboxPolicy,
+  persistSandboxPolicy,
+  sandboxPolicyRefusal,
+} from './sandbox-policy-budget.js';
 import { readEnvFile } from '../orchestrator/env.js';
 import {
   isolatedObserverForRun,
@@ -828,6 +836,7 @@ export function computeProjectChainSiblingDenyPaths(
   projectRoot: string,
   mountRoot: string | null,
   listDir: (dir: string) => string[],
+  maxDenies = Infinity,
 ): string[] {
   const denies: string[] = [];
   if (!mountRoot) return denies;
@@ -847,7 +856,10 @@ export function computeProjectChainSiblingDenyPaths(
     }
     for (const entry of entries) {
       const full = path.join(parent, entry);
-      if (full !== child) denies.push(full);
+      if (full !== child) {
+        if (denies.length >= maxDenies) throw new SandboxPolicyLimitError('list_entries');
+        denies.push(full);
+      }
     }
     child = parent;
     parent = path.dirname(parent);
@@ -1108,6 +1120,12 @@ export function buildSandboxMounts(
     trustedOwner &&
     (group.agentConfig?.fullAccess === true ||
       group.agentConfig?.noSandbox === true);
+  const addMount = (mount: SandboxMount) => {
+    if (!fullAccess && mounts.length >= SANDBOX_POLICY_LIMITS.listEntries) {
+      throw new SandboxPolicyLimitError('list_entries');
+    }
+    mounts.push(mount);
+  };
   const receivedDir = ensureSafeRuntimeReceivedDirectory(groupDir);
   const identityKey = identityId ? safeSharedMemoryKey(identityId) : null;
   const sharedUserMemoryDir =
@@ -1117,7 +1135,7 @@ export function buildSandboxMounts(
   const skillsDir = path.join(DATA_DIR, 'skills');
   const denyPath = (hostPath: string) => {
     if (!fs.existsSync(hostPath)) return;
-    mounts.push({
+    addMount({
       hostPath,
       containerPath: hostPath,
       readonly: true,
@@ -1131,7 +1149,7 @@ export function buildSandboxMounts(
   // sandbox is built but is created mid-session would otherwise stay readable
   // until the next build.
   const alwaysDenyPath = (hostPath: string) => {
-    mounts.push({
+    addMount({
       hostPath,
       containerPath: hostPath,
       readonly: true,
@@ -1142,7 +1160,7 @@ export function buildSandboxMounts(
   if (trustedOwner) {
     // Main normally gets project root read-only. Dedicated-host full access
     // intentionally makes it writable and keeps .env visible.
-    mounts.push({
+    addMount({
       hostPath: projectRoot,
       containerPath: '/workspace/project',
       readonly: !fullAccess,
@@ -1151,7 +1169,7 @@ export function buildSandboxMounts(
     // Shadow .env — deny read/write access to secrets unless fullAccess is set.
     const envFile = path.join(projectRoot, '.env');
     if (!fullAccess && fs.existsSync(envFile)) {
-      mounts.push({
+      addMount({
         hostPath: envFile,
         containerPath: '/workspace/project/.env',
         readonly: true,
@@ -1159,7 +1177,7 @@ export function buildSandboxMounts(
       });
     }
 
-    mounts.push({
+    addMount({
       hostPath: groupDir,
       containerPath: '/workspace/group',
       readonly: false,
@@ -1182,14 +1200,14 @@ export function buildSandboxMounts(
       // expose the canonical main directory by its host path, so deny the
       // whole owner workspace explicitly.  The nested received RO entry below
       // is the only intentional read carve-out.
-      mounts.push({
+      addMount({
         hostPath: groupDir,
         containerPath: '/workspace/canonical-group',
         readonly: true,
         deny: true,
       });
     }
-    mounts.push({
+    addMount({
       hostPath: untrustedPaths?.workspace ?? groupDir,
       containerPath: '/workspace/group',
       // Codex persists its thread id at the workspace root and the runner
@@ -1200,7 +1218,7 @@ export function buildSandboxMounts(
     });
     if (restrictedWhatsAppObserver) {
       for (const instructionFile of ['CLAUDE.md', 'AGENTS.md']) {
-        mounts.push({
+        addMount({
           hostPath: path.join(groupDir, instructionFile),
           containerPath: `/workspace/group/${instructionFile}`,
           readonly: true,
@@ -1214,7 +1232,7 @@ export function buildSandboxMounts(
     // emits file-write-unlink rules for this path/its mount point, preventing
     // rename→symlink→restore races against the host WhatsApp publisher while
     // preserving guest writes everywhere else in the group workspace.
-    mounts.push({
+    addMount({
       hostPath: receivedDir,
       containerPath: '/workspace/group/received',
       readonly: true,
@@ -1223,7 +1241,7 @@ export function buildSandboxMounts(
       denyWriteOnly: untrustedPaths ? undefined : true,
     });
     if (isolatedReceivedLink) {
-      mounts.push({
+      addMount({
         hostPath: isolatedReceivedLink,
         containerPath: '/workspace/group/received-link',
         readonly: true,
@@ -1232,7 +1250,7 @@ export function buildSandboxMounts(
 
     const globalDir = path.join(GROUPS_DIR, 'global');
     if (fs.existsSync(globalDir)) {
-      mounts.push({
+      addMount({
         hostPath: globalDir,
         containerPath: '/workspace/global',
         readonly: true,
@@ -1306,7 +1324,7 @@ export function buildSandboxMounts(
       }
     }
     if (sharedUserMemoryDir) {
-      mounts.push({
+      addMount({
         hostPath: sharedUserMemoryDir,
         containerPath: '/workspace/user-memory',
         readonly: false,
@@ -1362,6 +1380,7 @@ export function buildSandboxMounts(
       projectRoot,
       mountRoot,
       (dir) => fs.readdirSync(dir),
+      SANDBOX_POLICY_LIMITS.listEntries - mounts.length,
     )) {
       denyPath(sibling);
     }
@@ -1376,7 +1395,7 @@ export function buildSandboxMounts(
     const guestHome = ensureSafeGuestRuntimeDirectory(
       untrustedPaths?.home ?? path.join(DATA_DIR, 'sessions', group.folder),
     );
-    mounts.push({
+    addMount({
       hostPath: guestHome,
       containerPath: SANDBOX_GUEST_HOME,
       readonly: false,
@@ -1409,7 +1428,7 @@ export function buildSandboxMounts(
   const maySkillsWrite = SKILLS_CURATOR_FOLDER
     ? trustedOwner && group.folder === SKILLS_CURATOR_FOLDER
     : trustedOwner;
-  mounts.push({
+  addMount({
     hostPath: skillsDir,
     containerPath: '/workspace/skills',
     readonly: !maySkillsWrite,
@@ -1420,7 +1439,7 @@ export function buildSandboxMounts(
   if (trustedOwner) {
     // Main is trusted and keeps the legacy whole-root RW view (owner/X and
     // extension compatibility).
-    mounts.push({
+    addMount({
       hostPath: ipcLayout.root,
       containerPath: '/workspace/ipc',
       readonly: false,
@@ -1433,7 +1452,7 @@ export function buildSandboxMounts(
     // host paths directly rather than a virtual mount namespace.
     for (const category of IPC_CATEGORY_DIRECTORY_NAMES) {
       const inputOnly = category === 'input';
-      mounts.push({
+      addMount({
         hostPath: ipcLayout.categories[category],
         containerPath: `/workspace/ipc/${category}`,
         readonly: !inputOnly,
@@ -1441,14 +1460,14 @@ export function buildSandboxMounts(
       });
     }
     for (const snapshot of ['current_tasks.json', 'available_groups.json']) {
-      mounts.push({
+      addMount({
         hostPath: path.join(ipcLayout.root, snapshot),
         containerPath: `/workspace/ipc/${snapshot}`,
         readonly: true,
         deny: true,
       });
     }
-    mounts.push({
+    addMount({
       hostPath: path.join(ipcLayout.root, '*'),
       containerPath: '/workspace/ipc/*',
       readonly: true,
@@ -1463,7 +1482,7 @@ export function buildSandboxMounts(
     // allowed category a stable RW bind mount under its RO root filesystem.
     for (const category of IPC_CATEGORY_DIRECTORY_NAMES) {
       if (category === 'google') continue;
-      mounts.push({
+      addMount({
         hostPath: ipcLayout.categories[category],
         containerPath: `/workspace/ipc/${category}`,
         readonly: false,
@@ -1472,20 +1491,20 @@ export function buildSandboxMounts(
     // Unlike a real container, the macOS sandbox receives host paths through
     // CLAUDECLAW_IPC_DIR. Masking the logical /workspace path alone is not a
     // read boundary, so explicitly deny the real shared owner Google tree.
-    mounts.push({
+    addMount({
       hostPath: ipcLayout.categories.google,
       containerPath: '/workspace/.claudeclaw-deny/google-ipc',
       readonly: true,
       deny: true,
     });
-    mounts.push({
+    addMount({
       hostPath: ensureSafeGuestRuntimeDirectory(
         path.join(DATA_DIR, 'runtime-denied-google-ipc'),
       ),
       containerPath: '/workspace/ipc/google',
       readonly: true,
     });
-    mounts.push({
+    addMount({
       hostPath: path.join(ipcLayout.root, '*'),
       containerPath: '/workspace/ipc/*',
       readonly: true,
@@ -1508,7 +1527,7 @@ export function buildSandboxMounts(
           path.join(DATA_DIR, 'sessions', group.folder, 'tmp'),
       );
   if (trustedOwner) fs.mkdirSync(groupTmpDir, { recursive: true });
-  mounts.push({
+  addMount({
     hostPath: groupTmpDir,
     containerPath: '/workspace/tmp',
     readonly: false,
@@ -1524,7 +1543,7 @@ export function buildSandboxMounts(
   if (trustedOwner) {
     const screenshotDir = '/tmp/skoobi-screenshots';
     fs.mkdirSync(screenshotDir, { recursive: true });
-    mounts.push({
+    addMount({
       hostPath: screenshotDir,
       containerPath: screenshotDir,
       readonly: true,
@@ -1539,7 +1558,7 @@ export function buildSandboxMounts(
   const groupSessionsDir = preparedHome.claudeHome;
 
   // Sandbox needs Claude home dir to be accessible
-  mounts.push({
+  addMount({
     hostPath: groupSessionsDir,
     containerPath: SANDBOX_GUEST_CLAUDE_HOME,
     readonly: false,
@@ -1551,13 +1570,19 @@ export function buildSandboxMounts(
     !restrictedWhatsAppObserver &&
     group.containerConfig?.additionalMounts
   ) {
+    if (
+      !fullAccess &&
+      group.containerConfig.additionalMounts.length > SANDBOX_POLICY_LIMITS.listEntries
+    ) {
+      throw new SandboxPolicyLimitError('list_entries');
+    }
     const validatedMounts = validateAdditionalMounts(
       group.containerConfig.additionalMounts,
       group.name,
       trustedOwner,
     );
     for (const vm of validatedMounts) {
-      mounts.push({
+      addMount({
         hostPath: vm.hostPath,
         containerPath: vm.containerPath,
         readonly: vm.readonly,
@@ -2173,17 +2198,28 @@ export async function runSandboxAgent(
   const processName = `claudeclaw-sandbox-${safeName}-${Date.now()}`;
 
   // Build mounts and srt settings
-  const mounts = buildSandboxMounts(
-    group,
-    rawIsMain,
-    input.senderIdentity,
-    input.credentialProxyTier,
-    input.chatJid,
-    input.runTrust,
-  );
+  let mounts: SandboxMount[];
+  try {
+    mounts = buildSandboxMounts(
+      group,
+      rawIsMain,
+      input.senderIdentity,
+      input.credentialProxyTier,
+      input.chatJid,
+      input.runTrust,
+    );
+  } catch (err) {
+    if (err instanceof SandboxPolicyLimitError) {
+      return sandboxPolicyRefusal(err.reason);
+    }
+    throw err;
+  }
   const settingsDir = path.join(DATA_DIR, 'sandbox-settings');
   fs.mkdirSync(settingsDir, { recursive: true });
-  const settingsPath = path.join(settingsDir, `${processName}.json`);
+  const settingsPath = path.join(
+    settingsDir,
+    `${processName}-${randomBytes(6).toString('hex')}.json`,
+  );
 
   // Per-group bypass: noSandbox=true runs agent directly on node without seatbelt.
   // Intended for dedicated bot hosts where there's nothing to protect.
@@ -2252,22 +2288,40 @@ export async function runSandboxAgent(
   // Merge domains and build settings only after the observer's exact home
   // carve-out is installed. Any failure here happens after auth.json was
   // seeded, so clean that ephemeral copy before returning.
-  let settings: SandboxSettings;
+  let encodedSettings: Buffer | undefined;
   try {
-    const extensionDomains = isolatedObserverAuth
-      ? []
-      : getExtensionAllowedDomains();
-    const groupDomains = isolatedObserverAuth
-      ? []
-      : (group.agentConfig?.allowedDomains ?? []);
-    const extraDomains = [
-      ...extensionDomains,
-      ...groupDomains,
-      ...(isCodexProvider ? CODEX_SANDBOX_DOMAINS : []),
-    ];
-    settings = buildSandboxSettings(mounts, extraDomains);
+    if (!bypassSandbox) {
+      const groupDomains = isolatedObserverAuth
+        ? []
+        : (group.agentConfig?.allowedDomains ?? []);
+      const providerDomains = isCodexProvider ? CODEX_SANDBOX_DOMAINS : [];
+      const extensionDomains = isolatedObserverAuth
+        ? []
+        : getExtensionAllowedDomains(
+            SANDBOX_POLICY_LIMITS.listEntries -
+              groupDomains.length -
+              providerDomains.length,
+          );
+      assertSandboxPolicyInputs(mounts, [
+        extensionDomains,
+        groupDomains,
+        providerDomains,
+      ]);
+      const settings = buildSandboxSettings(mounts, [
+        ...extensionDomains,
+        ...groupDomains,
+        ...providerDomains,
+      ]);
+      encodedSettings = encodeSandboxPolicy(settings);
+      assertValidSandboxSettings(settings);
+      if (isolatedObserverAuth && codexHomeDir) {
+        assertIsolatedObserverCodexHomeCarveOut(settings, codexHomeDir);
+      }
+    }
   } catch (err) {
     if (codexHomeDir) cleanupCodexAuth(runtimePersistenceKey);
+    if (err instanceof SandboxPolicyLimitError)
+      return sandboxPolicyRefusal(err.reason);
     const message = err instanceof Error ? err.message : String(err);
     logger.error(
       { group: group.name, processName, err },
@@ -2364,22 +2418,7 @@ export async function runSandboxAgent(
   // abort the run on any failure rather than spawning a sandbox that can read
   // the entire host filesystem.
   try {
-    if (!bypassSandbox) {
-      assertValidSandboxSettings(settings);
-      if (isolatedObserverAuth && codexHomeDir) {
-        assertIsolatedObserverCodexHomeCarveOut(settings, codexHomeDir);
-      }
-    }
-    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-    if (!bypassSandbox) {
-      const roundTrip = JSON.parse(
-        fs.readFileSync(settingsPath, 'utf-8'),
-      ) as SandboxSettings;
-      assertValidSandboxSettings(roundTrip);
-      if (isolatedObserverAuth && codexHomeDir) {
-        assertIsolatedObserverCodexHomeCarveOut(roundTrip, codexHomeDir);
-      }
-    }
+    if (encodedSettings) persistSandboxPolicy(settingsPath, encodedSettings);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.error(

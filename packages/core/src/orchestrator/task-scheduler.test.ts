@@ -790,6 +790,38 @@ describe('task scheduler', () => {
     expect(offset).toBe(0);
   });
 
+  it.each(['once', 'interval'] as const)('reports a policy limit and schedules no early retry for a %s task', async scheduleType => {
+    const { sandboxPolicyRefusal } = await import('../runtimes/sandbox-policy-budget.js');
+    const { sandboxPolicyNotices } = await import('./sandbox-policy-notice.js');
+    const chat = 'tg:7000000002';
+    const taskId = 'policy-budget-' + scheduleType;
+    const intervalMs = 86_400_000;
+    const planned = new Date(Date.now() - 60_000).toISOString();
+    createTask({
+      id: taskId, group_folder: 'telegram_main', chat_jid: chat, prompt: 'Fixture task',
+      schedule_type: scheduleType, schedule_value: scheduleType === 'once' ? planned : String(intervalMs),
+      context_mode: 'isolated', next_run: planned, status: 'active', created_at: planned,
+    });
+    const task = getTaskById(taskId)!;
+    const normalSlot = computeNextRun(task);
+    runnerMocks.runSandboxAgent.mockResolvedValue(sandboxPolicyRefusal('total_entries'));
+    const route = vi.fn(async envelope => envelope.text);
+    await runTask(task, {
+      registeredGroups: () => ({ [chat]: { name: 'Policy fixture', folder: task.group_folder,
+        trigger: '', added_at: planned, runtime: 'sandbox' } }),
+      getSessions: () => ({}), queue: taskQueueMock(), onProcess: vi.fn(),
+      router: { route } as any,
+    });
+    expect(runnerMocks.runSandboxAgent).toHaveBeenCalledTimes(1);
+    expect(route).toHaveBeenCalledTimes(1);
+    expect(route.mock.calls[0][0]).toMatchObject({ chatJid: chat,
+      text: sandboxPolicyNotices.total_entries + (scheduleType === 'once' ? ' Плановая задача приостановлена.' : '') });
+    expect(getTaskById(taskId)).toMatchObject({
+      status: scheduleType === 'once' ? 'paused' : 'active',
+      next_run: scheduleType === 'once' ? null : normalSlot,
+    });
+  });
+
   it('uses sandbox runtime for scheduled tasks when the group requests it', async () => {
     createTask({
       id: 'task-sandbox',

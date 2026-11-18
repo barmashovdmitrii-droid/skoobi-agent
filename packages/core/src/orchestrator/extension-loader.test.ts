@@ -3,14 +3,41 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import {
+  getExtensionAllowedDomains,
   resolveExtensionCodeRootFromModuleUrl,
   resolveExtensionEntry,
 } from './extension-loader.js';
 
 const ROOT = path.resolve('/srv/claudeclaw/extensions/claudeclaw-demo');
+
+describe('sandbox extension domain budget', () => {
+  it('counts raw domains across manifests before deduplicating and propagates a budget refusal', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'domain-budget-'));
+    try {
+      for (const name of ['claudeclaw-one', 'claudeclaw-two']) {
+        fs.mkdirSync(path.join(directory, name));
+      }
+      const readDirectory = fs.readdirSync;
+      vi.spyOn(fs, 'readdirSync').mockImplementation((_path, options) =>
+        readDirectory(directory, options),
+      );
+      vi.spyOn(fs, 'existsSync').mockReturnValue(true);
+      vi.spyOn(fs, 'readFileSync').mockReturnValue(JSON.stringify({
+        name: 'fixture', version: '1.0.0', type: 'extension', entry: 'index.js',
+        provides: { allowedDomains: ['fixture.example'] },
+      }));
+      expect(getExtensionAllowedDomains(2)).toEqual(['fixture.example', 'fixture.example']);
+      expect(() => getExtensionAllowedDomains(1)).toThrow('list_entries');
+      expect(getExtensionAllowedDomains()).toEqual(['fixture.example']);
+    } finally {
+      vi.restoreAllMocks();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('extension code-root resolution', () => {
   it('decodes spaces and Unicode in the module path', () => {

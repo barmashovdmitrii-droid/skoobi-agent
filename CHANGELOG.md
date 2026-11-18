@@ -2,6 +2,14 @@
 
 All notable public changes to Skoobi Agent are documented here.
 
+## 2.4.1
+
+- Bound the size of sandbox permission files, their lists and individual
+  entries before starting an isolated task. A refused task reports the
+  reason in its originating chat.
+- Update Vite, Vitest and source-map-js development dependencies to versions
+  that address their published security advisories.
+
 ## 2.4.0
 
 - Recover a prepared Telegram reply after an interrupted delivery without
