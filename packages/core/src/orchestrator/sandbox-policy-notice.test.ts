@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
 import { afterEach, expect, it, vi } from 'vitest';
 
 const { spawn } = vi.hoisted(() => ({
@@ -44,6 +47,19 @@ it.each([
     const chat = 'tg:' + id;
     const otherChat = 'tg:485399';
     const folder = 'policy-fixture-' + id;
+    const stateRoot = process.env.SKOOBI_TEST_STATE_ROOT!;
+    const fixtureHome = path.join(stateRoot, 'home', folder);
+    const codexHome = path.join(fixtureHome, '.codex');
+    const fixtureAuth = JSON.stringify({ fixture: 'sandbox-policy-notice' });
+    fs.mkdirSync(codexHome, { recursive: true });
+    vi.stubEnv('HOME', fixtureHome);
+    vi.stubEnv('CODEX_HOME', codexHome);
+    if (outcome === 'image-ack-lost') {
+      // Codex primary prepares its isolated home before checking the policy.
+      fs.writeFileSync(path.join(codexHome, 'auth.json'), fixtureAuth, {
+        mode: 0o600,
+      });
+    }
     vi.stubEnv(
       'SKOOBI_SANDBOX_CODEX_PRIMARY',
       outcome === 'image-ack-lost' ? 'true' : 'false',
@@ -148,6 +164,13 @@ it.each([
     const first = await loop.processGroupMessages(chat, router);
     expect(first).toBe(!startsOffline);
     if (outcome === 'image-ack-lost') {
+      const dataDir = path.join(stateRoot, 'data');
+      expect(
+        fs.readFileSync(path.join(dataDir, 'codex-auth', 'auth.json'), 'utf8'),
+      ).toBe(fixtureAuth);
+      expect(
+        fs.existsSync(path.join(runtime.codexHomeDirFor(folder), 'auth.json')),
+      ).toBe(false);
       const job = db.getRecentImageJob(chat);
       expect(job).toMatchObject({
         status: 'failed',
