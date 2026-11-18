@@ -140,5 +140,9 @@ export default defineConfig({
       'scripts/**/*.test.mjs',
     ],
     setupFiles: ['setup/vitest-env.ts'],
+    // Cold imports and subprocess startup take longer on hosted runners.
+    ...(process.env.GITHUB_ACTIONS === 'true'
+      ? { testTimeout: 20_000, hookTimeout: 20_000 }
+      : {}),
   },
 });
