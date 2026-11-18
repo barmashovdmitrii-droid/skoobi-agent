@@ -58,6 +58,7 @@ vi.mock('../orchestrator/extension-loader.js', () => ({
   getExtensionAllowedDomains: vi.fn().mockReturnValue([]),
 }));
 
+import { sandboxPolicyLimitReason, SANDBOX_POLICY_LIMITS } from './sandbox-policy-budget.js';
 import { spawn, spawnSync } from 'child_process';
 import { EventEmitter } from 'events';
 
@@ -739,6 +740,50 @@ describe('assertValidSandboxSettings (L11 fail-closed)', () => {
     expect(() => assertValidSandboxSettings(missingFs)).toThrow(
       /missing filesystem/,
     );
+  });
+});
+
+describe('host policy refusal', () => {
+  it('stops before spawning a guest with an over-budget group policy', async () => {
+    const group = makeGroup({
+      agentConfig: {
+        allowedDomains: Array(SANDBOX_POLICY_LIMITS.listEntries + 1).fill(
+          'fixture.example',
+        ),
+      },
+    });
+    const result = await runSandboxAgent(group, makeInput(), vi.fn());
+    expect(sandboxPolicyLimitReason(result)).toBe('list_entries');
+    expect(result.error).not.toContain('fixture.example');
+    expect(spawn).not.toHaveBeenCalled();
+  });
+  it('retains the already-authorized direct owner route when its unused policy exceeds the sandbox budget', async () => {
+    const group = makeGroup({
+      isMain: true,
+      agentConfig: {
+        fullAccess: true,
+        allowedDomains: Array(SANDBOX_POLICY_LIMITS.listEntries + 1).fill(
+          'fixture.example',
+        ),
+      },
+    });
+    vi.mocked(spawn).mockImplementationOnce(() => {
+      const child = new FakeChild();
+      setImmediate(() => child.emit('close', 0));
+      return child as unknown as ReturnType<typeof spawn>;
+    });
+    const result = await runSandboxAgent(
+      group,
+      makeInput({
+        isMain: true,
+        credentialProxyTier: 'owner',
+        agentConfig: { fullAccess: true },
+      }),
+      vi.fn(),
+    );
+    expect(sandboxPolicyLimitReason(result)).toBeUndefined();
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(vi.mocked(spawn).mock.calls[0][1]).not.toContain('--settings');
   });
 });
 

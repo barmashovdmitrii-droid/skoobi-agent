@@ -120,7 +120,7 @@ directly in a shell command.
 Download both assets from the tagged release:
 
 ```bash
-VERSION=v2.4.0
+VERSION=v2.4.1
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh"
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh.sha256"
 ```
