@@ -36,6 +36,17 @@ const tokenCount = (
     },
   });
 
+it('attributes the final turn to its own observed model, including missing observations', () => {
+  const first = { requestedModel: 'first-config', observedModel: 'first-runtime' };
+  const second = { requestedModel: 'second-config', observedModel: 'second-runtime' };
+  expect(codexTurnTracePayload(mergeCodexTurnTelemetry(first, second))).toMatchObject({
+    requested_model: 'second-config', effective_model: 'second-runtime',
+  });
+  const missing = codexTurnTracePayload(mergeCodexTurnTelemetry(first, { requestedModel: 'second-config' }));
+  expect(missing.requested_model).toBe('second-config');
+  expect(missing).not.toHaveProperty('effective_model');
+});
+
 describe('codexAccountUsedPercentAcrossHomes', () => {
   let dataDir: string;
   let userHome: string;

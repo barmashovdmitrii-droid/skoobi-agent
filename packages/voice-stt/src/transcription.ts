@@ -16,8 +16,9 @@ import {
   TRANSCRIPTION_TEXT_MAX_BYTES,
   type LocalTranscriptionResult,
   type TranscriptionPassEvidence,
+  type TranscriptionRecheckReason,
 } from '@skoobi/shared/transcription-result';
-import { assessTranscription, classifyTranscriptionError, failedTranscription, hasSuspectCaptionTail } from './transcription-quality.js';
+import { assessTranscription, classifyTranscriptionError, failedTranscription, hasSensitiveRussianCorrection, hasSuspectCaptionTail } from './transcription-quality.js';
 import {
   startOperationTraceStage,
   type OperationTraceDetails,
@@ -452,13 +453,7 @@ export function candidateFromWhisperOutput(
   };
 }
 
-export type RetryReason =
-  | 'invalid_transcript'
-  | 'missing_language_probability'
-  | 'low_language_probability'
-  | 'missing_mean_token_log_probability'
-  | 'low_mean_token_log_probability'
-  | 'suspect_caption_tail';
+export type RetryReason = TranscriptionRecheckReason;
 
 export function retryReasonForAutoCandidate(
   candidate: WhisperCandidate,
@@ -503,6 +498,8 @@ export function retryReasonForAutoCandidate(
   }
   if (hasSuspectCaptionTail(candidate.transcript))
     return 'suspect_caption_tail';
+  if (candidate.detectedLanguage === 'ru' && hasSensitiveRussianCorrection(candidate.transcript))
+    return 'sensitive_correction';
   return null;
 }
 
@@ -984,7 +981,7 @@ function traceRetryReason(
   if (reason === 'low_mean_token_log_probability') return 'low_mean_logprob';
   if (reason === 'missing_mean_token_log_probability')
     return 'missing_mean_logprob';
-  if (reason === 'suspect_caption_tail') return 'recheck_uncertain';
+  if (reason === 'suspect_caption_tail' || reason === 'sensitive_correction') return 'recheck_uncertain';
   return reason;
 }
 
@@ -1109,7 +1106,9 @@ async function transcribeUnserialized(
     if (requestedLanguage === 'auto' && config.accuracyMode === 'max') {
       retryReason = retryReasonForAutoCandidate(candidates[0], config);
       if (retryReason) {
-        for (const retryLanguage of ['ru', 'kk'] as const) {
+        const semanticCheck = retryReason === 'sensitive_correction';
+        const languages = semanticCheck ? ['ru'] : ['ru', 'kk'];
+        for (const retryLanguage of languages) {
           controlledTimeout(config.whisperTimeoutMs, control);
           passCount += 1;
           try {
@@ -1121,7 +1120,7 @@ async function transcribeUnserialized(
                 privateTmpDir,
                 retryLanguage,
                 passCount,
-                initialPrompt,
+                semanticCheck ? '' : initialPrompt,
                 trace,
                 traceRetryReason(retryReason, candidates[0]),
                 control,

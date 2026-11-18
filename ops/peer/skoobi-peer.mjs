@@ -219,6 +219,22 @@ export async function watchOnce(c,transport=remoteRpc,shouldStop=()=>false){
   }
 }
 
+/** An explicit availability probe. Historic job state never stands in for a live hello. */
+export async function peerHealth(c, transport=remoteRpc){
+  const jobs=new JobStore(c.stateRoot).list();
+  const contacts=jobs.map(s=>s.lastRemoteAt||s.remoteAcceptedAt).filter(t=>Number.isFinite(Date.parse(t)));
+  const lastJobContactAt=contacts.length?new Date(Math.max(...contacts.map(Date.parse))).toISOString():null;
+  const counts={active:jobs.filter(s=>!terminalStates.has(s.state)).length,total:jobs.length};
+  let reply;
+  try{reply=await transport(c,'hello',{},8000);}
+  catch{return {checkedAt:now(),route:'unavailable',worker:'unknown',lastJobContactAt,jobs:counts};}
+  const heartbeatAt=reply?.heartbeat?.updatedAt||null;
+  const age=Date.now()-Date.parse(heartbeatAt);
+  const worker=reply?.maintenance?.active||reply?.heartbeat?.maintenance?.active?'maintenance':
+    !Number.isFinite(age)||age< -30000||age>30000?'unknown':'running';
+  return {checkedAt:now(),route:'reachable',worker,heartbeatAt,lastJobContactAt,jobs:counts};
+}
+
 export async function watch(c){
   let stopping=false;process.once('SIGTERM',()=>stopping=true);process.once('SIGINT',()=>stopping=true);
   const releaseLock=acquireProcessLock(c.stateRoot,'watch');
@@ -236,6 +252,7 @@ async function main(){
   if(command==='watch'){if(args.length)throw Error('Unexpected argument');await watch(c);return;}
   let result;
   if(command==='hello')result=await remoteRpc(c,'hello');
+  else if(command==='health')result=await peerHealth(c);
   else if(command==='submit'){
     const ti=args.indexOf('--title');const title=ti>=0?args.splice(ti,2)[1]:'Задача';const ni=args.indexOf('--no-notify'),notify=ni<0;if(ni>=0)args.splice(ni,1);
     const ci=args.indexOf('--contract');const contract=ci>=0?JSON.parse(ownerRead(args.splice(ci,2)[1],96000).toString()):undefined;
@@ -265,7 +282,7 @@ async function main(){
     result=store.list().map(s=>({id:s.id,title:s.title,state:store.wantsCancel(s.id)&&!terminalStates.has(s.state)?'cancellation_pending':s.state,remoteState:s.remoteState,notificationState:s.notificationState}));
   }
   else if(command==='cancel')result=await cancel(c,args.shift());
-  else throw Error('Commands: hello, submit, inspect, status, reconcile, revise, review, rework, gui-slot, list, cancel, watch');
+  else throw Error('Commands: hello, health, submit, inspect, status, reconcile, revise, review, rework, gui-slot, list, cancel, watch');
   console.log(JSON.stringify(result));
 }
 if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url))main().catch(()=>{console.error('Peer operation failed. Check the private job status and MacBook availability.');process.exitCode=1;});

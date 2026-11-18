@@ -92,6 +92,9 @@ export interface CodexTokenTotals {
  * no rollout and reports none of it.
  */
 export interface CodexTurnTelemetry {
+  /** Requested at spawn and observed in this attempt's own turn_context. */
+  requestedModel?: string;
+  observedModel?: string;
   usageSource?: CodexUsageSource;
   /** token_count events of the turn = requests to the model. */
   modelRequests?: number;
@@ -296,6 +299,7 @@ export interface CodexTurnResult {
    * records. A thread id or turn.started alone does not acknowledge input. */
   inputPersisted?: boolean;
   modelUsed: string;
+  observedModel?: string;
   modelDowngradeUsed?: boolean;
   /**
    * Tokens of THIS turn. codex's turn.completed.usage is the thread's running
@@ -978,7 +982,9 @@ function findCodexRolloutFile(
   threadId: string,
 ): string | undefined {
   for (const filePath of rolloutFiles.keys()) {
-    if (path.basename(filePath).includes(threadId)) return filePath;
+    const filename = path.basename(filePath);
+    const match = /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}(?:\.\d+)?-(.+)\.jsonl$/.exec(filename);
+    if (match?.[1] === threadId) return filePath;
   }
   return undefined;
 }
@@ -2134,6 +2140,7 @@ async function runSingleAttempt(
     : null;
 
   return new Promise<CodexTurnResult>((resolve) => {
+    const attemptStartedAt = Date.now();
     const child = spawn(config.command, args, {
       cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -2245,6 +2252,12 @@ async function runSingleAttempt(
     // rollout tail gave, for the case the tail could not be read.
     let rolloutBaseline: CodexTokenTotals | null = null;
     let accountUsedPercent: number | null | undefined;
+    let observedModel: string | undefined;
+    let modelTurnId: string | null | undefined;
+    const resetModelObservation = () => {
+      modelTurnId = undefined;
+      observedModel = undefined;
+    };
     let appliedServiceTier: string | null | undefined;
     let appliedReasoningEffort: string | null | undefined;
     const toolCalls: Record<string, number> = {};
@@ -2341,6 +2354,7 @@ async function runSingleAttempt(
       | 'acted'
       | 'modelRequests'
       | 'appliedServiceTier'
+      | 'observedModel'
       | 'appliedReasoningEffort'
       | 'accountUsedPercent'
       | 'toolCalls'
@@ -2352,6 +2366,7 @@ async function runSingleAttempt(
       // called is worth knowing however the turn ended.
       ...(modelRequests > 0 ? { modelRequests } : {}),
       ...(appliedServiceTier !== undefined ? { appliedServiceTier } : {}),
+      ...(observedModel ? { observedModel } : {}),
       ...(appliedReasoningEffort !== undefined ? { appliedReasoningEffort } : {}),
       ...(accountUsedPercent !== undefined ? { accountUsedPercent } : {}),
       ...(Object.keys(toolCalls).length > 0 ? { toolCalls: { ...toolCalls } } : {}),
@@ -2470,11 +2485,33 @@ async function runSingleAttempt(
     // from the rollout records codex writes as it goes.
     const noteRolloutAccounting = (parsed: unknown): void => {
       if (!parsed || typeof parsed !== 'object') return;
-      const outer = parsed as { type?: unknown; payload?: unknown };
+      const outer = parsed as { type?: unknown; payload?: unknown; timestamp?: unknown };
       // codex writes session_meta when it creates a thread and never again on
       // `exec resume`: in a rollout that existed before the attempt it names
       // the CLI that created the thread, maybe days and an upgrade ago.
       if (outer.type !== 'session_meta' || rolloutIsOwn) toolStats.note(parsed);
+      // A restored or truncated rollout can replay complete turns. Pair the
+      // model with a fresh task_started from this exact thread and attempt.
+      const payload = outer.payload as Record<string, unknown> | null;
+      const timestamp = typeof outer.timestamp === 'string' ? Date.parse(outer.timestamp) : NaN;
+      const fresh = timestamp >= attemptStartedAt && timestamp <= Date.now();
+      if (outer.type === 'event_msg' && payload?.type === 'task_started' && fresh) {
+        const id = payload.turn_id;
+        if (typeof id === 'string' && id && id.length <= 128) {
+          if (modelTurnId === undefined) modelTurnId = id;
+          else if (modelTurnId !== id) {
+            modelTurnId = null;
+            observedModel = undefined;
+          }
+        }
+      }
+      if (outer.type === 'turn_context') {
+        if (fresh && modelTurnId && payload?.turn_id === modelTurnId) {
+          const model = payload.model;
+          observedModel = typeof model === 'string' && /^[a-zA-Z0-9._:-]{1,128}$/.test(model) ? model : undefined;
+        }
+        return;
+      }
       if (outer.type === 'response_item') {
         countCodexToolCalls(toolCalls, parsed);
         return;
@@ -2482,8 +2519,7 @@ async function runSingleAttempt(
       if (outer.type !== 'event_msg' || !outer.payload || typeof outer.payload !== 'object') {
         return;
       }
-      const payload = outer.payload as Record<string, unknown>;
-      if (payload.type === 'token_count') {
+      if (payload?.type === 'token_count') {
         const totals = tokenCountTotals(payload);
         const last = (payload.info as { last_token_usage?: unknown } | undefined)
           ?.last_token_usage as
@@ -2506,7 +2542,7 @@ async function runSingleAttempt(
           const used = rateLimitsUsedPercent(payload.rate_limits);
           if (used !== null) accountUsedPercent = used;
         }
-      } else if (payload.type === 'thread_settings_applied') {
+      } else if (payload?.type === 'thread_settings_applied') {
         const settings = payload.thread_settings as
           | { service_tier?: unknown; reasoning_effort?: unknown }
           | undefined;
@@ -2596,6 +2632,7 @@ async function runSingleAttempt(
         // dedupe prevents an already observed completion from firing twice.
         rolloutOffset = 0;
         rolloutPending = '';
+        resetModelObservation();
       }
       if (size > rolloutOffset) {
         // Rollout growth is progress: codex records reasoning, tool calls and
@@ -2829,6 +2866,7 @@ async function runSingleAttempt(
         toolObserver.observe(event);
         recordImageGeneration(parseCodexImageGenerationEvent(event));
         if (event.type === 'thread.started' && event.thread_id) {
+          if (newThreadId !== event.thread_id) resetModelObservation();
           newThreadId = event.thread_id;
           scanRollout();
         } else if (event.type === 'turn.started') {

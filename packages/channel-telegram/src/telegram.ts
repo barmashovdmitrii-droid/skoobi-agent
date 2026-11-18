@@ -830,7 +830,9 @@ async function sendTelegramMessage(
   chatId: string | number,
   text: string,
   options: { message_thread_id?: number } = {},
+  canSend?: () => boolean,
 ): Promise<void> {
+  if (canSend && !canSend()) throw new Error('saved_final_superseded');
   // Nothing to say. Telegram rejects a blank message with a 400, which used to
   // surface as an outbound delivery failure and hold the cursor back so the
   // whole turn was retried.
@@ -863,6 +865,7 @@ async function sendTelegramMessage(
       'Markdown send failed, falling back to plain text',
     );
     const plain = plainTelegramText(text);
+    if (canSend && !canSend()) throw new Error('saved_final_superseded');
     await api.sendMessage(chatId, plain.trim() ? plain : text, options);
   }
 }
@@ -952,13 +955,14 @@ async function sendTelegramMessageWithRetry(
   chatId: string | number,
   text: string,
   options: { message_thread_id?: number } = {},
+  canSend?: () => boolean,
   transientDelaysMs: readonly number[] = TELEGRAM_TRANSIENT_SEND_RETRY_DELAYS_MS,
 ): Promise<void> {
   let transientAttempt = 0;
   let rateLimitRetried = false;
   for (;;) {
     try {
-      await sendTelegramMessage(api, chatId, text, options);
+      await sendTelegramMessage(api, chatId, text, options, canSend);
       return;
     } catch (err) {
       const retryAfter = telegramRetryAfterSeconds(err);
@@ -973,6 +977,7 @@ async function sendTelegramMessageWithRetry(
       }
       if (
         retryAfter === null &&
+        !canSend && // A saved reply with a lost ACK waits for an explicit resend.
         isTelegramTransientSendError(err) &&
         transientAttempt < transientDelaysMs.length
       ) {
@@ -2543,6 +2548,7 @@ export class TelegramChannel implements Channel {
   private mediaIntakeAdapter?: MediaIntakeAdapter;
   private mediaIntakeWorker?: MediaIntakeWorker;
   name = 'telegram';
+  readonly voiceTransportAware = true;
 
   private bot: Bot | null = null;
   private opts: TelegramChannelOpts;
@@ -5296,7 +5302,7 @@ export class TelegramChannel implements Channel {
     await this.progressMessages.finish(jid, turnKey);
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(jid: string, text: string, options?: {canSend?: () => boolean}): Promise<void> {
     if (!this.bot) {
       logger.warn('Telegram bot not initialized');
       throw new Error('Telegram bot not initialized');
@@ -5318,7 +5324,7 @@ export class TelegramChannel implements Channel {
       // typed instead of silently vanishing while logged as sent.
       if (parts.length === 0 && text.trim()) parts.push(text);
       for (const part of parts) {
-        await sendTelegramMessageWithRetry(this.bot.api, numericId, part);
+        await sendTelegramMessageWithRetry(this.bot.api, numericId, part, {}, options?.canSend);
       }
       logger.info({ jid, length: text.length }, 'Telegram message sent');
     } catch (err) {
@@ -5377,7 +5383,7 @@ export class TelegramChannel implements Channel {
   ): Promise<void> {
     if (!this.bot) {
       logger.warn('Telegram bot not initialized');
-      return;
+      throw new Error('Telegram bot not initialized');
     }
     if (!fs.existsSync(filePath)) {
       throw new Error(`Document file not found: ${path.basename(filePath)}`);
@@ -5403,17 +5409,20 @@ export class TelegramChannel implements Channel {
     );
   }
 
-  async sendVoice(jid: string, text: string): Promise<void> {
+  async sendVoice(jid: string, text: string, options?: {canSend?: () => boolean; transportAttempted?: () => void}): Promise<void> {
     if (!this.bot) {
       logger.warn('Telegram bot not initialized');
-      return;
+      throw new Error('Telegram bot not initialized');
     }
     const trimmed = text.trim();
     if (!trimmed) return;
     const numericId = this.telegramChatIdForJid(jid);
     const result = await synthesizeVoice(trimmed);
     try {
+      if (!result.files.length) throw new Error('Voice synthesis returned no audio');
       for (const file of result.files) {
+        if (options?.canSend && !options.canSend()) throw new Error('saved_final_superseded');
+        options?.transportAttempted?.();
         await this.bot.api.sendVoice(numericId, new InputFile(file));
       }
       logger.info(
@@ -5546,6 +5555,7 @@ export class TelegramChannel implements Channel {
 
 export class TelegramMultiBotChannel implements Channel {
   name = 'telegram';
+  readonly voiceTransportAware = true;
 
   constructor(private readonly channels: TelegramChannel[]) {}
 
@@ -5569,10 +5579,11 @@ export class TelegramMultiBotChannel implements Channel {
     await Promise.all(this.channels.map((channel) => channel.disconnect()));
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(jid: string, text: string, options?: {canSend?: () => boolean}): Promise<void> {
     const channel = this.channelForJid(jid);
     if (!channel) throw new Error(`No Telegram bot owns JID: ${jid}`);
-    await channel.sendMessage(jid, text);
+    if (options) await channel.sendMessage(jid, text, options);
+    else await channel.sendMessage(jid, text);
   }
 
   async sendProgress(jid: string, text: string, turnKey: string): Promise<boolean> {
@@ -5607,10 +5618,11 @@ export class TelegramMultiBotChannel implements Channel {
     await channel.sendDocument(jid, filePath, caption);
   }
 
-  async sendVoice(jid: string, text: string): Promise<void> {
+  async sendVoice(jid: string, text: string, options?: {canSend?: () => boolean; transportAttempted?: () => void}): Promise<void> {
     const channel = this.channelForJid(jid);
     if (!channel) throw new Error(`No Telegram bot owns JID: ${jid}`);
-    await channel.sendVoice(jid, text);
+    if (options) await channel.sendVoice(jid, text, options);
+    else await channel.sendVoice(jid, text);
   }
 
   async setTyping(jid: string, isTyping: boolean): Promise<void> {

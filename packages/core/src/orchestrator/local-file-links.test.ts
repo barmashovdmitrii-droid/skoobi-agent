@@ -165,14 +165,14 @@ describe('rewriting local file links in a final answer (C38)', () => {
       { outcome: 'sent', basename: 'research.md' },
     ]);
     // The next answer linking the same file does not send it again.
-    expect(recentChatFileSend(folder, research)).toBe('sent');
+    expect(recentChatFileSend(folder, 'tg:100', research)).toBe('sent');
   });
 
   it('does not send a file the model already sent through send_document', async () => {
 
     const pdf = file('artifacts/fixture/Пример — список.pdf');
-    noteChatFileSendStarted(folder, pdf);
-    noteChatFileSendFinished(folder, pdf, true);
+    noteChatFileSendStarted(folder, 'tg:100', pdf);
+    noteChatFileSendFinished(folder, 'tg:100', pdf, true);
     const sent: SentDocument[] = [];
     const result = await rewrite(
       `Список: [Пример — список.pdf](<${pdf}>)`,
@@ -331,7 +331,7 @@ describe('rewriting local file links in a final answer (C38)', () => {
     expect(result.text).toBe('Вот a.pdf (попросите, и я пришлю)');
     expect(result.links[0].reason).toBe('send_failed');
     expect(result.sentFiles).toEqual([]);
-    expect(recentChatFileSend(folder, pdf)).toBeNull();
+    expect(recentChatFileSend(folder, 'tg:100', pdf)).toBeNull();
   });
 
   it('attaches at most five files of one answer', async () => {
@@ -380,26 +380,27 @@ describe('chat file send registry', () => {
 
   it('remembers a confirmed send for 30 minutes and forgets a refused one', () => {
     const now = 1_792_000_000_000;
-    noteChatFileSendStarted('chat_a', '/nonexistent/a.pdf', now);
-    expect(recentChatFileSend('chat_a', '/nonexistent/a.pdf', now)).toBe(
+    noteChatFileSendStarted('chat_a', 'tg:100', '/nonexistent/a.pdf', now);
+    expect(recentChatFileSend('chat_a', 'tg:100', '/nonexistent/a.pdf', now)).toBe(
       'sending',
     );
-    noteChatFileSendFinished('chat_a', '/nonexistent/a.pdf', true, now);
-    expect(recentChatFileSend('chat_a', '/nonexistent/a.pdf', now)).toBe(
+    noteChatFileSendFinished('chat_a', 'tg:100', '/nonexistent/a.pdf', true, now);
+    expect(recentChatFileSend('chat_a', 'tg:100', '/nonexistent/a.pdf', now)).toBe(
       'sent',
     );
-    expect(recentChatFileSend('chat_b', '/nonexistent/a.pdf', now)).toBeNull();
+    expect(recentChatFileSend('chat_a', 'tg:other', '/nonexistent/a.pdf', now)).toBeNull();
+    expect(recentChatFileSend('chat_b', 'tg:100', '/nonexistent/a.pdf', now)).toBeNull();
     expect(
       recentChatFileSend(
-        'chat_a',
+        'chat_a', 'tg:100',
         '/nonexistent/a.pdf',
         now + RECENT_CHAT_FILE_SEND_MS + 1,
       ),
     ).toBeNull();
 
-    noteChatFileSendStarted('chat_a', '/nonexistent/b.pdf', now);
-    noteChatFileSendFinished('chat_a', '/nonexistent/b.pdf', false, now);
-    expect(recentChatFileSend('chat_a', '/nonexistent/b.pdf', now)).toBeNull();
+    noteChatFileSendStarted('chat_a', 'tg:100', '/nonexistent/b.pdf', now);
+    noteChatFileSendFinished('chat_a', 'tg:100', '/nonexistent/b.pdf', false, now);
+    expect(recentChatFileSend('chat_a', 'tg:100', '/nonexistent/b.pdf', now)).toBeNull();
   });
 
   it('reads only photo/document envelopes from the queue and skips junk', () => {
@@ -407,7 +408,7 @@ describe('chat file send registry', () => {
     try {
       fs.writeFileSync(
         path.join(dir, '1.json'),
-        JSON.stringify({ type: 'photo', filePath: '/nonexistent/p.png' }),
+        JSON.stringify({ type: 'photo', chatJid: 'tg:100', filePath: '/nonexistent/p.png' }),
       );
       fs.writeFileSync(
         path.join(dir, '2.json'),
@@ -415,10 +416,11 @@ describe('chat file send registry', () => {
       );
       fs.writeFileSync(path.join(dir, '3.json'), '{not json');
       fs.writeFileSync(path.join(dir, '4.tmp'), '{}');
-      expect([...queuedIpcFileSends('chat_a', dir)]).toEqual([
+      expect([...queuedIpcFileSends('chat_a', 'tg:100', dir)]).toEqual([
         '/nonexistent/p.png',
       ]);
-      expect(queuedIpcFileSends('chat_a', path.join(dir, 'missing')).size).toBe(
+      expect(queuedIpcFileSends('chat_a', 'tg:other', dir).size).toBe(0);
+      expect(queuedIpcFileSends('chat_a', 'tg:100', path.join(dir, 'missing')).size).toBe(
         0,
       );
     } finally {

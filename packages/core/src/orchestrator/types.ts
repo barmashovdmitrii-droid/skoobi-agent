@@ -197,7 +197,7 @@ export interface MessageIngestion {
 export interface MessageRouter {
   addPreHook(hook: OutboundPreHook): void;
   addPostHook(hook: (envelope: OutboundEnvelope) => void): void;
-  route(envelope: OutboundEnvelope): Promise<string | null>;
+  route(envelope: OutboundEnvelope, canSend?: () => boolean): Promise<string | null>;
   /** Convenience: route with minimal envelope */
   send(jid: string, text: string): Promise<void>;
   /**
@@ -228,9 +228,10 @@ export interface MessageRouter {
     caption?: string,
     options?: {
       suppressCursorAdvance?: boolean;
+      canSend?: () => boolean;
       meta?: Record<string, unknown>;
     },
   ): Promise<boolean>;
   /** Synthesize text → voice and send. Returns true if delivered, false if no channel supports it. */
-  sendVoice(jid: string, text: string): Promise<boolean>;
+  sendVoice(jid: string, text: string, control?: {canSend(): boolean; transportAttempted(): void}): Promise<boolean>;
 }

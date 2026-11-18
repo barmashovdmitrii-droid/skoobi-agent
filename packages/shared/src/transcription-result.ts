@@ -24,6 +24,7 @@ export type TranscriptionRecheckReason =
   | 'low_language_probability'
   | 'missing_mean_token_log_probability'
   | 'low_mean_token_log_probability'
+  | 'sensitive_correction'
   | 'suspect_caption_tail';
 export type TranscriptionUncertainty =
   | 'missing_mean_logprob'
@@ -33,6 +34,8 @@ export type TranscriptionUncertainty =
   | 'candidate_disagreement'
   | 'number_disagreement'
   | 'negation_disagreement'
+  | 'unrecognized_date_term'
+  | 'date_disagreement'
   | 'possible_name_disagreement'
   | 'comparison_limited'
   | 'recheck_unavailable'
@@ -74,7 +77,7 @@ export interface TranscriptionPassEvidence {
   errorCode?: TranscriptionErrorCode;
 }
 export interface TranscriptionAmbiguity {
-  kind: 'number' | 'negation' | 'possible_name';
+  kind: 'number' | 'negation' | 'date' | 'possible_name';
   passIndices: [number, number];
   /** Bounded differing terms for a targeted clarification, not a corrected command. */
   variants: [string, string];
@@ -126,6 +129,7 @@ const RECHECK = [
   'low_language_probability',
   'missing_mean_token_log_probability',
   'low_mean_token_log_probability',
+  'sensitive_correction',
   'suspect_caption_tail',
 ];
 const UNCERTAINTY = [
@@ -136,6 +140,8 @@ const UNCERTAINTY = [
   'candidate_disagreement',
   'number_disagreement',
   'negation_disagreement',
+  'unrecognized_date_term',
+  'date_disagreement',
   'possible_name_disagreement',
   'comparison_limited',
   'recheck_unavailable',
@@ -359,7 +365,7 @@ export function parseLocalTranscriptionResult(
       if (
         !record(ambiguity) ||
         !exactKeys(ambiguity, ['kind', 'passIndices', 'variants']) ||
-        !oneOf(ambiguity.kind, ['number', 'negation', 'possible_name']) ||
+        !oneOf(ambiguity.kind, ['number', 'negation', 'date', 'possible_name']) ||
         !Array.isArray(ambiguity.passIndices) ||
         ambiguity.passIndices.length !== 2 ||
         ambiguity.passIndices[0] === ambiguity.passIndices[1] ||

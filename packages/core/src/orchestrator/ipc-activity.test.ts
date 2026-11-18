@@ -494,10 +494,10 @@ describe('IPC watcher → run-activity liveness notifications', () => {
     expect(mainEvents.slice(-3).sort()).toEqual(['document', 'photo', 'voice']);
     // C38: the final answer that links one of these files must not attach it
     // a second time — the watcher notes every confirmed file send.
-    expect(recentChatFileSend(MAIN_FOLDER, fs.realpathSync(chartPath))).toBe(
+    expect(recentChatFileSend(MAIN_FOLDER, 'main@g.us', fs.realpathSync(chartPath))).toBe(
       'sent',
     );
-    expect(recentChatFileSend(MAIN_FOLDER, fs.realpathSync(estimatePath))).toBe(
+    expect(recentChatFileSend(MAIN_FOLDER, 'main@g.us', fs.realpathSync(estimatePath))).toBe(
       'sent',
     );
   });
@@ -603,10 +603,10 @@ describe('IPC watcher → run-activity liveness notifications', () => {
       ).toEqual([]);
       // A refused file is not «already sent»: a later link may attach it.
       expect(
-        recentChatFileSend(MAIN_FOLDER, fs.realpathSync(failDocument)),
+        recentChatFileSend(MAIN_FOLDER, 'main@g.us', fs.realpathSync(failDocument)),
       ).toBeNull();
       expect(
-        recentChatFileSend(MAIN_FOLDER, fs.realpathSync(failPhoto)),
+        recentChatFileSend(MAIN_FOLDER, 'main@g.us', fs.realpathSync(failPhoto)),
       ).toBeNull();
     } finally {
       warnSpy.mockRestore();

@@ -222,6 +222,45 @@ describe('production factory path in a synthetic private instance', () => {
     30000,
   );
 
+  it('captures only the selected Studio place and separates integrity from two-client evidence', async () => {
+    await call('create', {title:'Fixture Studio', engine:'roblox', brief:{...brief, platforms:['roblox']}});
+    await call('plan', {tasks:[{id:'studio-qa',stage:'qa',title:'Playtest',acceptance:['Two players'],dependencies:[]}]});
+    const claimed=await call('claim',{taskId:'studio-qa',backend:'agent'});
+    const capture={token:claimed.claim.token,sourceRoot:claimed.workDirectory,entrypoint:'Game.rbxlx',version:'0.1'};
+    const place=path.join(claimed.workDirectory,capture.entrypoint);
+    await expect(call('build_capture',capture)).rejects.toThrow('roblox_place_missing');
+    fs.writeFileSync(place,'<html>not a place</html>');
+    await expect(call('build_capture',capture)).rejects.toThrow('roblox_place_invalid');
+    fs.writeFileSync(place,'<!DOCTYPE roblox [<!ENTITY x "test">]><roblox version="4"><Item/></roblox>');
+    await expect(call('build_capture',capture)).rejects.toThrow('roblox_place_invalid');
+    fs.writeFileSync(place,'<roblox version="4"><Item class="Workspace"/></roblox>');
+    fs.writeFileSync(path.join(claimed.workDirectory,'private-notes.json'),'{}');
+    const captured=await call('build_capture',capture);
+    const build=captured.build;
+    expect(build.files.map((f:{path:string})=>f.path)).toEqual(['Game.rbxlx']);
+    expect(fs.readdirSync(build.root)).toEqual(['Game.rbxlx']);
+    const integrity=await call('verify_build',{buildId:build.id});
+    expect(integrity.evidence.assurance).toBe('place_integrity_only');
+    expect(integrity.fullGameplayVerified).toBe(false);
+    const report='studio-test.json',filename=path.join(project.workspace,report);
+    const observation={schema:1,kind:'studio_two_clients',placeSha256:build.files[0].sha256,
+      result:'pass',serverObserved:true,observedClients:['client-1','client-2']};
+    const record=()=>call('evidence_record',{kind:'technical',criterion:'studio_two_clients',result:'pass',studioReport:report,buildId:build.id});
+    fs.writeFileSync(filename,JSON.stringify({...observation,placeSha256:'0'.repeat(64)}));
+    await expect(record()).rejects.toThrow('roblox_playtest_report_mismatch');
+    fs.writeFileSync(filename,JSON.stringify({...observation,observedClients:['same','same']}));
+    await expect(record()).rejects.toThrow('roblox_playtest_report_invalid');
+    fs.writeFileSync(filename,JSON.stringify(observation));
+    const studio=await record();
+    expect(studio.evidence).toMatchObject({trust:'reported',assurance:'studio_reported',manifestSha256:build.manifestSha256});
+    await call('checkpoint',{token:capture.token,summary:'Checked snapshot',state:'submitted',buildId:build.id});
+    await call('release_claim',{token:capture.token});
+    const review={taskId:'studio-qa',decision:'accepted',note:'Check exact build and report'};
+    await expect(call('task_review',{...review,evidenceIds:[integrity.evidence.id]})).rejects.toThrow('roblox_two_client_report_required');
+    await call('task_review',{...review,evidenceIds:[integrity.evidence.id,studio.evidence.id]});
+    expect(project.tasks[0].state).toBe('accepted');
+  });
+
   it('imports, seeds an isolated writer, freezes a build, verifies and reviews the exact artifact', async () => {
     await call('create', { title: 'Fixture', engine: 'canvas', brief });
     const imported = await call('source_import', {

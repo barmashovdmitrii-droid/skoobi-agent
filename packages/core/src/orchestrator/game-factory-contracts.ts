@@ -165,6 +165,7 @@ export interface FactoryFile {
 }
 
 export interface FactoryBuild {
+  profile?: 'roblox_place';
   id: string;
   briefRevision: number;
   version: string;
@@ -205,7 +206,7 @@ export interface FactoryEvidence {
   receiptPath?: string;
   receiptSha256?: string;
   receiptId?: string;
-  assurance?: 'startup_only' | 'verified_user_quote';
+  assurance?: 'startup_only' | 'verified_user_quote' | 'place_integrity_only' | 'studio_reported';
 }
 
 export interface FactoryRelease {

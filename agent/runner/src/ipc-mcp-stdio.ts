@@ -3388,6 +3388,21 @@ export async function requestHostMemoryState(
     .strict();
   const card = z
     .object({
+      work: z.object({
+        target: z.string().min(1).max(500).describe('Exact execution environment and project.'),
+        executor: z.string().min(1).max(200),
+        lastObservedAt: z.string().datetime().optional(),
+        requirementsRevision: z.number().int().min(1),
+        nextStep: z.string().min(1).max(2000).nullable().describe('For waiting work, record the action after the stated condition is met. Preserve cancellation and approval conditions.'),
+        waitingOn: z.string().min(1).max(200).optional().describe('Who or what supplies the awaited input. Omit when the source does not establish it.'),
+        criteria: z.array(z.object({
+          key: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/).max(80),
+          description: z.string().min(1).max(1000),
+          state: z.enum(['pending','passed','failed','blocked']),
+          checkedRevision: z.number().int().min(1).optional(),
+          evidence: z.string().min(1).max(2000).optional(),
+        }).strict()).min(1).max(30),
+      }).strict().optional().describe('Reported acceptance checklist, not proof or authority. Increase requirementsRevision after changed requirements; previous passed checks become pending. Keep unfinished criteria and original user pain. Completion requires every criterion checked for current revision, no pending work or next step.'),
       title: z.string().min(1).max(200),
       goal: z.string().min(1).max(4000),
       status: z.enum(['active', 'waiting', 'completed', 'cancelled']),
@@ -4014,7 +4029,7 @@ registerTool(
 
 registerTool(
   'skill_propose',
-  'Propose a new reusable Skoobi procedural skill as a draft. This never activates the skill; the operator must review and approve it outside the model.',
+  'Propose a new reusable Skoobi procedural skill as a draft. Activation requires a verified executable procedure, two reviewed examples meeting their criteria, and operator registration. Check the available tools and evidence before seeking approval.',
   {
     name: z
       .string()
@@ -4078,7 +4093,7 @@ registerTool(
       content: [
         {
           type: 'text' as const,
-          text: `Skill proposal "${args.name}" submitted for operator review. It is not active until the operator approves it.`,
+          text: `Skill proposal "${args.name}" submitted for operator review through the host queue. The operator workflow registers a contract for the executable procedure and two reviewed examples (verify-register), runs them (verify), checks the evidence (verification), then activates the reviewed draft (approve). Track any existing approval for this exact scope and report the first outstanding step. This receipt confirms queuing only.`,
         },
       ],
     };

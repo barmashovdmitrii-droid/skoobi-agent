@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import {isDeepStrictEqual} from 'node:util';
 import {pathToFileURL} from 'node:url';
 import {JobStore,atomicWrite,privateRead,privateJson,privateDirectory,validateInputs,terminalStates,now,sha256,acquireFileLock} from './skoobi-peer-core.mjs';
 import {validatePeerContract,contentHash,PEER_CAPABILITIES} from './skoobi-peer-contract.mjs';
@@ -280,10 +281,11 @@ export function inspectPeerV2(c,id){
     parentTaskId:s.parentTaskId,createdAt:s.createdAt,finishedAt:s.finishedAt||null,
     revisionStatus:s.revisionStatus||null,pendingRevision:s.pendingRevision||null,
     assessment:s.assessment||null,review:s.review||null,contextInvalidated:s.contextInvalidated||null,
+    lastJobContactAt:s.lastRemoteAt||s.remoteAcceptedAt||null,lastProgressAt:s.lastProgressAt||null,
     lastConnectionErrorAt:s.lastConnectionErrorAt||null,nextAttemptAt:s.nextAttemptAt||null};
 }
 
-export function syncPeerDeliveryReceipt(c,id,host){
+function syncReceiptLocked(c,id,host){
   const store=new JobStore(c.stateRoot),s=store.state(id);if(!s.resultEventId)return;
   const file=path.join(host.config.root,'receipts',s.resultEventId+'.json');
   if(!fs.existsSync(file))return;
@@ -291,7 +293,15 @@ export function syncPeerDeliveryReceipt(c,id,host){
   if(receipt.eventId!==s.resultEventId)throw Error('Delivery receipt mismatch');
   // The main service owns this receipt. No channel acknowledgement is inferred here.
   if(receipt.jobId!==id||receipt.revision!==s.revision||receipt.resultHash!==s.assessment?.resultHash)throw Error('Delivery receipt binding mismatch');
-  store.update(id,{deliveryReceipt:receipt,deliveryState:receipt.delivery||'unknown'});
+  const deliveryState=receipt.delivery||'unknown';
+  if(s.deliveryState!==deliveryState||!isDeepStrictEqual(s.deliveryReceipt,receipt)){
+    store.update(id,{deliveryReceipt:receipt,deliveryState});
+  }
+}
+
+export function syncPeerDeliveryReceipt(c,id,host){
+  const store=new JobStore(c.stateRoot),release=acquireFileLock(store.dir(id),'coordinator');
+  try{syncReceiptLocked(c,id,host);}finally{release();}
 }
 
 async function acknowledgeResult(c,id,host,store,transport){
@@ -318,10 +328,11 @@ export async function reconcilePeerV2(c,id,transport,adapters){
     if(local.schema!==2)throw Error('Use the legacy inspection path');
     if(terminalStates.has(local.state)){
       const current=await allContextCurrent(host,id,payload,store);
-      if(!current.valid)store.update(id,{contextInvalidated:current.reason||'changed'});
+      const invalidation=current.reason||'changed';
+      if(!current.valid&&local.contextInvalidated!==invalidation)store.update(id,{contextInvalidated:invalidation});
       if(local.localConclusion)await publishLocalConclusion(id,host,store);
       else if(local.assessment)await publishResult(c,id,host,store);
-      syncPeerDeliveryReceipt(c,id,host);await acknowledgeResult(c,id,host,store,transport);return inspectPeerV2(c,id);
+      syncReceiptLocked(c,id,host);await acknowledgeResult(c,id,host,store,transport);return inspectPeerV2(c,id);
     }
     let current=await allContextCurrent(host,id,payload,store);
     const expired=Date.parse(payload.contract.execution.expiresAt)<=Date.now();
@@ -395,7 +406,7 @@ export async function reconcilePeerV2(c,id,transport,adapters){
     store.update(id,{assessment,remoteResult:remote,localArtifacts:artifacts,state:remote.state,finishedAt:remote.finishedAt||now(),
       cancellationConfirmed:remote.state==='cancelled'&&remote.cancellationConfirmed===true,
       progress:{stage:'review',lastActivityAt:now(),nextStep:assessment.status==='passed'?'delivery':'coordinator_review'}});
-    await publishResult(c,id,host,store);syncPeerDeliveryReceipt(c,id,host);await acknowledgeResult(c,id,host,store,transport);
+    await publishResult(c,id,host,store);syncReceiptLocked(c,id,host);await acknowledgeResult(c,id,host,store,transport);
     return inspectPeerV2(c,id);
   }catch(error){
     const s=store.state(id),failures=(s.connectionFailures||0)+1;

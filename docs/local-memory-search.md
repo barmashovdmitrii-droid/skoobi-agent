@@ -79,5 +79,7 @@ scripts/with-node22.sh node --import tsx evals/semantic-memory/run.ts \
 
 Build the memory package first when running directly from source. The evaluation
 uses a temporary SQLite database and emits record IDs and aggregate metrics.
+To check the same ranking against eight additional queries and six distractor
+records, pass `--corpus evals/semantic-memory/holdout-corpus.json`.
 An optional `--queries` file contains `[{"id":"expected-record-id","query":"..."}]`.
 Keep independent evaluation queries separate from model or ranking development.

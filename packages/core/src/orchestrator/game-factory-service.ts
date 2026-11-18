@@ -11,6 +11,7 @@ import {
   captureFactoryManifest,
   importFactorySource,
   ensureFactoryPrivateDirectory,
+  captureFactoryReferenceFileAsync,
   captureFactoryManifestAsync,
   importFactorySourceAsync,
   ensureFactoryPrivateDirectoryAsync,
@@ -57,6 +58,7 @@ import {
 import {
   FACTORY_READ_ACTIONS,
   FactoryError,
+  type FactoryFile,
   type FactoryActor,
   type FactoryActorPolicy,
   type FactoryBrief,
@@ -378,14 +380,19 @@ export interface FactoryArtifactSnapshot {
 export interface FactoryServiceDependencies {
   now?: () => string;
   verifyCurrentSource: (actor: FactoryActor) => void;
+  captureReference?: (
+    input: Parameters<typeof captureFactoryReferenceFileAsync>[0],
+  ) => FactoryFile;
   capture?: (input: {
     sourceRoot: string;
     entrypoint: string;
+    profile?: 'roblox_place';
     allowedRoots: string[];
   }) => FactoryArtifactSnapshot;
   importSource?: (input: {
     sourceRoot: string;
     entrypoint: string;
+    profile?: 'roblox_place';
     allowedRoots: string[];
     destinationRoot: string;
   }) => FactoryArtifactSnapshot;
@@ -1004,6 +1011,7 @@ export class GameFactoryService {
             const before = this.deps.capture({
               sourceRoot: base.root,
               entrypoint: base.entrypoint,
+              ...(base.profile && {profile: base.profile}),
               allowedRoots: [project.workspace],
             });
             if (before.manifestSha256 !== base.manifestSha256)
@@ -1012,6 +1020,7 @@ export class GameFactoryService {
             const seeded = this.deps.importSource({
               sourceRoot: base.root,
               entrypoint: base.entrypoint,
+              ...(base.profile && {profile: base.profile}),
               allowedRoots: [project.workspace],
               destinationRoot: sourceDirectory,
             });
@@ -1419,7 +1428,9 @@ export class GameFactoryService {
             root: this.config.workspaceRoot,
             relativePath: `${project.id}/builds`,
           });
+          const profile=project.engine === 'roblox' && /\.rbxlx?$/i.test(input.entrypoint) ? 'roblox_place' as const : undefined;
           const snapshot = this.deps.importPeerResult({
+            ...(profile && {profile}),
             actor,
             projectId: project.id,
             jobId: input.jobId,
@@ -1442,6 +1453,7 @@ export class GameFactoryService {
             };
           }
           const build: FactoryBuild = {
+            ...(profile && {profile}),
             id: buildId,
             briefRevision: project.brief.revision,
             version: input.version,
@@ -1573,6 +1585,7 @@ export class GameFactoryService {
             const bundled = this.deps.bundle({
               sourceRoot: build.root,
               entrypoint: build.entrypoint,
+              ...(build.profile && {profile: build.profile}),
               allowedRoots: [project.workspace],
               expectedManifestSha256: build.manifestSha256,
             });
@@ -1698,7 +1711,10 @@ export class GameFactoryService {
             root: this.config.workspaceRoot,
             relativePath: `${project.id}/imports`,
           });
+          const profile = project.engine === 'roblox' && /\.rbxlx?$/i.test(input.entrypoint)
+            ? 'roblox_place' as const : undefined;
           const snapshot = this.deps.importSource({
+            ...(profile && {profile}),
             sourceRoot: input.sourceRoot,
             entrypoint: input.entrypoint,
             allowedRoots: policy.sourceRoots,
@@ -1710,6 +1726,7 @@ export class GameFactoryService {
             note: input.note,
           };
           const build: FactoryBuild = {
+            ...(profile && {profile}),
             id: `import-${randomUUID()}`,
             briefRevision: project.brief.revision,
             version: input.version,
@@ -1744,6 +1761,8 @@ export class GameFactoryService {
               .strict(),
             args,
           );
+          if (project.engine === 'roblox' && !/\.rbxlx?$/i.test(input.entrypoint))
+            throw new FactoryError('roblox_place_entrypoint_required');
           const current = lease(input.token);
           if (project.builds.length >= 50)
             throw new FactoryError('build_limit');
@@ -1754,7 +1773,10 @@ export class GameFactoryService {
             root: this.config.workspaceRoot,
             relativePath: `${project.id}/builds`,
           });
+          const profile = project.engine === 'roblox' && /\.rbxlx?$/i.test(input.entrypoint)
+            ? 'roblox_place' as const : undefined;
           const snapshot = this.deps.importSource({
+            ...(profile && {profile}),
             sourceRoot: input.sourceRoot,
             entrypoint: input.entrypoint,
             allowedRoots: [current.workDirectory],
@@ -1765,6 +1787,7 @@ export class GameFactoryService {
             ),
           });
           const build: FactoryBuild = {
+            ...(profile && {profile}),
             id: `build-${randomUUID()}`,
             briefRevision: project.brief.revision,
             version: input.version,
@@ -1800,6 +1823,7 @@ export class GameFactoryService {
                   'platform',
                 ]),
                 criterion: text(2000),
+                studioReport: text(1024).optional(),
                 result: z.enum(['pass', 'fail', 'unknown']),
               })
               .strict(),
@@ -1807,8 +1831,24 @@ export class GameFactoryService {
           );
           const build = project.builds.find((b) => b.id === input.buildId);
           if (!build) throw new FactoryError('build_unavailable');
+          let studioEvidence: Pick<FactoryProject['evidence'][number], 'receiptPath' | 'receiptSha256' | 'assurance'> = {};
+          if (input.studioReport) {
+            const place = build.files.find(file => file.path === build.entrypoint);
+            if (!place || build.profile !== 'roblox_place' || input.kind !== 'technical' ||
+                input.criterion !== 'studio_two_clients' || !input.studioReport.endsWith('.json'))
+              throw new FactoryError('roblox_playtest_report_invalid');
+            if (!this.deps.captureReference) throw new FactoryError('artifact_adapter_unavailable');
+            const report = this.deps.captureReference({
+              sourceRoot: project.workspace,
+              allowedRoots: [project.workspace],
+              entrypoint: input.studioReport,
+              studioPlaytest: {placeSha256: place.sha256, result: input.result},
+            });
+            studioEvidence = {receiptPath: report.path, receiptSha256: report.sha256, assurance: 'studio_reported'};
+          }
           const evidence = {
-            ...input,
+            buildId: input.buildId, kind: input.kind, criterion: input.criterion, result: input.result,
+            ...studioEvidence,
             id: `ev-${randomUUID()}`,
             manifestSha256: build.manifestSha256,
             trust: 'reported' as const,
@@ -1829,22 +1869,35 @@ export class GameFactoryService {
               b.briefRevision === project.brief.revision,
           );
           if (!build) throw new FactoryError('build_not_current');
-          if (project.engine === 'roblox')
-            throw new FactoryError('roblox_requires_studio_verification');
-          if (!this.deps.verifyHtml5)
-            throw new FactoryError('html5_checker_unavailable');
-          const receipt = this.deps.verifyHtml5({
-            sourceRoot: build.root,
-            entrypoint: build.entrypoint,
-            allowedRoots: [project.workspace],
-            expectedManifestSha256: build.manifestSha256,
-          });
-          if (
-            receipt.manifestSha256 !== build.manifestSha256 ||
-            receipt.kind !== 'html5_startup_smoke' ||
-            receipt.trust !== 'host_verified'
-          )
-            throw new FactoryError('check_receipt_mismatch');
+          let receipt: FactoryHtml5CheckReceipt | {
+            kind: 'roblox_place_integrity'; trust: 'host_verified'; status: 'passed';
+            manifestSha256: string; placeSha256: string; limitations: string[];
+          };
+          if (project.engine === 'roblox') {
+            if (build.profile !== 'roblox_place' || !this.deps.capture)
+              throw new FactoryError('roblox_place_capture_required');
+            const snapshot = this.deps.capture({
+              sourceRoot: build.root, entrypoint: build.entrypoint,
+              allowedRoots: [project.workspace], profile: build.profile,
+            });
+            const [place] = snapshot.files;
+            if (snapshot.manifestSha256 !== build.manifestSha256 || snapshot.files.length !== 1 || place.path !== build.entrypoint)
+              throw new FactoryError('check_receipt_mismatch');
+            receipt = {
+              kind: 'roblox_place_integrity', trust:'host_verified', status:'passed',
+              manifestSha256: snapshot.manifestSha256, placeSha256: place.sha256,
+              limitations: ['Place format and bytes checked. Studio play requires a separate report for this hash.'],
+            };
+          } else {
+            if (!this.deps.verifyHtml5) throw new FactoryError('html5_checker_unavailable');
+            receipt = this.deps.verifyHtml5({
+              sourceRoot: build.root, entrypoint: build.entrypoint,
+              allowedRoots: [project.workspace], expectedManifestSha256: build.manifestSha256,
+            });
+            if (receipt.manifestSha256 !== build.manifestSha256 ||
+                receipt.kind !== 'html5_startup_smoke' || receipt.trust !== 'host_verified')
+              throw new FactoryError('check_receipt_mismatch');
+          }
           const receiptId = `check-${randomUUID()}`,
             serialized = peerCanonicalJson(receipt),
             receiptSha256 = createHash('sha256')
@@ -1870,7 +1923,7 @@ export class GameFactoryService {
             buildId: build.id,
             manifestSha256: build.manifestSha256,
             kind: 'technical' as const,
-            criterion: 'html5_startup_smoke',
+            criterion: receipt.kind,
             result:
               receipt.status === 'passed'
                 ? ('pass' as const)
@@ -1881,7 +1934,7 @@ export class GameFactoryService {
             source: source(),
             receiptId,
             receiptSha256,
-            assurance: 'startup_only' as const,
+            assurance: receipt.kind === 'roblox_place_integrity' ? 'place_integrity_only' as const : 'startup_only' as const,
           };
           project.evidence.push(evidence);
           return {
@@ -2021,10 +2074,14 @@ export class GameFactoryService {
               this.deps.capture({
                 sourceRoot: build.root,
                 entrypoint: build.entrypoint,
+                ...(build.profile && {profile: build.profile}),
                 allowedRoots: [project.workspace],
               }).manifestSha256 !== build.manifestSha256
             )
               throw new FactoryError('review_build_changed');
+            if (build.profile === 'roblox_place' && ['qa','package','release'].includes(task.stage) &&
+                !evidence.some(e => e?.buildId === build.id && e.assurance === 'studio_reported' && e.result === 'pass'))
+              throw new FactoryError('roblox_two_client_report_required');
             if (evidence.some((e) => e?.result !== 'pass'))
               throw new FactoryError('review_has_unresolved_evidence');
             if (
@@ -2079,6 +2136,7 @@ export class GameFactoryService {
             this.deps.capture({
               sourceRoot: build.root,
               entrypoint: build.entrypoint,
+              ...(build.profile && {profile: build.profile}),
               allowedRoots: [project.workspace],
             }).manifestSha256 !== build.manifestSha256
           )
@@ -2167,6 +2225,7 @@ export class GameFactoryService {
           const bundle = this.deps.archive({
             sourceRoot: build.root,
             entrypoint: build.entrypoint,
+            ...(build.profile && {profile: build.profile}),
             allowedRoots: [project.workspace],
             expectedManifestSha256: build.manifestSha256,
             destinationFile: path.join(directory, 'game.zip'),
@@ -2416,6 +2475,7 @@ export class GameFactoryService {
 }
 
 type FactoryIoKind =
+  | 'reference_capture'
   | 'capture'
   | 'import'
   | 'directory'
@@ -2514,6 +2574,7 @@ async function executeGameFactoryRequestInner(
       const result = new GameFactoryService(config, new GameFactoryStore(db), {
         verifyCurrentSource: (current) =>
           verifyFactoryCurrentSource(current, getDb()),
+        captureReference: (input) => io<FactoryFile>('reference_capture', input),
         capture: (input) => io<FactoryArtifactSnapshot>('capture', input),
         importSource: (input) => io<FactoryArtifactSnapshot>('import', input),
         ensureDirectory: (input) => io<string>('directory', input),
@@ -2609,7 +2670,14 @@ async function executeGameFactoryRequestInner(
     // Транзакция уже отменена. Долгий обход файлов не держит SQLite lock и
     // выполняется дочерним процессом, не блокируя event loop Скуби.
     const result =
-      pending.kind === 'audio_observe'
+      pending.kind === 'reference_capture'
+        ? await captureFactoryReferenceFileAsync(
+            pending.input as Parameters<typeof captureFactoryReferenceFileAsync>[0],
+          ).catch((error: unknown) => {
+            if (error instanceof FactoryError) throw error;
+            throw new FactoryError('reference_file_unavailable');
+          })
+        : pending.kind === 'audio_observe'
         ? await observePersistedFactoryAudio((pending.input as {actor:FactoryActor}).actor,
             (pending.input as {jobId:string}).jobId,(pending.input as {poll:boolean}).poll)
         : pending.kind === 'audio_import'
