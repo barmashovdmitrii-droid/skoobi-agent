@@ -2,6 +2,24 @@
 
 All notable public changes to Skoobi Agent are documented here.
 
+## 2.4.0
+
+- Recover a prepared Telegram reply after an interrupted delivery without
+  running the task again. The host checks the owner, profile and original
+  inputs and invalidates the saved reply after a correction or cancellation.
+  A local report shows how many prepared replies have a transport acknowledgement.
+- Save the next step and acceptance criteria with a work item. Changing the
+  requirements invalidates checks from the earlier revision. Project-scoped
+  recall now has a separate evaluation corpus.
+- Flag uncertain dates, times and other meaningful differences between speech
+  recognition passes. A synthetic audio evaluation can be run locally.
+- Ship the game factory in the stable release. Capture a Roblox build and
+  attach a two-client Studio report to the exact place file that was tested.
+  Peer workers can record delivery receipts locally.
+- Record the requested model and the model observed in the current Codex turn
+  separately. An unobserved model stays unknown in usage reports.
+- Refresh the runtime dependency lockfiles for Node.js 22.
+
 ## 2.3.0
 
 - Added an optional coordinated macOS worker with durable task identities,

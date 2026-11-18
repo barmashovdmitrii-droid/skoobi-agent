@@ -16,7 +16,7 @@ import {
   resolveTelegramMediaScope, messagesBeforePendingMedia,
   cancelMediaForDirectOwnerStop, dispatchMaterializedMedia, latestPendingMediaStop,
 } from './media-intake-host.js';
-import { getOrCreateOperationTrace, pruneOperationTraces, queueOperationTrace, recoverDeadOwnerOperationTraces } from './operation-trace-store.js';
+import { findOperationTraceForMessage, getOrCreateOperationTrace, pruneOperationTraces, queueOperationTrace, recoverDeadOwnerOperationTraces } from './operation-trace-store.js';
 import { defaultArtifactAcceptanceHost } from './artifact-acceptance.js';
 import { createArtifactAcceptanceDeliveryPolicy } from './artifact-acceptance-policy.js';
 import { createPeerInboxPump, loadPeerBridgeConfig, peerInboxPromptContext, type PeerBridgeConfig } from './peer-inbox.js';
@@ -104,6 +104,7 @@ import {
   getRecentImageJob,
   getRegisteredGroup,
   getRouterState,
+  scrubExpiredReadyTextBodies,
   getTaskById,
   initDatabase,
   INITIAL_INGESTION_CURSOR,
@@ -152,6 +153,7 @@ import {
   noteTimeoutContinuationFailureDelivered, readTimeoutContinuation,
   settleTimeoutContinuation, stageTimeoutContinuation, timeoutContinuationNotices, TIMEOUT_CONTINUATION_NOTE,
 } from './timeout-continuation.js';
+import { readyTextFinalJournal, recoverReadyTextFinal, isExplicitReadyTextRequest, readyTextCanSend, READY_TEXT_RECOVERY_WINDOW, type PriorFinishedWork } from './ready-text-final.js';
 import { channelConnectivity, startHeartbeat } from './heartbeat.js';
 import {
   ipcDocumentHistoryPlaceholder,
@@ -167,6 +169,7 @@ import {
 } from './memory-provenance.js';
 import {
   escapeXml,
+  formatOutbound,
   findChannel,
   formatMessages,
   prependRecentConversationContext,
@@ -6203,6 +6206,11 @@ export function _setRegisteredGroups(
   registeredGroups = groups;
 }
 
+/** Test harness for exercising cold-start recovery with isolated channels. */
+export { loadState as _loadStateForTest, recoverPendingMessages as _recoverPendingMessagesForTest, processGroupMessages };
+export function _setChannelsForTest(value: Channel[]): void { channels.splice(0, channels.length, ...value); }
+export function _queueForTest() { return queue; }
+
 export function loadLegacyDefaultTelegramUserMemoryContext(
   chatJid: string,
   senderId: string | null | undefined,
@@ -6541,6 +6549,32 @@ export function triggerBatchDecision(
       };
 }
 
+/** Revalidate a direct owner's current authority at both capture and recovery. */
+function readyFinalPrincipal(chatJid: string, group: RegisteredGroup, messages: NewMessage[]): string | undefined {
+  if (!group.isMain || !shouldAutoRouteAgentOutput(group.agentConfig) ||
+      isMultiSenderChat(chatJid) || !isTrustedOwnerContextRequest({ chatJid, messages })) return;
+  const tenant = currentTenantRegistry().resolveJid(chatJid);
+  if (tenant && (tenant.mode !== 'owner' || tenant.folder !== group.folder)) return;
+  if (chatJid.endsWith('@s.whatsapp.net')) return JSON.stringify([tenant?.tenant_id, chatJid]);
+  const identity = messages[0]?.sender_identity;
+  if (!identity || messages.some(m => m.sender_identity?.bot_id !== identity.bot_id ||
+      m.sender_identity?.persona_id !== identity.persona_id)) return;
+  const tgTenant = currentTenantRegistry().resolveTelegramJid(chatJid);
+  if (tgTenant && safeTelegramBotId(tgTenant.bot_id) !== safeTelegramBotId(identity.bot_id)) return;
+  if (!createTelegramSenderIdentity({ chatId: identity.chat_id, fromId: identity.telegram_user_id,
+    botId: identity.bot_id, ownerAllowlist: loadOwnerAllowlistFromEnv() }).is_owner_sender) return;
+  return JSON.stringify([tenant?.tenant_id, chatJid, identity.identity_id, identity.bot_id, identity.persona_id]);
+}
+
+let nextReadyTextRetentionAt = 0;
+
+function advanceReadyFinalCursor(chatJid: string, cursor: string): void {
+  if ((lastAgentTimestamp[chatJid] || INITIAL_INGESTION_CURSOR) < cursor) {
+    lastAgentTimestamp[chatJid] = cursor;
+    saveState();
+  }
+}
+
 async function processGroupMessagesInner(
   chatJid: string,
   router: MessageRouter,
@@ -6559,8 +6593,29 @@ async function processGroupMessagesInner(
 
   const isMainGroup = group.isMain === true;
 
-  const sinceTimestamp =
-    lastAgentTimestamp[chatJid] || INITIAL_INGESTION_CURSOR;
+  if (Date.now() >= nextReadyTextRetentionAt) {
+    scrubExpiredReadyTextBodies(Date.now() - READY_TEXT_RECOVERY_WINDOW);
+    nextReadyTextRetentionAt = Date.now() + 3600_000;
+  }
+  const finalJournal = readyTextFinalJournal({ get: getRouterState, set: setRouterState }, chatJid, group.folder,
+    (sourceId, stage) => {
+      const channel = eventChannelForJid(chatJid) ?? 'other';
+      const tenant = currentTenantRegistry().resolveTelegramJid(chatJid);
+      const trace = findOperationTraceForMessage(getDb(), { tenantId: tenant?.tenant_id || `channel:${channel}`, chatId: chatJid }, sourceId, channel);
+      startOperationTraceStage(trace, stage).finish('succeeded');
+    });
+  const readyAccess = {
+    readSources: (ids: string[]) => getMessagesByIds(chatJid, ids),
+    readAfter: (cursor: string) => getMessagesSince(chatJid, cursor, ASSISTANT_NAME, 201),
+    principal: (rows: NewMessage[]) => {
+      const current = registeredGroups[chatJid];
+      if (current?.folder === group.folder) return readyFinalPrincipal(chatJid, current, rows);
+    },
+    acceptsPing: isActiveRunPingText,
+    pendingMedia: () => Boolean(earliestMediaIntakeCursor(getDb(), chatJid)),
+    held: () => Boolean(telegramAgentHold(chatJid)) || queue.isCancelRequested(chatJid),
+  };
+  let previousWork: PriorFinishedWork | undefined;
   const groupIpcDir = resolveGroupIpcPath(group.folder);
   const timeoutStore = { get: getRouterState, set: setRouterState };
   const receiptKey = deferredDeliveryReceiptKey(chatJid);
@@ -6585,41 +6640,29 @@ async function processGroupMessagesInner(
         (entries) => setRouterState(receiptKey,appendDeferredDeliveryReceipts(getRouterState(receiptKey),entries)));
       continue;
     }
+    const completed = finalJournal.read();
+    if (record.state === 'running' && completed?.checkpointFiles?.includes(checkpoint.name) &&
+        checkpoint.messageIds.every(id => completed.sourceIds.includes(id))) {
+      retireTimeoutContinuationFinal(groupIpcDir, timeoutStore, record.requestKey);
+      continue;
+    }
     if (record.state === 'delivery' && record.finalText) {
-      const sourceMessages = getMessagesByIds(chatJid,record.messageIds);
-      const sourceCursor = record.handledThroughCursor || (sourceMessages.at(-1) && messageCursor(sourceMessages.at(-1)!));
-      // A new user message wins over an undelivered cached answer. Preserve
-      // the answer as evidence, but neither send it stale nor rerun its actions.
-      if (sourceCursor && getMessagesSince(chatJid,sourceCursor,ASSISTANT_NAME).length) {
-        // Retire exact covered IDs durably before moving any checkpoint. A
-        // crash halfway through archiving must not execute an already handled correction.
-        supersededTimeoutIds.push(...(record.handledMessageIds ?? record.messageIds));
-        setRouterState(supersededTimeoutIdsKey,JSON.stringify([...new Set(supersededTimeoutIds)].slice(-5000)));
-        lastAgentTimestamp[chatJid] = cursorAfterConfirmedSend(lastAgentTimestamp[chatJid] || INITIAL_INGESTION_CURSOR,sourceCursor);
-        saveState();
-        retireTimeoutContinuationFinal(groupIpcDir,timeoutStore,record.requestKey);
-        continue;
+      const ids = [...new Set(record.handledMessageIds ?? record.messageIds)];
+      const sources = getMessagesByIds(chatJid, ids);
+      const sourceCursor = record.handledThroughCursor || sources.at(-1)?.ingestion_cursor;
+      const principal = readyAccess.principal(sources);
+      const current = finalJournal.read();
+      // Older timeout checkpoints may already have reached the transport.
+      // Import a provably scoped final, then wait for a fresh request.
+      const age = Date.now() - Date.parse(sources.at(-1)?.timestamp ?? '');
+      if (principal && sources.length === ids.length && sources.at(-1)?.ingestion_cursor === sourceCursor &&
+          age >= 0 && age < READY_TEXT_RECOVERY_WINDOW && sourceCursor && (!current || current.sourceCursor < sourceCursor)) {
+        finalJournal.stage(principal, sources, record.finalText, record.finalizedInputFiles);
       }
-      try {
-        const delivered = await router.route({ chatJid, text: record.finalText,
-          triggerType: 'agent-response', groupFolder: group.folder,
-          meta: { kind: 'timeout_continuation_delivery_retry' } });
-        if (!delivered) return false;
-        try {
-          settleTimeoutContinuation(timeoutStore, record.requestKey, true);
-          setRouterState(receiptKey,appendDeferredDeliveryReceipts(getRouterState(receiptKey),[{name:record.fileName,messageIds:record.handledMessageIds ?? record.messageIds,recoverable:true}]));
-          if (record.handledThroughCursor) {
-            lastAgentTimestamp[chatJid] = cursorAfterConfirmedSend(lastAgentTimestamp[chatJid] || INITIAL_INGESTION_CURSOR,record.handledThroughCursor);
-            saveState();
-          }
-          acknowledgeDeferredInputCheckpoints(groupIpcDir, chatJid, record.finalizedInputFiles?.length ? record.finalizedInputFiles : [record.fileName],
-            (entries) => setRouterState(receiptKey, appendDeferredDeliveryReceipts(getRouterState(receiptKey), entries)));
-        } catch (err) {
-          quarantineConfirmedInputs(record.finalizedInputFiles?.length ? record.finalizedInputFiles : [record.fileName]);
-          logger.error({err,chatJid},'Cached final delivered; receipt failed, execution quarantined');
-        }
-        try { storeBotReply(chatJid, delivered); } catch (err) { logger.warn({err,chatJid}, 'Delivered continuation history write failed'); }
-      } catch (err) { logger.warn({err,chatJid}, 'Cached continuation delivery remains pending'); return false; }
+      supersededTimeoutIds.push(...ids);
+      setRouterState(supersededTimeoutIdsKey,JSON.stringify([...new Set(supersededTimeoutIds)].slice(-5000)));
+      if (sourceCursor) advanceReadyFinalCursor(chatJid, sourceCursor);
+      retireTimeoutContinuationFinal(groupIpcDir,timeoutStore,record.requestKey);
     } else if (record.state === 'running' || record.state === 'blocked') {
       blockTimeoutContinuation(groupIpcDir, timeoutStore, record.requestKey);
       // These exact originals have already had their sole continuation attempt.
@@ -6629,6 +6672,51 @@ async function processGroupMessagesInner(
       if (last) { lastAgentTimestamp[chatJid] = cursorAfterConfirmedSend(lastAgentTimestamp[chatJid] || INITIAL_INGESTION_CURSOR, messageCursor(last)); saveState(); }
     }
   }
+  const completedRecord = finalJournal.read();
+  if (completedRecord?.checkpointFiles?.length) {
+    // A saved final owns its exact registered deferred inputs even if the
+    // channel ACK was lost. Never offer those files to a second runner.
+    const covered = new Set(completedRecord.sourceIds);
+    const names = readDeferredInputCheckpoints(groupIpcDir, chatJid)
+      .filter(entry => completedRecord.checkpointFiles?.includes(entry.name) &&
+        entry.recoverable && entry.messageIds.every(id => covered.has(id)))
+      .map(entry => entry.name);
+    if (names.length) {
+      supersededTimeoutIds.push(...covered);
+      setRouterState(supersededTimeoutIdsKey,JSON.stringify([...new Set(supersededTimeoutIds)].slice(-5000)));
+      archiveSupersededContinuationInputs(groupIpcDir, names);
+    }
+  }
+  // Resolve an already-completed task before any runner, prompt, or fast status
+  // path. A held chat stays held. Recovery routes text only; no attachments,
+  // speech synthesis or task tools are invoked.
+  if (finalJournal.read()) {
+    if (telegramAgentHold(chatJid)) return true;
+    const recovered = await recoverReadyTextFinal({
+      journal: finalJournal,
+      ...readyAccess,
+      consumedThrough: lastAgentTimestamp[chatJid] || INITIAL_INGESTION_CURSOR,
+      isStop: text => isCodexDesktopStopCommandText(stripMediaPlaceholderForVoiceIntent(text)),
+      prior: work => { previousWork = work; },
+      advance: cursor => advanceReadyFinalCursor(chatJid, cursor),
+      send: async (text, canSend) => {
+        try {
+          return await router.route({ chatJid, groupFolder: group.folder, text,
+            triggerType: 'agent-response', meta: { kind: 'requested_saved_final' } }, canSend);
+        } catch (err) {
+          logger.warn({ err, chatJid }, 'Requested saved final has no channel acknowledgement');
+          return null;
+        }
+      },
+      acknowledged: text => {
+        try { storeBotReply(chatJid, text); } catch (err) { logger.warn({ err, chatJid }, 'Could not record saved final in history'); }
+      },
+    });
+    if (recovered === 'handled') return true;
+  }
+
+  const sinceTimestamp =
+    lastAgentTimestamp[chatJid] || INITIAL_INGESTION_CURSOR;
   for (const record of timeoutContinuationNotices(groupIpcDir, timeoutStore)) {
     try {
       const delivered = await router.route({chatJid,
@@ -6774,6 +6862,7 @@ async function processGroupMessagesInner(
     }, missedMessages.map(message => message.id), eventChannelForJid(chatJid) ?? 'other');
   } catch { /* Optional diagnostics must not stop admitted work. */ }
   const originalTargetCursor = targetCursor;
+  const readyOwnerAtAdmission = readyAccess.principal(missedMessages);
   // «стоп», пришедший, когда ничего не выполнялось, шёл сюда и уходил модели
   // как обычная задача: остановку ловил только опрос активного хода.
   const idleStop = await maybeHandleCodexDesktopStopCommand({
@@ -6813,6 +6902,15 @@ async function processGroupMessagesInner(
     anonymizeSenderNames: !isMainGroup,
   });
   const currentTurnPrompt = prompt;
+  if (previousWork && readyAccess.principal(missedMessages) === previousWork.principal &&
+      missedMessages.some(m => m.id === previousWork?.messageId)) {
+    prompt = [
+      '<completed_prior_work>',
+      'Предыдущее действие уже выполнено. Обработай новые сообщения с учётом результата. Не выполняй исходное действие повторно.',
+      '<saved_result>' + escapeXml(previousWork.text) + '</saved_result>',
+      '</completed_prior_work>', prompt,
+    ].join('\n');
+  }
   // Было 50. Замер на боевых ходах: этот блок — 20 849 символов, 30-37 %
   // промпта, при том что нового относительно прошлого хода в нём в среднем 2,3
   // сообщения (1217 символов) — остальное модель уже видела в этом же треде.
@@ -7948,6 +8046,78 @@ async function processGroupMessagesInner(
     });
   }
 
+  let finalDeliveryOutcome: 'confirmed' | 'unconfirmed' | undefined;
+  // Live gateway and the two reserve modes return through separate handlers.
+  // Each must durably claim its own admitted input before ANY channel operation.
+  const deliverProviderAnswer = async (
+    text: string, meta: Record<string, unknown>, voice: boolean,
+    sources: NewMessage[], eligible = true,
+  ): Promise<{text: string; mode: 'voice' | 'text'; checkpointed: boolean} | null> => {
+    const visible = formatOutbound(text);
+    const principal = eligible && autoRoute && visible && replyJid === chatJid &&
+      !startedWithDeferredCheckpoint && !pendingTimeoutKeys.length &&
+      (sources === missedMessages ? readyOwnerAtAdmission : readyAccess.principal(sources));
+    const record = principal && sources.at(-1)?.ingestion_cursor
+      ? finalJournal.stage(principal, sources, visible, undefined, true) : undefined;
+    const canSend = record ? () => readyTextCanSend(readyAccess, finalJournal, record) : undefined;
+    if (record) {
+      finalDeliveryOutcome = 'unconfirmed';
+      advanceReadyFinalCursor(chatJid, record.sourceCursor);
+    }
+    // A crash while generating audio can recover the saved text immediately.
+    // Once a channel call may have begun, only a fresh request can resend it.
+    const claimTransport = () => {
+      if (record?.unattempted) {
+        delete record.unattempted;
+        finalJournal.save(record);
+      }
+    };
+    let mode: 'voice' | 'text' = 'text';
+    let delivered: string | null = null;
+    try {
+      if (canSend && !canSend()) return null;
+      if (voice) {
+        let attemptedVoice = false;
+        const control = canSend ? {canSend, transportAttempted: () => { claimTransport(); attemptedVoice = true; }} : undefined;
+        const ok = await router.sendVoice(replyJid, text, control);
+        if (ok) {
+          mode = 'voice';
+          delivered = visible;
+        } else if (attemptedVoice || (canSend && !canSend())) {
+          return null;
+        } else {
+          recordEventSafely({chatJid, type:'error', actor:'system', senderId:senderChannelUserId,
+            payload:{kind:meta.kind === 'skoobi_live' ? 'skoobi_live_voice_delivery_failed' : 'codex_reserve_voice_delivery_failed',
+              reply_jid:replyJid, group_folder:group.folder, trace_id:meta.trace_id, fallback_to_text:true}});
+        }
+      }
+      if (!delivered) {
+        if (canSend && !canSend()) return null;
+        claimTransport();
+        delivered = await router.route({chatJid:replyJid, text, triggerType:'agent-response',
+          groupFolder:group.folder, meta}, canSend);
+      }
+      if (!delivered) {
+        if (record) return null;
+        throw new Error('Provider answer was not delivered');
+      }
+    } catch (error) {
+      if (!record) throw error;
+      logger.warn({err:error,chatJid}, 'Finished provider answer retained after missing transport acknowledgement');
+      return null;
+    }
+    if (record && finalJournal.current(record)) {
+      delete record.unattempted;
+      record.confirmed = true;
+      record.text = delivered;
+      finalJournal.save(record);
+      finalDeliveryOutcome = 'confirmed';
+    }
+    try { storeBotReply(replyJid, delivered); }
+    catch (error) { logger.warn({err:error,chatJid}, 'Could not save acknowledged provider reply in history'); }
+    return {text:delivered, mode, checkpointed:Boolean(record)};
+  };
+
   if (
     tenantForRun &&
     liveModeSelected &&
@@ -8233,50 +8403,15 @@ async function processGroupMessagesInner(
             : liveRun.answerText,
         );
         const liveAnswerText = quotaDegradedNotice ? `${quotaDegradedNotice}\n\n${rawAnswerText}` : rawAnswerText;
-        let deliveredText: string | null = null;
-        let deliveryMode: 'text' | 'voice' = 'text';
-        if (voiceReplyRequested) {
-          const voiceOk = await router.sendVoice(replyJid, liveAnswerText);
-          if (voiceOk) {
-            deliveredText = liveAnswerText;
-            deliveryMode = 'voice';
-          } else {
-            recordEventSafely({
-              chatJid,
-              type: 'error',
-              actor: 'system',
-              senderId: senderChannelUserId,
-              payload: {
-                kind: 'skoobi_live_voice_delivery_failed',
-                reply_jid: replyJid,
-                group_folder: group.folder,
-                trace_id: liveRun.traceId,
-                fallback_to_text: true,
-              },
-            });
-          }
-        }
-        if (!deliveredText) {
-          deliveredText = await router.route({
-            chatJid: replyJid,
-            text: liveAnswerText,
-            triggerType: 'agent-response',
-            groupFolder: group.folder,
-            meta: {
-              kind: 'skoobi_live',
-              trace_id: liveRun.traceId,
-              voice_reply_requested: voiceReplyRequested,
-            },
-          });
-        }
-        if (!deliveredText) {
-          throw new Error('Skoobi live answer was not delivered');
-        }
-        storeBotReply(replyJid, deliveredText);
+        const sent = await deliverProviderAnswer(liveAnswerText, {
+          kind:'skoobi_live', trace_id:liveRun.traceId, voice_reply_requested:voiceReplyRequested,
+        }, voiceReplyRequested, missedMessages);
+        if (!sent) return true;
+        const {text:deliveredText, mode:deliveryMode} = sent;
 
         const currentCursor =
           lastAgentTimestamp[chatJid] || INITIAL_INGESTION_CURSOR;
-        const piped = lastPipedTimestamp[chatJid] || '';
+        const piped = sent.checkpointed ? '' : lastPipedTimestamp[chatJid] || '';
         const newCursor = cursorAfterConfirmedSend(
           currentCursor,
           targetCursor,
@@ -8766,7 +8901,7 @@ async function processGroupMessagesInner(
   };
   // Links to files on this Mac in the final answer (C38): the file itself is
   // attached before the text, which says «(файл выше)» or keeps just the name.
-  const attachLocalFileLinks = async (text: string): Promise<string> => {
+  const attachLocalFileLinks = async (text: string, canSend?: () => boolean): Promise<string> => {
     if (!text.includes('](')) return text;
     try {
       const rewrite = await rewriteLocalFileLinks({
@@ -8774,6 +8909,7 @@ async function processGroupMessagesInner(
         groupFolder: agentGroup.folder,
         chatJid: replyJid,
         router,
+        canSend,
         // The run's trust, not the registration: a non-owner member of a
         // multi-sender main chat gets names only, as IPC would refuse him.
         isMain: chatTurnMayAttachLocalFiles({
@@ -8881,6 +9017,7 @@ async function processGroupMessagesInner(
         chatHistoryGrant,
       },
       async (result) => {
+        if (finalDeliveryOutcome === 'unconfirmed') return;
         terminalProgressKey = String(activeRunProgress[chatJid]?.turnStartedAt ?? initialAgentRunStartedAt);
         // Streaming output callback — called for each agent result
         if (lateImages) {
@@ -8982,8 +9119,53 @@ async function processGroupMessagesInner(
             // unhandled rejection и зависают group-queue до рестарта сервиса.
             // Здесь ловим, логируем, оставляем cursor НЕ продвинутым — следующий
             // recovery/loop попробует доставить заново.
+            let cached: ReturnType<typeof finalJournal.stage> | undefined;
             try {
-              const preparedText = duplicatesInterim ? userText : await attachLocalFileLinks(userText);
+              if (!duplicatesInterim && result.status === 'success' && replyJid === chatJid) {
+                const timeoutNames = activeTimeoutKeys.flatMap(key =>
+                  readTimeoutContinuation(timeoutStore, key)?.fileName ?? []);
+                const finalized = new Set([...(result.finalizedInputFiles ?? []), ...timeoutNames]);
+                const checkpoints = finalized.size ? readDeferredInputCheckpoints(groupIpcDir, chatJid)
+                  .filter(entry => finalized.has(entry.name) && entry.recoverable) : [];
+                const through = initialBatchDelivered ? lastPipedTimestamp[chatJid] : targetCursor;
+                const from = initialBatchDelivered ? lastAgentTimestamp[chatJid] : previousCursor;
+                const rows = through && from && through > from ? getMessagesSince(chatJid, from, ASSISTANT_NAME, 1000)
+                  .filter(row => messageCursor(row) <= through) : [];
+                if (checkpoints.length) {
+                  const ids = [...new Set([...missedMessages.map(m => m.id),
+                    ...checkpoints.flatMap(entry => entry.messageIds)])];
+                  const sources = getMessagesByIds(chatJid, ids);
+                  const principal = readyAccess.principal(sources);
+                  if (principal && sources.length === ids.length && checkpoints.length === finalized.size) {
+                    cached = finalJournal.stage(principal, sources, formatOutbound(userText), checkpoints.map(entry => entry.name), true);
+                  }
+                } else if (!startedWithDeferredCheckpoint && !finalized.size && through) {
+                  if (readyOwnerAtAdmission && !initialBatchDelivered && through === originalTargetCursor) {
+                    cached = finalJournal.stage(readyOwnerAtAdmission, missedMessages, formatOutbound(userText), undefined, true);
+                  } else if (rows.at(-1)?.ingestion_cursor === through) {
+                    const principal = readyAccess.principal(rows);
+                    if (principal) cached = finalJournal.stage(principal, rows, formatOutbound(userText), undefined, true);
+                  }
+                }
+                if (cached) finalDeliveryOutcome = 'unconfirmed';
+              }
+              const record = cached;
+              const canSend = record ? () => readyTextCanSend(readyAccess, finalJournal, record) : undefined;
+              const stopSuperseded = () => {
+                if (!record || !canSend || canSend()) return false;
+                advanceReadyFinalCursor(chatJid, record.sourceCursor);
+                if (readyAccess.held() && finalJournal.current(record)) finalJournal.clear();
+                queue.closeStdin(chatJid);
+                return true;
+              };
+              if (stopSuperseded()) return;
+              const preparedText = duplicatesInterim ? userText : await attachLocalFileLinks(userText, canSend);
+              if (stopSuperseded()) return;
+              if (cached) {
+                cached.text = formatOutbound(preparedText);
+                delete cached.unattempted;
+                finalJournal.save(cached);
+              }
               if (result.status === 'success') for (const key of activeTimeoutKeys) {
                 const fileName = readTimeoutContinuation(timeoutStore,key)?.fileName;
                 const coveredNames = [...new Set([...(Array.isArray(result.finalizedInputFiles) ? result.finalizedInputFiles : []), ...(fileName ? [fileName] : [])])];
@@ -9002,8 +9184,20 @@ async function processGroupMessagesInner(
                     triggerType: 'agent-response',
                     groupFolder: group.folder,
                     meta: { progressFinal: true, progressKey: terminalProgressKey },
-                  });
-              if (!deliveredText && !duplicatesInterim) return;
+                  }, canSend);
+              if (!deliveredText && !duplicatesInterim) {
+                if (cached) {
+                  advanceReadyFinalCursor(chatJid, cached.sourceCursor);
+                  queue.closeStdin(chatJid);
+                }
+                return;
+              }
+              if (cached && deliveredText && finalJournal.current(cached)) {
+                cached.confirmed = true;
+                cached.text = deliveredText;
+                finalJournal.save(cached);
+                finalDeliveryOutcome = 'confirmed';
+              }
               if (deliveredText) {
                 try { storeBotReply(replyJid, deliveredText); }
                 catch (err) { logger.warn({err, chatJid}, 'Delivered final could not be recorded in chat history; preserving delivery acknowledgement'); }
@@ -9068,6 +9262,12 @@ async function processGroupMessagesInner(
               }
               initialBatchDelivered = true;
             } catch (err) {
+              if (cached) {
+                // Execution is complete even when the remote ACK was lost.
+                // A new status request can claim only the saved text.
+                advanceReadyFinalCursor(chatJid, cached.sourceCursor);
+                queue.closeStdin(chatJid);
+              }
               recordEventSafely({
                 chatJid,
                 type: 'error',
@@ -9081,7 +9281,7 @@ async function processGroupMessagesInner(
               });
               logger.warn(
                 { err, jid: replyJid, groupFolder: group.folder },
-                'Outbound delivery failed; cursor not advanced, will retry on next run',
+                cached ? 'Final text retained; waiting for a new owner delivery request' : 'Outbound delivery failed without ordinary final checkpoint',
               );
             }
           }
@@ -9345,6 +9545,15 @@ async function processGroupMessagesInner(
     if (idleTimer) clearTimeout(idleTimer);
   }
   unloggedRunCost = agentResult;
+  if (finalDeliveryOutcome === 'unconfirmed' && (agentResult.status === 'error' || hadError)) {
+    // A runner can exit abnormally after producing its final. Neither a new
+    // provider nor timeout continuation may repeat work already checkpointed.
+    logFailedTurn();
+    recordEventSafely({chatJid, type:'session_finished', actor:'system', senderId:senderChannelUserId,
+      payload:{group_folder:group.folder, status:'error', final_delivery:'unconfirmed'}});
+    delete lastPipedTimestamp[chatJid];
+    return true;
+  }
 
   if (imageJobContext) {
     const imageResult = await finalizeCodexImageJob({
@@ -9430,6 +9639,15 @@ async function processGroupMessagesInner(
     return finishCancelledTurn();
   }
 
+  const deliverFallbackTurn = (text:string, meta:Record<string,unknown>, eligible:boolean) => {
+    const through = lastPipedTimestamp[chatJid];
+    const sources = initialBatchDelivered && through
+      ? getMessagesSince(chatJid, lastAgentTimestamp[chatJid], ASSISTANT_NAME, 1000)
+          .filter(row => messageCursor(row) <= through)
+      : initialBatchDelivered ? [] : missedMessages;
+    return deliverProviderAnswer(text, meta, false, sources, eligible &&
+      (!initialBatchDelivered || sources.at(-1)?.ingestion_cursor === through));
+  };
   if (
     ownerCodexFullAgentPrimaryActive &&
     !ownerCodexFullAgentProviderSucceeded &&
@@ -9534,6 +9752,7 @@ async function processGroupMessagesInner(
       },
     });
 
+    let claudeFinalRetained = false;
     hadError = false;
     legacyAnswerParts.length = 0;
     if (!inboundOnly) {
@@ -9567,6 +9786,7 @@ async function processGroupMessagesInner(
           chatHistoryGrant,
         },
         async (result) => {
+          if (claudeFinalRetained) return;
           if (result.result) {
             const raw =
               typeof result.result === 'string'
@@ -9577,38 +9797,32 @@ async function processGroupMessagesInner(
             if (userText) legacyAnswerParts.push(userText);
             if (userText.trim() && autoRoute) {
               try {
-                const deliveredText = await router.route({
-                  chatJid: replyJid,
-                  text: userText,
-                  triggerType: 'agent-response',
-                  groupFolder: group.folder,
-                  meta: {
-                    kind: 'owner_codex_full_agent_claude_fallback',
-                    primary_provider: DEFAULT_PROVIDER_FAILOVER_POLICY.primary,
-                    fallback_provider:
-                      DEFAULT_PROVIDER_FAILOVER_POLICY.fallback,
-                    reason,
-                  },
-                });
-                if (deliveredText) {
-                  storeBotReply(replyJid, deliveredText);
-                  outputSentToUser = true;
-                  queue.noteUserVisibleOutput(chatJid);
-                  const turn = cursorAfterRunnerTurn({
-                    initialBatchDelivered,
-                    currentCursor: lastAgentTimestamp[chatJid],
-                    targetCursor,
-                    pipedCursor: lastPipedTimestamp[chatJid],
-                  });
-                  if (lastAgentTimestamp[chatJid] !== turn.cursor) {
-                    lastAgentTimestamp[chatJid] = turn.cursor;
-                    saveState();
-                  }
-                  if (turn.foldedPiped) {
-                    delete lastPipedTimestamp[chatJid];
-                  }
-                  initialBatchDelivered = true;
+                const sent = await deliverFallbackTurn(userText, {
+                  kind:'owner_codex_full_agent_claude_fallback',
+                  primary_provider:DEFAULT_PROVIDER_FAILOVER_POLICY.primary,
+                  fallback_provider:DEFAULT_PROVIDER_FAILOVER_POLICY.fallback, reason,
+                }, result.status === 'success' && !friendly && !result.finalizedInputFiles?.length);
+                if (!sent) {
+                  claudeFinalRetained = true;
+                  queue.closeStdin(chatJid);
+                  return;
                 }
+                outputSentToUser = true;
+                queue.noteUserVisibleOutput(chatJid);
+                const turn = cursorAfterRunnerTurn({
+                  initialBatchDelivered,
+                  currentCursor: lastAgentTimestamp[chatJid],
+                  targetCursor,
+                  pipedCursor: lastPipedTimestamp[chatJid],
+                });
+                if (lastAgentTimestamp[chatJid] !== turn.cursor) {
+                  lastAgentTimestamp[chatJid] = turn.cursor;
+                  saveState();
+                }
+                if (turn.foldedPiped) {
+                  delete lastPipedTimestamp[chatJid];
+                }
+                initialBatchDelivered = true;
               } catch (err) {
                 recordEventSafely({
                   chatJid,
@@ -9648,6 +9862,7 @@ async function processGroupMessagesInner(
         });
       }
     }
+    if (claudeFinalRetained) return true;
   }
 
   const runStatus =
@@ -9684,8 +9899,11 @@ async function processGroupMessagesInner(
   ) {
     const sessionId = eventSessionIdForTenant(tenantForRun);
     const deliveredText = legacyAnswerParts.join('\n\n');
-    const gatewayConfig = loadModelGatewayConfig();
-    const requestedModel = gatewayConfig.codex?.model || 'gpt-5.6-sol';
+    const modelIdentity = {
+      requested_model: agentResult.codexTurn?.requestedModel ?? null,
+      effective_model: agentResult.codexTurn?.observedModel ?? null,
+      attempt_id: currentOperationTrace()?.attemptId ?? null,
+    };
     const traceId = recordModelTrace({
       tenant: tenantForRun,
       senderId: senderChannelUserId,
@@ -9708,8 +9926,7 @@ async function processGroupMessagesInner(
       payload: {
         provider: 'codex_cli',
         provider_model: 'codex-subscription',
-        requested_model: requestedModel,
-        effective_model: requestedModel,
+        ...modelIdentity,
         usage_source: 'unavailable_or_estimated',
         // Overrides usage_source with the runner's own account of the turn
         // and adds used_percent, the applied service_tier / reasoning_effort,
@@ -9735,8 +9952,7 @@ async function processGroupMessagesInner(
         runtime: 'codex_full_agent',
         provider: 'codex_cli',
         provider_model: 'codex-subscription',
-        requested_model: requestedModel,
-        effective_model: requestedModel,
+        ...modelIdentity,
         codex_full_agent_primary: true,
         codex_owner_full_agent_mode:
           liveConfig.codexOwnerFullAgentMode || 'auto',
@@ -9933,6 +10149,7 @@ async function processGroupMessagesInner(
         let reserveErrorText: string | undefined;
         let reserveDelivered = false;
         let reserveRouteFailed = false;
+        let reserveFinalRetained = false;
         let reserveResult: RunAgentResult | undefined;
         const reserveFullAgentCircuitOutcome =
           createProviderCircuitOutcomeLatch<ProviderFailoverReason>({
@@ -10035,46 +10252,38 @@ async function processGroupMessagesInner(
                 reserveFullAgentCircuitOutcome.settleSuccess();
               }
               if (!text.trim() || !autoRoute) return;
-              const outboundText = text;
+              if (reserveFinalRetained) return;
               try {
-                const deliveredText = await router.route({
-                  chatJid: replyJid,
-                  text: outboundText,
-                  triggerType: 'agent-response',
-                  groupFolder: group.folder,
-                  meta: {
-                    kind: 'codex_reserve_fallback',
-                    mode: 'full_agent',
-                    trace_id: reserveTraceId,
-                    primary_runtime: 'claude_sdk',
-                    voice_reply_requested: voiceReplyRequested,
-                  },
-                });
-                if (deliveredText) {
-                  storeBotReply(replyJid, deliveredText);
-                  reserveDelivered = true;
-                  outputSentToUser = true;
-                  // Mirror the primary path's cursor semantics exactly: the
-                  // first delivered turn answers the initial batch; a LATER
-                  // delivered turn answers piped follow-ups and folds the
-                  // piped window — otherwise post-run reconciliation would
-                  // re-dispatch (and double-answer) follow-ups the codex
-                  // reserve already replied to.
-                  const turn = cursorAfterRunnerTurn({
-                    initialBatchDelivered,
-                    currentCursor: lastAgentTimestamp[chatJid],
-                    targetCursor,
-                    pipedCursor: lastPipedTimestamp[chatJid],
-                  });
-                  if (lastAgentTimestamp[chatJid] !== turn.cursor) {
-                    lastAgentTimestamp[chatJid] = turn.cursor;
-                    saveState();
-                  }
-                  if (turn.foldedPiped) {
-                    delete lastPipedTimestamp[chatJid];
-                  }
-                  initialBatchDelivered = true;
+                const sent = await deliverFallbackTurn(text, {kind:'codex_reserve_fallback',
+                  mode:'full_agent', trace_id:reserveTraceId, primary_runtime:'claude_sdk',
+                  voice_reply_requested:voiceReplyRequested}, !result.finalizedInputFiles?.length);
+                if (!sent) {
+                  reserveFinalRetained = true;
+                  queue.closeStdin(chatJid);
+                  return;
                 }
+                reserveDelivered = true;
+                outputSentToUser = true;
+                // Mirror the primary path's cursor semantics exactly: the
+                // first delivered turn answers the initial batch; a LATER
+                // delivered turn answers piped follow-ups and folds the
+                // piped window — otherwise post-run reconciliation would
+                // re-dispatch (and double-answer) follow-ups the codex
+                // reserve already replied to.
+                const turn = cursorAfterRunnerTurn({
+                  initialBatchDelivered,
+                  currentCursor: lastAgentTimestamp[chatJid],
+                  targetCursor,
+                  pipedCursor: lastPipedTimestamp[chatJid],
+                });
+                if (lastAgentTimestamp[chatJid] !== turn.cursor) {
+                  lastAgentTimestamp[chatJid] = turn.cursor;
+                  saveState();
+                }
+                if (turn.foldedPiped) {
+                  delete lastPipedTimestamp[chatJid];
+                }
+                initialBatchDelivered = true;
               } catch (routeErr) {
                 reserveRouteFailed = true;
                 recordEventSafely({
@@ -10119,6 +10328,7 @@ async function processGroupMessagesInner(
             });
           }
         }
+        if (reserveFinalRetained) return true;
         const reserveLatencyMs = Date.now() - reserveStartedAt;
 
         // Success = the user actually got an answer. A run that delivered its
@@ -10383,50 +10593,12 @@ async function processGroupMessagesInner(
                 : reserveRun.answerText,
             );
             const reserveAnswerText = quotaDegradedNotice ? `${quotaDegradedNotice}\n\n${rawAnswerText}` : rawAnswerText;
-            let deliveredText: string | null = null;
-            let deliveryMode: 'text' | 'voice' = 'text';
-            if (voiceReplyRequested) {
-              const voiceOk = await router.sendVoice(
-                replyJid,
-                reserveAnswerText,
-              );
-              if (voiceOk) {
-                deliveredText = reserveAnswerText;
-                deliveryMode = 'voice';
-              } else {
-                recordEventSafely({
-                  chatJid,
-                  type: 'error',
-                  actor: 'system',
-                  senderId: senderChannelUserId,
-                  payload: {
-                    kind: 'codex_reserve_voice_delivery_failed',
-                    reply_jid: replyJid,
-                    group_folder: group.folder,
-                    trace_id: reserveRun.traceId,
-                    fallback_to_text: true,
-                  },
-                });
-              }
-            }
-            if (!deliveredText) {
-              deliveredText = await router.route({
-                chatJid: replyJid,
-                text: reserveAnswerText,
-                triggerType: 'agent-response',
-                groupFolder: group.folder,
-                meta: {
-                  kind: 'codex_reserve_fallback',
-                  trace_id: reserveRun.traceId,
-                  primary_runtime: 'claude_sdk',
-                  voice_reply_requested: voiceReplyRequested,
-                },
-              });
-            }
-            if (!deliveredText) {
-              throw new Error('Codex reserve answer was not delivered');
-            }
-            storeBotReply(replyJid, deliveredText);
+            const sent = await deliverProviderAnswer(reserveAnswerText, {
+              kind:'codex_reserve_fallback', trace_id:reserveRun.traceId, primary_runtime:'claude_sdk',
+              voice_reply_requested:voiceReplyRequested,
+            }, voiceReplyRequested, missedMessages);
+            if (!sent) return true;
+            const {text:deliveredText, mode:deliveryMode} = sent;
             outputSentToUser = true;
 
             advanceCursorAfterInitialBatchDelivery();
@@ -10931,6 +11103,12 @@ async function processGroupMessagesInner(
   if (runCancelledByUser) {
     for (const key of activeTimeoutKeys) { blockTimeoutContinuation(groupIpcDir,timeoutStore,key); noteTimeoutContinuationFailureDelivered(timeoutStore,key); }
     return finishCancelledTurn();
+  }
+  if (finalDeliveryOutcome === 'unconfirmed') {
+    // The source cursor was saved when the completed answer was withheld or
+    // lost its ACK. Only subsequent input belongs to the next queue turn.
+    delete lastPipedTimestamp[chatJid];
+    return true;
   }
   for (const key of activeTimeoutKeys) {
     const record = readTimeoutContinuation(timeoutStore,key);
@@ -12201,6 +12379,13 @@ async function startMessageLoop(router: MessageRouter): Promise<void> {
           // уже скормлены runner'у через IPC pipe ждут send confirmation, не
           // нужно пере-pip'ать. После confirmed send в onOutput callback
           // lastAgentTimestamp сольёт piped в себя.
+          const cachedFinal = readyTextFinalJournal({ get: getRouterState, set: setRouterState }, chatJid, group.folder).read();
+          if (cachedFinal && (!cachedFinal.confirmed ||
+              groupMessages.some(row => isExplicitReadyTextRequest(row.content)))) {
+            queue.closeStdin(chatJid);
+            queue.enqueueMessageCheck(chatJid);
+            continue;
+          }
           const lastAgent =
             lastAgentTimestamp[chatJid] || INITIAL_INGESTION_CURSOR;
           const lastPiped = lastPipedTimestamp[chatJid] || '';
@@ -12487,7 +12672,17 @@ function recoverPendingMessages(): void {
       lastAgentTimestamp[chatJid] || INITIAL_INGESTION_CURSOR;
     const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
     const deferred = readDeferredInputCheckpoints(resolveGroupIpcPath(group.folder), chatJid);
-    if (pending.length > 0 || deferred.some((entry) => entry.recoverable) || timeoutContinuationNotices(resolveGroupIpcPath(group.folder), {get:getRouterState,set:setRouterState}).length > 0) {
+    // A crash can advance the completed source cursor while first delivery
+    // is still provably unattempted. It must wake even without a new message.
+    let firstSendPending: boolean;
+    try {
+      firstSendPending = readyTextFinalJournal({get: getRouterState, set: setRouterState},
+        chatJid, group.folder).read()?.unattempted === true;
+    } catch (err) {
+      logger.error({err, chatJid}, 'Cannot recover an invalid saved final; holding this chat');
+      continue;
+    }
+    if (firstSendPending || pending.length > 0 || deferred.some((entry) => entry.recoverable) || timeoutContinuationNotices(resolveGroupIpcPath(group.folder), {get:getRouterState,set:setRouterState}).length > 0) {
       logger.info(
         { group: group.name, pendingCount: pending.length },
         'Recovery: found unprocessed messages',

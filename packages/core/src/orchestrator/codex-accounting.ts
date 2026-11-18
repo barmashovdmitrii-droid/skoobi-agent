@@ -189,6 +189,8 @@ export function codexTurnTracePayload(
 ): Record<string, unknown> {
   if (!codexTurn) return {};
   const out: Record<string, unknown> = {};
+  if (codexTurn.requestedModel) out.requested_model = codexTurn.requestedModel;
+  if (codexTurn.observedModel) out.effective_model = codexTurn.observedModel;
   if (codexTurn.usageSource !== undefined) {
     out.usage_source = codexTurn.usageSource;
   }
@@ -282,6 +284,9 @@ export function mergeCodexTurnTelemetry(
       : undefined;
   }
   const out: CodexTurnTelemetry = {};
+  // Model identity belongs to the latest contributing turn, including unknown.
+  if (later.requestedModel) out.requestedModel = later.requestedModel;
+  if (later.observedModel) out.observedModel = later.observedModel;
   const usageSource = weakerUsageSource(earlier.usageSource, later.usageSource);
   if (usageSource) out.usageSource = usageSource;
   const modelRequests =

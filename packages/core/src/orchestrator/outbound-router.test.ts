@@ -14,6 +14,47 @@ function mockChannel(name: string, jidPrefix: string): Channel {
 }
 
 describe('MessageRouter', () => {
+  it('drops a saved answer if middleware selects a different recipient', async () => {
+    const channel = mockChannel('telegram', 'tg:');
+    const router = createMessageRouter([channel]);
+    router.addPreHook(async envelope => ({action: 'modify', envelope: {...envelope, chatJid: 'tg:other'}}));
+    const delivered = await router.route({chatJid: 'tg:fixture', text: 'saved', triggerType: 'agent-response'}, () => true);
+    expect(delivered).toBeNull();
+    expect(channel.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('rechecks a linked document after asynchronous acceptance and releases its snapshot', async () => {
+    const channel = mockChannel('telegram', 'tg:');
+    channel.sendDocument = vi.fn();
+    const cleanup = vi.fn();
+    let active = true;
+    const router = createMessageRouter([channel], {artifactAcceptance: async () => {
+      await Promise.resolve();
+      active = false;
+      return {required: true, status: 'passed', code: 'checks_passed', snapshotPath: '/fixture/checked.zip', cleanup};
+    }});
+    const delivered = await router.sendDocument('tg:fixture', '/fixture/file.zip', undefined, {canSend: () => active});
+    expect(delivered).toBe(false);
+    expect(channel.sendDocument).not.toHaveBeenCalled();
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('distinguishes synthesis failure from a voice upload with an unknown outcome', async () => {
+    const channel = mockChannel('telegram', 'tg:');
+    channel.voiceTransportAware = true;
+    channel.sendVoice = vi.fn().mockRejectedValueOnce(new Error('synthesis failed'))
+      .mockImplementationOnce(async (_jid, _text, options) => {
+        options.transportAttempted();
+        throw new Error('upload acknowledgement lost');
+      });
+    const router = createMessageRouter([channel]);
+    const control = {canSend: () => true, transportAttempted: vi.fn()};
+    expect(await router.sendVoice('tg:fixture', 'ready', control)).toBe(false);
+    expect(control.transportAttempted).not.toHaveBeenCalled();
+    expect(await router.sendVoice('tg:fixture', 'ready', control)).toBe(false);
+    expect(control.transportAttempted).toHaveBeenCalledOnce();
+  });
+
   it('sends the verified immutable snapshot and cleans it even after a transport failure', async () => {
     const channel = mockChannel('telegram', 'tg:');
     channel.sendDocument = vi.fn().mockRejectedValue(new Error('send outcome unknown'));

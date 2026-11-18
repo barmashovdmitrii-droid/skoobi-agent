@@ -11,6 +11,13 @@ record the objective, reported progress, remaining steps, a pending question,
 and artifact locations. The assistant maintains cards during its work; a
 card's status does not prove that a file was checked or delivered.
 
+A waiting card can name who supplies the missing input and what to do when it
+arrives. For an older card, the first saved pending step remains available.
+An optional work checkpoint records the execution environment, executor and
+acceptance criteria. When requirements change, increment the requirements
+revision and recheck the affected work. Completion requires a passing check
+with evidence for each criterion in that revision and no outstanding next step.
+
 Important corrections use the existing record's revision and a quotation from
 the user's actual message. The host checks the message identity and quotation.
 This verifies the source reference, not the assistant's interpretation. Older

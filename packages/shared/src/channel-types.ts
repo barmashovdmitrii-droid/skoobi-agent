@@ -55,7 +55,7 @@ export type OnTelegramCallbackQuery = (
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
+  sendMessage(jid: string, text: string, options?: {canSend?: () => boolean}): Promise<void>;
   /** Optional quiet progress surface, updated in place within one host-owned turn. */
   sendProgress?(jid: string, text: string, turnKey: string): Promise<boolean>;
   /** Close this exact turn's progress and drain its transport before a final reply. */
@@ -72,7 +72,9 @@ export interface Channel {
   // Optional: send an arbitrary document/file by absolute file path.
   sendDocument?(jid: string, filePath: string, caption?: string): Promise<void>;
   // Optional: synthesize text → voice and send. Channels that don't support audio can omit.
-  sendVoice?(jid: string, text: string): Promise<void>;
+  /** The channel reports the first upload separately from audio synthesis. */
+  voiceTransportAware?: boolean;
+  sendVoice?(jid: string, text: string, options?: {canSend?: () => boolean; transportAttempted?: () => void}): Promise<void>;
   // Optional: best-effort emoji reaction on an inbound message (e.g. 👀 while
   // the agent is busy). Resolves false instead of throwing; no retries.
   // WhatsApp deliberately omits it: its own reaction in the self-chat would

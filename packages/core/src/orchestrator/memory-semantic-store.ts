@@ -233,6 +233,19 @@ function vectorFrom(buffer: Buffer, dimensions: number): number[] | undefined {
   return validEmbedding(vector, dimensions) ? vector : undefined;
 }
 
+/** Bridge everyday descriptions and the terms in short operational records.
+ * Expand the query only; identity, project, exact IDs and stored facts stay authoritative. */
+function expandRecallQuery(query: string): string {
+  const concepts: string[] = [];
+  if (/голос|диктов|транскри|распозна.{0,15}реч|реч.{0,18}текст/iu.test(query)) {
+    concepts.push('аудиозапись распознавание речи');
+  }
+  if (/приостанов|на паузе|чего жд[её]м|что жд[её]м|жд[её]т уточнения/iu.test(query)) {
+    concepts.push('причина ожидания, от кого зависит продолжение работы');
+  }
+  return concepts.length ? [query, ...concepts].join(' ') : query;
+}
+
 /** Scope/project are selected by the authenticated host BEFORE embedding. No
  * shared legacy index, historical versions, or model-provided identity is used.
  * Existing lexical memory APIs remain intact. Missing model is a normal fallback.
@@ -252,6 +265,7 @@ export async function recallStructuredMemory(
     project = namespace(options.projectKey);
   const now = () => options.now ?? new Date().toISOString();
   const query = options.query.trim().slice(-1600);
+  const searchQuery = expandRecallQuery(query);
   const limit = Math.max(1, Math.min(20, Math.trunc(options.limit ?? 10)));
   if (!Number.isFinite(limit) || !Number.isFinite(Date.parse(now())))
     throw new Error('invalid_memory_recall');
@@ -268,7 +282,7 @@ export async function recallStructuredMemory(
   try {
     candidates = currentCandidates(db, scopeId, project, now());
     syncLexical(db, scopeId, candidates, now());
-    lexical = lexicalRanks(db, scopeId, query, candidates);
+    lexical = lexicalRanks(db, scopeId, searchQuery, candidates);
   } catch {
     return { ...result, reason: 'storage_unavailable' };
   }
@@ -362,7 +376,7 @@ export async function recallStructuredMemory(
           ).run();
         })();
       }
-      const encoded = await encoder.encode([query], 'query');
+      const encoded = await encoder.encode([searchQuery], 'query');
       if (
         encoded.length !== 1 ||
         !validEmbedding(encoded[0], encoder.dimensions)
@@ -385,7 +399,7 @@ export async function recallStructuredMemory(
     );
     candidates = latest;
     syncLexical(db, scopeId, candidates, now());
-    lexical = lexicalRanks(db, scopeId, query, candidates);
+    lexical = lexicalRanks(db, scopeId, searchQuery, candidates);
     for (const item of candidates)
       if (
         previous.get(item.row.record_key)?.hash !== item.hash ||

@@ -1574,6 +1574,7 @@ export function linkCheckGateForInput(
 
 type TurnAccounting = Pick<
   CodexTurnResult,
+  | 'observedModel'
   | 'usage'
   | 'usageSource'
   | 'modelRequests'
@@ -1593,6 +1594,7 @@ type TurnAccounting = Pick<
 
 /** What the runner asked codex for on this turn (the tier decision). */
 export interface RequestedCodexTurnSettings {
+  requestedModel?: string;
   requestedServiceTier: 'priority' | null;
   fastTierDroppedForQuota: boolean;
 }
@@ -1609,6 +1611,9 @@ export function codexTurnTelemetry(
   requested?: RequestedCodexTurnSettings,
 ): CodexTurnTelemetry | undefined {
   const out: CodexTurnTelemetry = {};
+  if (requested?.requestedModel) out.requestedModel = requested.requestedModel;
+  const observedModel = (fix ?? result).observedModel;
+  if (observedModel) out.observedModel = observedModel;
   // A correction on a resumed thread is always a delta; the pair is as
   // honest as its weaker half.
   const usageSource =
@@ -1725,6 +1730,7 @@ export function combineTurnAccounting(
     sideEffectTools: merged.sideEffectTools,
     usageSource: telemetry?.usageSource,
     modelRequests: telemetry?.modelRequests,
+    ...(telemetry?.observedModel ? { observedModel: telemetry.observedModel } : {}),
     appliedServiceTier: telemetry?.serviceTier,
     appliedReasoningEffort: telemetry?.reasoningEffort,
     accountUsedPercent: telemetry?.accountUsedPercent,
@@ -3316,6 +3322,7 @@ export async function runCodexProviderLoop(
         );
       }
       const requestedTurnSettings: RequestedCodexTurnSettings = {
+        requestedModel: codexCfg.model,
         requestedServiceTier: serviceTier ?? null,
         fastTierDroppedForQuota: tierDecision.droppedForQuota,
       };

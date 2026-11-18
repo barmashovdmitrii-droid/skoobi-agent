@@ -90,6 +90,27 @@ beforeEach(() => {
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 
 describe('memory used for the next decision', () => {
+  it('reads a legacy waiting condition and respects its latest revision and recorded dependency', () => {
+    const waiting = { ...card('Атлас'), status: 'waiting' as const, waiting: 'Ждём сигнал', pending: ['Продолжить только по сигналу'] };
+    const put = (updated: MemoryProjectCard, revision: number) => mutateMemoryState(getDb(), scope, {
+      kind: 'project_upsert', projectKey: 'atlas', card: updated, expectedRevision: revision, operationId: 'wait-' + revision,
+    }, source(revision + 1));
+    put(waiting, 0);
+    expect(listMemoryState(getDb(), scope).projects[0]?.waitingState).toEqual({
+      condition: 'Ждём сигнал', waitingOn: null, nextStep: 'Продолжить только по сигналу', stepSource: 'recorded_pending',
+    });
+    put({ ...waiting, waiting: 'Ждём макет', pending: [], work: { target: 'Макет', executor: 'Студия',
+      waitingOn: 'Дизайнер', requirementsRevision: 1, nextStep: 'Сверить размер', criteria: [
+        {key: 'size', description: 'Проверить размер', state: 'pending'},
+      ] } }, 1);
+    const listing = listMemoryState(getDb(), scope);
+    expect(listing.projects[0]?.waitingState).toMatchObject({ waitingOn: 'Дизайнер', nextStep: 'Сверить размер', stepSource: 'checkpoint' });
+    const context = buildStructuredMemoryContext(listing, 'Атлас').context;
+    expect(context).toContain('Дизайнер');
+    expect(context).not.toContain('Продолжить только по сигналу');
+    expect(listMemoryState(getDb(), { ...scope, identityId: 'other' }).projects).toHaveLength(0);
+  });
+
   it('uses the latest user correction after a long earlier batch message', () => {
     project('atlas', 'Атлас', 1);
     project('orbit', 'Орбита', 2);

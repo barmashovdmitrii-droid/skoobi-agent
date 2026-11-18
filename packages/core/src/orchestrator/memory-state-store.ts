@@ -1,3 +1,4 @@
+import { parseMemoryWorkCheckpoint, validateMemoryWorkTransition, type MemoryWorkCheckpoint } from './memory-work-checkpoint.js';
 import { createHash } from 'crypto';
 import type Database from 'better-sqlite3';
 import { parseProjectValueDetail, type ProjectValueDetail } from './project-insights.js';
@@ -36,6 +37,7 @@ export type MemoryFactType =
   | 'preference'
   | 'permission_note';
 export interface MemoryProjectCard {
+  work?: MemoryWorkCheckpoint;
   title: string;
   goal: string;
   status: 'active' | 'waiting' | 'completed' | 'cancelled';
@@ -49,6 +51,17 @@ export interface MemoryProjectCard {
     note?: string;
   }>;
 }
+export function projectWaitingState(card: MemoryProjectCard) {
+  if (card.status !== 'waiting') return undefined;
+  const checkpointStep = card.work?.nextStep;
+  return {
+    condition: card.waiting,
+    waitingOn: card.work?.waitingOn ?? null,
+    nextStep: checkpointStep ?? card.pending[0] ?? null,
+    stepSource: checkpointStep ? 'checkpoint' : card.pending.length ? 'recorded_pending' : 'unknown',
+  } as const;
+}
+
 type MutationBase = { operationId: string; expectedRevision: number };
 export type MemoryStateOperation = MutationBase &
   (
@@ -83,6 +96,7 @@ export type MemoryStateRecord =
       kind: 'project';
       projectKey: string;
       card: MemoryProjectCard;
+      waitingState?: ReturnType<typeof projectWaitingState>;
     })
   | (RecordBase & {
       kind: 'fact';
@@ -213,7 +227,18 @@ function cardView(card: MemoryProjectCard): MemoryProjectCard {
   };
   if (!Array.isArray(card.artifacts) || card.artifacts.length > 20)
     return fail('invalid_card');
+  let work: MemoryWorkCheckpoint | undefined;
+  if (card.work !== undefined) {
+    try { work = parseMemoryWorkCheckpoint(card.work); } catch { return fail('invalid_work_checkpoint'); }
+    if (!Array.isArray(card.pending)) return fail('invalid_card');
+    if (card.status === 'completed' &&
+        (card.pending.length || card.waiting || work.nextStep || work.waitingOn ||
+          work.criteria.some(criterion => criterion.state !== 'passed'))) {
+      return fail('work_acceptance_incomplete');
+    }
+  }
   const result: MemoryProjectCard = {
+    ...(work ? { work } : {}),
     title: text(card.title, 200),
     goal: text(card.goal, 4000),
     status: card.status,
@@ -240,6 +265,8 @@ function cardView(card: MemoryProjectCard): MemoryProjectCard {
   if (
     SECRET.test(
       [
+        ...(work ? [work.target, work.executor, work.nextStep ?? '', work.waitingOn ?? '',
+          ...work.criteria.flatMap(c => [c.key, c.description, c.evidence ?? ''])] : []),
         result.title,
         result.goal,
         ...result.pending,
@@ -306,7 +333,7 @@ function readRow(
 }
 function publicRecord(row: Row | undefined): MemoryStateRecord | null {
   if (!row || row.forgotten || !row.body_json || !row.source_json) return null;
-  return {
+  const record = {
     kind: row.kind,
     projectKey: row.project_key || null,
     key: row.item_key,
@@ -316,6 +343,11 @@ function publicRecord(row: Row | undefined): MemoryStateRecord | null {
     evidence: 'reported_not_verified',
     ...JSON.parse(row.body_json),
   } as MemoryStateRecord;
+  if (record.kind === 'project') {
+    const waitingState = projectWaitingState(record.card);
+    if (waitingState) record.waitingState = waitingState;
+  }
+  return record;
 }
 function currentRecord(
   row: Row | undefined,
@@ -577,6 +609,9 @@ export function mutateMemoryState(
           ? (JSON.parse(current.body_json).card as MemoryProjectCard)
           : null;
         const next = (body as { card: MemoryProjectCard }).card;
+        try { validateMemoryWorkTransition(existing?.work, next.work); }
+        catch (error) { return fail((error as Error).message, revision); }
+
         if (
           (current.forgotten ||
             existing?.status === 'completed' ||

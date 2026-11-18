@@ -3098,6 +3098,24 @@ describe('TelegramChannel', () => {
       );
     });
 
+    it.each(['next part', 'plain text fallback', 'rate limit retry', 'lost acknowledgement'])(
+      'does not send a stale or duplicate saved final during %s', async (stage) => {
+        const channel = new TelegramChannel('test-token', createTestOpts());
+        await channel.connect();
+        let current = true;
+        const api = currentBot().api.sendMessage;
+        api.mockImplementationOnce(async () => {
+          current = stage === 'lost acknowledgement';
+          if (stage === 'rate limit retry') throw Object.assign(new Error('rate limit'), {parameters:{retry_after:0}});
+          if (stage === 'plain text fallback') throw new Error("Bad Request: can't parse entities");
+          if (stage === 'lost acknowledgement') throw new Error('ECONNRESET');
+        });
+        const text = stage === 'next part' ? 'x'.repeat(5000) : 'Готовый ответ';
+        await expect(channel.sendMessage('tg:100200300', text, {canSend:() => current})).rejects.toThrow();
+        expect(api).toHaveBeenCalledTimes(1);
+      },
+    );
+
     it('sends exactly one message at 4096 characters', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);

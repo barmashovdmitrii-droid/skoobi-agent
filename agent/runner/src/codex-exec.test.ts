@@ -1928,7 +1928,7 @@ describe('runCodexExecTurn (fake codex binary)', () => {
       process.stdin.resume();
       console.log(JSON.stringify({ type: 'thread.started', thread_id: ${JSON.stringify(opts.threadId)} }));
       console.log(JSON.stringify({ type: 'turn.started' }));
-      for (const rec of ${JSON.stringify(opts.records)}) record(rec);
+      for (const rec of ${JSON.stringify(opts.records)}) record({timestamp:new Date().toISOString(), ...rec});
       setTimeout(() => {
         console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'done' } }));
         console.log(JSON.stringify({ type: 'turn.completed', usage: ${JSON.stringify(opts.completedUsage)} }));
@@ -1969,7 +1969,11 @@ describe('runCodexExecTurn (fake codex binary)', () => {
         fakeTurn({
           rollout,
           threadId: 'th-delta',
-          records: turnRecords(base),
+          records: [
+            { type: 'event_msg', payload: { type: 'task_started', turn_id: 'current-turn' } },
+            { type: 'turn_context', payload: { turn_id: 'current-turn', model: 'observed-fixture-model' } },
+            ...turnRecords(base),
+          ],
           completedUsage: {
             input_tokens: base.input + 350,
             cached_input_tokens: base.cached + 270,
@@ -1994,11 +1998,43 @@ describe('runCodexExecTurn (fake codex binary)', () => {
       });
       expect(result.usageSource).toBe('turn_delta');
       expect(result.modelRequests).toBe(3);
+      expect(result.observedModel).toBe('observed-fixture-model');
       expect(result.appliedServiceTier).toBe('priority');
       expect(result.appliedReasoningEffort).toBe('xhigh');
       expect(result.accountUsedPercent).toBe(48.5);
       expect(result.toolCalls).toEqual({ view_image: 2, exec_command: 1 });
     });
+
+    it.each(['foreign-file', 'different-turn', 'truncated-history', 'switch-thread'])(
+      'leaves model unknown for an unbound rollout context (%s)',
+      async (scenario) => {
+        const home = path.join(dir, 'codex-home-model-' + scenario);
+        const thread = 'th-owner';
+        const file = rolloutPathFor(home, scenario === 'foreign-file' ? thread + '-neighbor' : thread);
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        const restored = scenario === 'truncated-history';
+        if (restored) fs.writeFileSync(file, ' '.repeat(8192) + '\n');
+        const timestamp = restored ? { timestamp: '2026-01-01T00:00:00.000Z' } : {};
+        const records = [
+          { ...timestamp, type: 'event_msg', payload: { type: 'task_started', turn_id: 'current' } },
+          { ...timestamp, type: 'turn_context', payload: {
+            turn_id: scenario === 'different-turn' ? 'previous' : 'current', model: 'foreign-model',
+          } },
+        ];
+        let binary = fakeTurn({ rollout: file, threadId: thread, records,
+          completedUsage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 1 } });
+        if (restored) binary = binary.replace('process.stdin.resume();',
+          `fs.truncateSync(${JSON.stringify(file)},0); process.stdin.resume();`);
+        if (scenario === 'switch-thread') binary = binary.replace('setTimeout(() => {',
+          `setTimeout(() => { console.log(JSON.stringify({ type:'thread.started',thread_id:'th-next' }));`);
+        writeFakeCodex(binary);
+        const result = await withHome(home, () => runCodexExecTurn({
+          config: baseConfig(), cwd: dir, prompt: 'hello', threadId: thread, log: noopLog,
+        }));
+        expect(result.status).toBe('success');
+        expect(result.observedModel).toBeUndefined();
+      },
+    );
 
     it("reports a fresh thread's total as is, marked as the first turn", async () => {
       const codexHome = path.join(dir, 'codex-home-fresh');

@@ -132,6 +132,64 @@ export function hasSuspectCaptionTail(text: string | null): boolean {
     return false;
   return (prefix.match(/\p{L}[\p{L}\p{M}'’-]*/gu) ?? []).length >= 12;
 }
+// Short corrections of dates and negated action commands can change what the
+// host is asked to do even when the language and average token scores are high.
+const CALENDAR_WORDS = new Set((
+  'понедельник понедельника понедельнику понедельником понедельнике вторник вторника вторнику вторником вторнике ' +
+  'среда среды среду среде средой четверг четверга четвергу четвергом четверге ' +
+  'пятница пятницы пятницу пятнице пятницей суббота субботы субботу субботе субботой ' +
+  'воскресенье воскресенья воскресенью воскресеньем сегодня завтра послезавтра вчера ' +
+  'январь января январе февраль февраля феврале март марта марте апрель апреля апреле май мая мае ' +
+  'июнь июня июне июль июля июле август августа августе сентябрь сентября сентябре ' +
+  'октябрь октября октябре ноябрь ноября ноябре декабрь декабря декабре'
+).split(' '));
+
+// Two passes of the same model sometimes agree on the same malformed word.
+// In a "from ... to ..." correction flag a near-calendar term for clarification.
+// This never emits a suggested spelling or mutates the transcript.
+function nearCalendarTerm(word: string): boolean {
+  if (word.length < 4 || word.length > 16 || CALENDAR_WORDS.has(word)) return false;
+  for (const term of CALENDAR_WORDS) {
+    if (Math.abs(term.length - word.length) > 1) continue;
+    let i = 0;
+    while (i < term.length && term[i] === word[i]) i++;
+    if (term.slice(i + Number(term.length >= word.length)) ===
+        word.slice(i + Number(word.length >= term.length))) return true;
+  }
+  return false;
+}
+
+function scheduleTerms(all: Token[]): {dates: Token[]; unrecognized: boolean} {
+  const dates = new Set(all.filter(t => CALENDAR_WORDS.has(t.value)));
+  let unrecognized = false;
+  for (let i = 0; i + 3 < all.length; i++) {
+    if (!['с', 'со', 'вместо'].includes(all[i].value) || all[i + 2].value !== 'на') continue;
+    const from = all[i + 1], to = all[i + 3];
+    for (const [term, other] of [[from, to], [to, from]]) {
+      if (CALENDAR_WORDS.has(other.value) && nearCalendarTerm(term.value)) {
+        dates.add(term);
+        unrecognized = true;
+      }
+    }
+  }
+  return {dates:all.filter(t => dates.has(t)), unrecognized};
+}
+
+const CHANGE_WORD = /^(?:поправка|исправление|измени(?:те)?|исправь(?:те)?|перенеси(?:те)?|передвинь(?:те)?|сдвинь(?:те)?|замени(?:те)?|вместо)$/u;
+const ACTION_WORD = /^(?:отправляй|отправь|посылай|публикуй|выкладывай|загружай|запускай|удаляй|сохраняй|переноси|отменяй|меняй)(?:те)?$/u;
+
+export function hasSensitiveRussianCorrection(text: string | null): boolean {
+  if (!text || text.length > 800) return false;
+  const words = tokens(text);
+  const negativeAction = words.some((word, i) =>
+    word.value === 'не' && ACTION_WORD.test(words[i + 1]?.value || ''));
+  const stopWithAction = words.some(w => w.value === 'стоп' || w.value === 'отмена') &&
+    words.some(w => ACTION_WORD.test(w.value));
+  const date = words.some(w => CALENDAR_WORDS.has(w.value)) ||
+    /(?:^|\s)\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?(?=$|[\s.,!?])/u.test(text);
+  return negativeAction || stopWithAction || (date && words.some(w => CHANGE_WORD.test(w.value)));
+}
+
 function difference(a: Token[], b: Token[]): [string, string] | undefined {
   if (sameWords(a, b)) return;
   const left = a.find((token, index) => token.value !== b[index]?.value);
@@ -219,7 +277,7 @@ export function assessTranscription(input: {
         ? 'number_disagreement'
         : kind === 'negation'
           ? 'negation_disagreement'
-          : 'possible_name_disagreement',
+          : kind === 'date' ? 'date_disagreement' : 'possible_name_disagreement',
     );
     if (ambiguities.length < 8)
       ambiguities.push({ kind, passIndices: [a.index, b.index], variants });
@@ -248,6 +306,8 @@ export function assessTranscription(input: {
           (token) => /\d/u.test(token.raw) || NUMBER_WORDS.has(token.value),
         );
       addAmbiguity('number', a, b, difference(numbers(left), numbers(right)));
+      if (hasSensitiveRussianCorrection(a.text) || hasSensitiveRussianCorrection(b.text))
+        addAmbiguity('date', a, b, difference(scheduleTerms(left).dates, scheduleTerms(right).dates));
       const leftNegation = negationContext(a.text!, left),
         rightNegation = negationContext(b.text!, right);
       if (
@@ -284,6 +344,8 @@ export function assessTranscription(input: {
       } else if (selected.languageProbability < input.retryLanguageProbability)
         uncertainty.add('low_language_probability');
     }
+    if (hasSensitiveRussianCorrection(selected.text) && scheduleTerms(tokens(selected.text!)).unrecognized)
+      uncertainty.add('unrecognized_date_term');
     if (hasSuspectCaptionTail(selected.text))
       uncertainty.add('suspect_caption_tail');
   }

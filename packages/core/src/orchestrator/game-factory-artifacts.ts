@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from 'child_process';
 import path from 'path';
 
+import { FactoryError } from './game-factory-contracts.js';
 import type { FactoryFile } from './game-factory-contracts.js';
 
 export interface FactoryManifestLimits {
@@ -18,6 +19,16 @@ export interface CaptureFactoryManifestInput {
   /** Canonical host roots, never an allowlist supplied by an agent/IPC caller. */
   allowedRoots: string[];
   limits?: FactoryManifestLimits;
+  /** Host-selected: a Studio place is a standalone build, not its surrounding source directory. */
+  profile?: 'roblox_place';
+}
+
+/** A reference is one bounded text file, never a source tree or build input. */
+export interface CaptureFactoryReferenceFileInput {
+  sourceRoot: string;
+  entrypoint: string;
+  allowedRoots: string[];
+  studioPlaytest?: { placeSha256: string; result: 'pass' | 'fail' | 'unknown' };
 }
 
 export interface FactoryManifest {
@@ -101,7 +112,8 @@ const HARD_LIMITS = {
  * It never executes imported code, a shell, build scripts, or network calls.
  */
 const FILESYSTEM_HELPER = String.raw`
-import base64, ctypes, errno, hashlib, io, json, os, secrets, signal, stat, sys, zipfile
+import base64, ctypes, errno, hashlib, io, json, os, secrets, signal, stat, struct, sys, zipfile
+from xml.parsers import expat
 
 def deadline_signal(signum, frame):
     raise TimeoutError('Factory filesystem deadline exceeded')
@@ -127,6 +139,9 @@ PUBLIC_NOTICES = {'license', 'licence', 'notice', 'credits', 'attribution', 'ofl
     'license.md', 'licence.md', 'notice.md', 'credits.md', 'attribution.md'}
 PRIVATE_NAMES = {'package-lock.json', 'npm-shrinkwrap.json', 'auth.json',
     'credentials.json', 'secrets.json', 'tokens.json', 'config.local.json'}
+REFERENCE_EXTENSIONS = {'.md', '.txt', '.gd', '.cs', '.cpp', '.h', '.hpp',
+    '.json', '.js', '.mjs', '.ts', '.tsx', '.jsx', '.css', '.html', '.glsl',
+    '.shader', '.py', '.lua', '.luau', '.tscn', '.tres'}
 
 def fail(message):
     raise ValueError(message)
@@ -153,6 +168,42 @@ def allowed_file(name):
     extension = os.path.splitext(low)[1]
     public_notice = low in PUBLIC_NOTICES or (low.startswith(('ofl-', 'license-', 'licence-', 'notice-', 'credits-', 'attribution-')) and extension in ('.txt', '.md'))
     return not excluded_name(name) and (extension in ALLOWED_EXTENSIONS or public_notice)
+
+def validate_place(name, data):
+    # Verify the container only. Embedded scripts are never run.
+    if name.lower().endswith('.rbxlx'):
+        parser = expat.ParserCreate()
+        depth, items = 0, 0
+        def start(tag, attrs):
+            nonlocal depth, items
+            if depth == 0 and (tag != 'roblox' or attrs.get('version') != '4'):
+                fail('roblox_place_invalid')
+            if depth == 1 and tag == 'Item': items += 1
+            depth += 1
+        def end(tag):
+            nonlocal depth
+            depth -= 1
+        parser.StartElementHandler, parser.EndElementHandler = start, end
+        parser.StartDoctypeDeclHandler = lambda *args: fail('roblox_place_invalid')
+        try: parser.Parse(data, True)
+        except expat.ExpatError: fail('roblox_place_invalid')
+        if not items: fail('roblox_place_invalid')
+        return
+    if len(data) < 32 or not data.startswith(b'<roblox!\x89\xff\r\n\x1a\n\x00\x00'):
+        fail('roblox_place_invalid')
+    offset, instances, parents = 32, False, False
+    while offset + 16 <= len(data):
+        tag, packed, unpacked, reserved = struct.unpack_from('<4sIII', data, offset)
+        offset += 16
+        size = packed or unpacked
+        if size > len(data) - offset: fail('roblox_place_invalid')
+        if tag == b'END\x00':
+            if instances and parents and not packed and size == 9 and data[offset:] == b'</roblox>': return
+            fail('roblox_place_invalid')
+        if tag == b'INST': instances = True
+        if tag == b'PRNT': parents = True
+        offset += size
+    fail('roblox_place_invalid')
 
 def bounded_names(fd, remaining):
     names = []
@@ -234,6 +285,42 @@ def read_stable_file(parent, name, expected):
     finally:
         os.close(fd)
 
+def capture_reference(source_fd):
+    parts = q['entrypoint'].split('/')
+    if len(parts) > limits['maxDepth'] or any(not safe_name(part) or excluded_name(part) for part in parts):
+        fail('Invalid or private reference path')
+    if os.path.splitext(parts[-1])[1].lower() not in REFERENCE_EXTENSIONS:
+        fail('Unsupported reference text format')
+    fd, chain = source_fd, []
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            chain.append((fd, part, child, os.fstat(child)))
+            fd = child
+        before = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            fail('Reference must be a regular single-link file')
+        data = read_stable_file(fd, parts[-1], before)
+        try: data.decode('utf-8')
+        except UnicodeDecodeError: fail('Reference must be UTF-8 text')
+        if b'\x00' in data: fail('Reference must be text without NUL bytes')
+        if q.get('studioPlaytest'):
+            binding = q['studioPlaytest']
+            try: report = json.loads(data)
+            except (ValueError, UnicodeError): fail('roblox_playtest_report_invalid')
+            if (not isinstance(report, dict) or report.get('schema') != 1 or
+                report.get('kind') != 'studio_two_clients' or report.get('placeSha256') != binding['placeSha256'] or
+                report.get('result') != binding['result'] or report.get('serverObserved') is not True):
+                fail('roblox_playtest_report_mismatch')
+            clients = report.get('observedClients')
+            if (not isinstance(clients, list) or not 2 <= len(clients) <= 16 or
+                not all(isinstance(c,str) and 0 < len(c.strip()) <= 100 for c in clients) or
+                len(set(c.strip().casefold() for c in clients)) != len(clients)):
+                fail('roblox_playtest_report_invalid')
+        verify_bindings(chain)
+        return {'path': q['entrypoint'], 'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
+    finally: close_chain(chain)
+
 def write_file(parent, name, data):
     fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
     try:
@@ -248,23 +335,31 @@ def write_file(parent, name, data):
 
 def capture(root, root_fd, copy_fd=None, strict=False, archive=None):
     files, observed, total, entries = [], {}, 0, 0
+    place = q.get('profile') == 'roblox_place'
+    selected = place or q.get('singleFile')
     def walk(fd, prefix, depth, target):
         nonlocal total, entries
         if depth > limits['maxDepth']: fail('Source exceeds depth limit')
         before = os.fstat(fd)
         if strict and (before.st_uid != os.geteuid() or stat.S_IMODE(before.st_mode) & 0o077): fail('Destination directory is not private')
-        names = [q['entrypoint']] if q.get('singleFile') and not strict and not prefix else bounded_names(fd, limits['maxEntries'] - entries)
+        names = [q['entrypoint']] if selected and not strict and not prefix else bounded_names(fd, limits['maxEntries'] - entries)
         observed[prefix] = ('directory', stable(before), names)
         entries += len(names)
         if entries > limits['maxEntries']: fail('Source exceeds entry limit')
         for name in names:
             if not safe_name(name): fail('Unsafe source filename')
+            if place and name != q['entrypoint']: fail('Unexpected file in private place snapshot')
+            if place and excluded_name(name): fail('roblox_place_invalid')
             if excluded_name(name):
                 if strict: fail('Destination contains excluded files')
                 continue
             rel = prefix + '/' + name if prefix else name
             if len(rel.encode('utf-8')) > 1024: fail('Source path too long')
-            s = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            try: s = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if place: fail('roblox_place_missing')
+                raise
+            if place and not stat.S_ISREG(s.st_mode): fail('roblox_place_invalid')
             if stat.S_ISLNK(s.st_mode): fail('Source symlinks are not allowed')
             if stat.S_ISDIR(s.st_mode):
                 child = os.open(name, DIR_FLAGS, dir_fd=fd)
@@ -280,11 +375,12 @@ def capture(root, root_fd, copy_fd=None, strict=False, archive=None):
                     if target_child is not None: os.close(target_child)
             elif not stat.S_ISREG(s.st_mode):
                 fail('Special source files are not allowed')
-            elif allowed_file(name):
+            elif place or allowed_file(name):
                 if strict and (s.st_uid != os.geteuid() or stat.S_IMODE(s.st_mode) & 0o077): fail('Destination file is not private')
                 if len(files) >= limits['maxFiles']: fail('Source exceeds file limit')
                 if s.st_size > limits['maxTotalBytes'] - total: fail('Source exceeds total byte limit')
                 data = read_stable_file(fd, name, s)
+                if place: validate_place(name, data)
                 if q.get('singleFile'):
                     ext = os.path.splitext(name)[1].lower()
                     valid_image_header = (ext == '.png' and data.startswith(b'\x89PNG\r\n\x1a\n')) or (ext in ('.jpg', '.jpeg') and data.startswith(b'\xff\xd8\xff')) or (ext == '.webp' and len(data) >= 12 and data[:4] == b'RIFF' and data[8:12] == b'WEBP' and int.from_bytes(data[4:8], 'little') + 8 == len(data))
@@ -306,7 +402,7 @@ def capture(root, root_fd, copy_fd=None, strict=False, archive=None):
     def verify(fd, prefix):
         record = observed[prefix]
         if stable(os.fstat(fd)) != record[1]: fail('Source tree changed during capture')
-        if not (q.get('singleFile') and not strict and not prefix) and bounded_names(fd, limits['maxEntries']) != record[2]: fail('Source tree changed during capture')
+        if not (selected and not strict and not prefix) and bounded_names(fd, limits['maxEntries']) != record[2]: fail('Source tree changed during capture')
         for name in record[2]:
             rel = prefix + '/' + name if prefix else name
             child_record = observed.get(rel)
@@ -418,6 +514,10 @@ def run():
     source, source_fd, source_chain = resolve_source()
     parent_chain, stage_name, parent_fd = [], None, None
     try:
+        if q['operation'] == 'captureReference':
+            result = capture_reference(source_fd)
+            verify_bindings(source_chain)
+            return result
         if q['operation'] == 'capture':
             result = capture(source, source_fd)
             verify_bindings(source_chain)
@@ -528,6 +628,10 @@ function normalizedInput(input: CaptureFactoryManifestInput) {
   ) {
     throw new Error('Factory entrypoint must be a portable relative path');
   }
+  if (input.profile && (input.profile !== 'roblox_place' ||
+      input.entrypoint.includes('/') || !/\.rbxlx?$/i.test(input.entrypoint))) {
+    throw new FactoryError('roblox_place_entrypoint_required');
+  }
   const limits = { ...DEFAULT_LIMITS, ...input.limits };
   for (const key of Object.keys(
     DEFAULT_LIMITS,
@@ -543,6 +647,7 @@ function normalizedInput(input: CaptureFactoryManifestInput) {
   return {
     sourceRoot: input.sourceRoot,
     entrypoint: input.entrypoint,
+    ...(input.profile && {profile:input.profile}),
     allowedRoots: input.allowedRoots,
     limits,
   };
@@ -560,6 +665,8 @@ function parseHelperResult(
     throw new Error('Factory filesystem helper returned invalid output');
   }
   if (status !== 0 || !response.ok || !response.result) {
+    if (response.error && ['roblox_place_missing', 'roblox_place_invalid', 'roblox_playtest_report_invalid', 'roblox_playtest_report_mismatch'].includes(response.error))
+      throw new FactoryError(response.error);
     throw new Error(
       `Factory filesystem operation failed: ${response.error || error?.message || 'helper failed'}`,
     );
@@ -738,6 +845,33 @@ export async function captureFactoryManifestAsync(
       { ...normalizedInput(input), operation: 'capture' },
       options,
     )) as FactoryManifest,
+  );
+}
+
+/** Hash exactly one local reference without returning its text or reading siblings.
+ * This intentionally does not widen the build/import/release file allowlist. */
+export async function captureFactoryReferenceFileAsync(
+  input: CaptureFactoryReferenceFileInput,
+  options?: FactoryFilesystemHelperOptions,
+): Promise<FactoryFile> {
+  return Object.freeze(
+    (await executeFilesystemHelperAsync(
+      {
+        ...normalizedInput({
+          sourceRoot: input.sourceRoot,
+          entrypoint: input.entrypoint,
+          allowedRoots: input.allowedRoots,
+          limits: {
+            maxFiles: 1,
+            maxFileBytes: 1024 * 1024,
+            maxTotalBytes: 1024 * 1024,
+          },
+        }),
+        operation: 'captureReference',
+        ...(input.studioPlaytest && {studioPlaytest:input.studioPlaytest}),
+      },
+      options,
+    )) as FactoryFile,
   );
 }
 

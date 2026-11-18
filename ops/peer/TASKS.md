@@ -117,3 +117,5 @@ Use accepted evidence in the combined answer. Report blocked, failed, stale,
 unknown-delivery and review-required states explicitly. Process durable memory
 proposals under normal main memory rules. Never synchronize databases, sessions,
 logins, reminders or Telegram polling between machines.
+
+Use `health --config <absolute coordinator.json>` for a fresh connection observation. It reports the route, worker heartbeat, last contact recorded by a job and queue counts. Use `inspect` for the state and progress of a particular job. Past job receipts keep their original observation times.

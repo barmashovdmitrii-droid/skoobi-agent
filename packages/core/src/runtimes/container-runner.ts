@@ -161,6 +161,9 @@ export interface CodexRunnerInputConfig {
  * in model_traces / session_finished; the INFO line per turn comes from it.
  */
 export interface CodexTurnTelemetry {
+  /** Requested at spawn and observed in this attempt's own turn_context. */
+  requestedModel?: string;
+  observedModel?: string;
   /**
    * Where `usage` comes from: 'turn_delta' — this turn's share of the
    * thread totals; 'cumulative_first_turn' — a fresh or unreadable thread,

@@ -1642,6 +1642,16 @@ export function setRouterState(key: string, value: string): void {
   ).run(key, value);
 }
 
+/** Remove expired saved text, keeping the source cursor until the queue consumes it. */
+export function scrubExpiredReadyTextBodies(cutoffMs: number): void {
+  db.prepare(`
+    UPDATE router_state SET value = json_set(value, '$.text', '')
+    WHERE key GLOB 'ready_text_final:*' AND CASE WHEN json_valid(value)
+      THEN json_extract(value, '$.savedAt') <= ? AND json_extract(value, '$.text') <> ''
+      ELSE 0 END
+  `).run(cutoffMs);
+}
+
 // --- Session accessors ---
 
 export function setSession(groupFolder: string, sessionId: string): void {

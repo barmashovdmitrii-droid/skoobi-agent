@@ -219,6 +219,7 @@ export async function rewriteLocalFileLinks(input: {
   isMain: boolean;
   /** The chat's channel has sendDocument (WhatsApp does not). */
   canSendDocuments: boolean;
+  canSend?: () => boolean;
   nowMs?: number;
   /** Test seams. */
   groupRoot?: string;
@@ -309,10 +310,11 @@ export async function rewriteLocalFileLinks(input: {
 
     const previous = recentChatFileSend(
       input.groupFolder,
+      input.chatJid,
       realPath,
       input.nowMs,
     );
-    queued ??= queuedIpcFileSends(input.groupFolder, input.ipcMessagesDir);
+    queued ??= queuedIpcFileSends(input.groupFolder, input.chatJid, input.ipcMessagesDir);
     if (previous || queued.has(realPath)) {
       const inFlight = previous !== 'sent';
       const result: LocalFileLinkResult = {
@@ -360,7 +362,7 @@ export async function rewriteLocalFileLinks(input: {
       label && label !== name && label !== path.parse(name).name
         ? label.slice(0, MAX_CAPTION_CHARS)
         : undefined;
-    noteChatFileSendStarted(input.groupFolder, realPath, input.nowMs);
+    noteChatFileSendStarted(input.groupFolder, input.chatJid, realPath, input.nowMs);
     let delivered = false;
     try {
       delivered = await input.router.sendDocument(
@@ -371,6 +373,7 @@ export async function rewriteLocalFileLinks(input: {
           // An attachment of the answer, not the answer: the text's own
           // delivery decides the chat cursor.
           suppressCursorAdvance: true,
+          ...(input.canSend ? { canSend: input.canSend } : {}),
           meta: { kind: 'local_file_document' },
         },
       );
@@ -379,6 +382,7 @@ export async function rewriteLocalFileLinks(input: {
     }
     noteChatFileSendFinished(
       input.groupFolder,
+      input.chatJid,
       realPath,
       delivered,
       input.nowMs,

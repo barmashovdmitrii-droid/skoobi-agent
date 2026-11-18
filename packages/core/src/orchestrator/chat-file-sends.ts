@@ -121,10 +121,11 @@ function folderSends(
 /** The IPC watcher (or the host itself) is about to send this file. */
 export function noteChatFileSendStarted(
   groupFolder: string,
+  chatJid: string,
   filePath: string,
   nowMs: number = Date.now(),
 ): void {
-  const key = realOrResolved(filePath);
+  const key = JSON.stringify([chatJid, realOrResolved(filePath)]);
   const sends = folderSends(groupFolder, nowMs);
   sends.delete(key);
   sends.set(key, { state: 'sending', atMs: nowMs });
@@ -133,11 +134,12 @@ export function noteChatFileSendStarted(
 /** The send finished: confirmed, or forgotten when the channel refused it. */
 export function noteChatFileSendFinished(
   groupFolder: string,
+  chatJid: string,
   filePath: string,
   delivered: boolean,
   nowMs: number = Date.now(),
 ): void {
-  const key = realOrResolved(filePath);
+  const key = JSON.stringify([chatJid, realOrResolved(filePath)]);
   const sends = folderSends(groupFolder, nowMs);
   sends.delete(key);
   if (delivered) sends.set(key, { state: 'sent', atMs: nowMs });
@@ -146,10 +148,11 @@ export function noteChatFileSendFinished(
 /** How this file went to this group's chat in the last 30 minutes, if at all. */
 export function recentChatFileSend(
   groupFolder: string,
+  chatJid: string,
   realPath: string,
   nowMs: number = Date.now(),
 ): ChatFileSendState | null {
-  const entry = sendsByFolder.get(groupFolder)?.get(realPath);
+  const entry = sendsByFolder.get(groupFolder)?.get(JSON.stringify([chatJid, realPath]));
   if (!entry || nowMs - entry.atMs > RECENT_CHAT_FILE_SEND_MS) return null;
   return entry.state;
 }
@@ -162,6 +165,7 @@ export function recentChatFileSend(
  */
 export function queuedIpcFileSends(
   groupFolder: string,
+  chatJid: string,
   messagesDir?: string,
 ): Set<string> {
   const queued = new Set<string>();
@@ -187,10 +191,12 @@ export function queuedIpcFileSends(
         { maxBytes: MAX_ENVELOPE_BYTES, oversize: 'reject' },
       );
       const data = JSON.parse(buffer.toString('utf-8')) as {
+        chatJid?: unknown;
         type?: unknown;
         filePath?: unknown;
       };
       if (
+        data.chatJid === chatJid &&
         (data.type === 'document' || data.type === 'photo') &&
         typeof data.filePath === 'string' &&
         data.filePath

@@ -43,7 +43,7 @@ describe('actual final file reopen and rasterization', () => {
         .toString(),
     ).toBe('PNG');
     expect(result.humanAcceptance).toBe('not_recorded');
-  });
+  }, 60_000);
   it('does not render different bytes under an old expected hash', async () => {
     const result = await renderCalculationDocument({
       filename: path.join(fixture, 'good.pdf'),

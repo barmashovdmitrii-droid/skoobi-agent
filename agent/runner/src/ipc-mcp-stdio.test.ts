@@ -2302,6 +2302,8 @@ describe('skill_* tools', () => {
       expect(proposed.content[0].text).toMatch(
         /submitted for operator review/i,
       );
+      expect(proposed.content[0].text).toMatch(/verify-register.*verify.*verification.*approve/i);
+      expect(proposed.content[0].text).toContain('receipt confirms queuing only');
 
       // No direct write into the (read-only) skills dir.
       expect(

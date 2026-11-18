@@ -968,7 +968,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   const sentFileKey = fileValidation.staged
                     ? String(data.filePath)
                     : fileValidation.realPath;
-                  noteChatFileSendStarted(sourceGroup, sentFileKey);
+                  noteChatFileSendStarted(sourceGroup, data.chatJid, sentFileKey);
                   let ok = false;
                   try {
                     ok = await traceAuthorizedIpcDelivery(
@@ -982,7 +982,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                         ),
                     );
                   } finally {
-                    noteChatFileSendFinished(sourceGroup, sentFileKey, ok);
+                    noteChatFileSendFinished(sourceGroup, data.chatJid, sentFileKey, ok);
                     if (fileValidation.staged) {
                       try {
                         fs.unlinkSync(fileValidation.realPath);
@@ -1065,7 +1065,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   const sentFileKey = fileValidation.staged
                     ? String(data.filePath)
                     : fileValidation.realPath;
-                  noteChatFileSendStarted(sourceGroup, sentFileKey);
+                  noteChatFileSendStarted(sourceGroup, data.chatJid, sentFileKey);
                   let ok = false;
                   try {
                     ok = await traceAuthorizedIpcDelivery(
@@ -1079,7 +1079,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                         ),
                     );
                   } finally {
-                    noteChatFileSendFinished(sourceGroup, sentFileKey, ok);
+                    noteChatFileSendFinished(sourceGroup, data.chatJid, sentFileKey, ok);
                     if (fileValidation.staged) {
                       try {
                         fs.unlinkSync(fileValidation.realPath);

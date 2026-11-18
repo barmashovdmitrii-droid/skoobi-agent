@@ -337,7 +337,9 @@ def safe_path(name,directory_entry=False):
     if not directory_entry:
         low=parts[-1].lower();ext=os.path.splitext(low)[1]
         notice=low in NOTICES or (low.startswith(('ofl-','license-','licence-','notice-','credits-','attribution-')) and ext in ('.txt','.md'))
-        if ext not in ALLOW and not notice:fail()
+        if q.get('profile') == 'roblox_place':
+            if len(parts) != 1 or parts[0] != q['entrypoint'] or ext not in ('.rbxl','.rbxlx'):fail()
+        elif ext not in ALLOW and not notice:fail()
     return parts
 sources=q['sources']
 if not sources or len(sources)>20 or sum(s['bytes'] for s in sources)>MAX:fail()
@@ -481,6 +483,7 @@ export async function importFactoryPeerResult(
     jobId: string;
     artifactName?: string;
     entrypoint: string;
+    profile?: 'roblox_place';
     destinationRoot: string;
   },
   host: FactoryPeerResultHost = {},
@@ -537,10 +540,12 @@ export async function importFactoryPeerResult(
       sources: sources(selected),
       output: unpacked,
       entrypoint: input.entrypoint,
+      ...(input.profile && {profile:input.profile}),
     });
     const manifest = await importFactorySourceAsync({
       sourceRoot: unpacked,
       entrypoint: input.entrypoint,
+      ...(input.profile && {profile:input.profile}),
       allowedRoots: [temporary],
       destinationRoot: input.destinationRoot,
     });

@@ -221,3 +221,28 @@ test('watch resolves a durable context adapter separately for every job after re
   assert.deepEqual(selected.sort(),ids.sort());
   for(const id of ids)assert.equal(f.store.state(id).assessment.status,'passed');
 });
+
+test('terminal receipt polling preserves state until the host changes its receipt',async t=>{
+  const f=fixture(t),job=await queued(f);
+  await reconcilePeerV2(f.c,job.id,async()=>completion(job.id),f.host);
+  const initial=f.store.state(job.id);
+  const receipt={eventId:initial.resultEventId,jobId:job.id,revision:initial.revision,resultHash:initial.assessment.resultHash,delivery:'pending'};
+  const receipts=privateDirectory(path.join(f.host.config.root,'receipts'),true);
+  const filename=path.join(receipts,receipt.eventId+'.json');
+  const stateFile=path.join(f.store.dir(job.id),'state.json');
+  const never=async()=>{throw Error('no remote execution allowed');};
+  atomicWrite(filename,receipt);await watchPeerV2(f.c,never,()=>false,f.host);
+  const recorded=fs.statSync(stateFile,{bigint:true});
+  await watchPeerV2(f.c,never,()=>false,f.host);await watchPeerV2(f.c,never,()=>false,f.host);
+  assert.equal(fs.statSync(stateFile,{bigint:true}).ino,recorded.ino);
+  assert.equal(fs.statSync(stateFile,{bigint:true}).mtimeNs,recorded.mtimeNs);
+  atomicWrite(filename,{...receipt,delivery:'disabled'});await watchPeerV2(f.c,never,()=>false,f.host);
+  assert.equal(f.store.state(job.id).deliveryState,'disabled');
+  const {peerHealth}=await import('./skoobi-peer.mjs');
+  const offline=await peerHealth(f.c,never);
+  assert.equal(offline.route,'unavailable');assert.equal(offline.worker,'unknown');
+  assert.equal(offline.lastJobContactAt,initial.lastRemoteAt);assert.deepEqual(offline.jobs,{active:0,total:1});
+  const online=await peerHealth(f.c,async()=>hello());assert.equal(online.worker,'running');
+  const stale=await peerHealth(f.c,async()=>({...hello(),heartbeat:{updatedAt:'2000-01-01T00:00:00Z'}}));
+  assert.equal(stale.route,'reachable');assert.equal(stale.worker,'unknown');
+});

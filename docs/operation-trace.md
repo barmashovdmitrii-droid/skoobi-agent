@@ -46,3 +46,18 @@ The command opens the existing database read-only. It does not initialize or
 migrate the instance and never reads legacy event payloads. Scope arguments are
 local operator inputs, not an authorization mechanism or a network API. Keep
 exports local unless their metadata is appropriate to share.
+
+## Saved reply delivery
+
+Run the following from the installation directory to summarize saved replies
+for the past seven days.
+
+```sh
+node scripts/ready-delivery-report.mjs
+```
+
+The report counts prepared replies, acknowledged finals and retry attempts.
+Median and 95th-percentile times start at the first admitted input for the
+reply. A missing final acknowledgement leaves delivery unconfirmed. The report
+reads the local database and prints aggregate numbers. Use `--help` to supply a
+different database or time window.

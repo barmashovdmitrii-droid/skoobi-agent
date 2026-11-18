@@ -5,8 +5,8 @@ Linux. It keeps conversations and runtime state on your computer, uses an
 authenticated local Codex CLI by default, and runs owner tools inside an
 isolated sandbox.
 
-The `2.1` line adds structured memory and improved task continuity.
-Review the release notes before upgrading an older installation.
+Version 2.4 adds recoverable Telegram replies, revision-aware work records and
+verified Roblox build capture. Review the [changelog](CHANGELOG.md) before upgrading.
 
 ## Quick start
 
@@ -87,7 +87,7 @@ uses the absolute Codex path found during installation.
 ### 4. Download and verify the release installer
 
 ```bash
-VERSION=v2.2.0
+VERSION=v2.4.0
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh"
 curl -fLO "https://github.com/barmashovdmitrii-droid/skoobi-agent/releases/download/$VERSION/install.sh.sha256"
 ```

@@ -56,7 +56,9 @@ export function createMessageRouter(channels: Channel[], hostOptions: {
       postHooks.push(hook);
     },
 
-    async route(envelope: OutboundEnvelope): Promise<string | null> {
+    async route(envelope: OutboundEnvelope, canSend?: () => boolean): Promise<string | null> {
+      const expectedJid = envelope.chatJid;
+      const expectedFolder = envelope.groupFolder;
       let current = envelope;
       const trace = currentOperationTrace();
       const response = startOperationTraceStage(trace, 'response');
@@ -117,6 +119,10 @@ export function createMessageRouter(channels: Channel[], hostOptions: {
         throw new Error('No connected channel for JID');
       }
 
+      // Revalidate the original destination and live request after asynchronous
+      // hooks, immediately before handing a private saved final to the channel.
+      const allowed = () => !canSend || (expectedJid === current.chatJid &&
+        expectedFolder === current.groupFolder && canSend());
       const progressKey = current.meta?.progressKey;
       try {
       if (
@@ -126,6 +132,7 @@ export function createMessageRouter(channels: Channel[], hostOptions: {
         (current.meta?.kind === 'agent_progress' ||
           current.meta?.kind === 'host_progress')
       ) {
+        if (!allowed()) { delivery.finish('skipped', { reason: 'dropped' }); return null; }
         const delivered = await channel.sendProgress(current.chatJid, formatted, progressKey);
         if (!delivered) {
           delivery.finish('skipped', { reason: 'dropped' });
@@ -138,7 +145,9 @@ export function createMessageRouter(channels: Channel[], hostOptions: {
         ) {
           await channel.finishProgress?.(current.chatJid, progressKey);
         }
-        await channel.sendMessage(current.chatJid, formatted);
+        if (!allowed()) { delivery.finish('skipped', { reason: 'dropped' }); return null; }
+        if (canSend) await channel.sendMessage(current.chatJid, formatted, {canSend: allowed});
+        else await channel.sendMessage(current.chatJid, formatted);
       }
       } catch (error) {
         // A timeout can follow a successful remote send; absence of an ACK
@@ -224,6 +233,7 @@ export function createMessageRouter(channels: Channel[], hostOptions: {
       caption?: string,
       options?: {
         suppressCursorAdvance?: boolean;
+        canSend?: () => boolean;
         meta?: Record<string, unknown>;
       },
     ): Promise<boolean> {
@@ -262,6 +272,7 @@ export function createMessageRouter(channels: Channel[], hostOptions: {
             return false;
           }
         }
+        if (options?.canSend && !options.canSend()) { delivery.finish('skipped', { reason: 'dropped' }); return false; }
         await channel.sendDocument(jid, checkedArtifact?.required ? checkedArtifact.snapshotPath! : filePath, caption);
         delivery.finish('succeeded', { reason: 'api_acknowledged' });
         logger.info(
@@ -294,7 +305,7 @@ export function createMessageRouter(channels: Channel[], hostOptions: {
       }
     },
 
-    async sendVoice(jid: string, text: string): Promise<boolean> {
+    async sendVoice(jid, text, control): Promise<boolean> {
       const delivery = startOperationTraceStage(currentOperationTrace(), 'delivery', { deliveryKind: 'final' });
       const channel = channels.find(
         (c) =>
@@ -308,7 +319,11 @@ export function createMessageRouter(channels: Channel[], hostOptions: {
         return false;
       }
       try {
-        await channel.sendVoice(jid, text);
+        if (control && !control.canSend()) { delivery.finish('skipped', { reason: 'dropped' }); return false; }
+        if (control) {
+          if (!channel.voiceTransportAware) control.transportAttempted();
+          await channel.sendVoice(jid, text, control);
+        } else await channel.sendVoice(jid, text);
         delivery.finish('succeeded', { reason: 'api_acknowledged' });
         logger.info({ jid, length: text.length }, 'Voice sent');
         runPostHooks({

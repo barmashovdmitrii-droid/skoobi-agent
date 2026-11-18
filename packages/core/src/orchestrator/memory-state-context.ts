@@ -1,6 +1,7 @@
 import { escapeXml } from '@skoobi/shared';
 import { editorialFeedbackContext } from './editorial-feedback.js';
 
+import { projectWaitingState } from './memory-state-store.js';
 import type {
   MemoryStateListing,
   MemoryStateRecord,
@@ -100,6 +101,7 @@ function source(record: MemoryStateRecord): object {
 
 function projectView(project: Project): object {
   const card = project.card;
+  const waitingState = projectWaitingState(card);
   return {
     projectKey: project.projectKey,
     revision: project.revision,
@@ -109,10 +111,26 @@ function projectView(project: Project): object {
     pending: card.pending.slice(0, 4).map((text) => compact(text, 240)),
     completed: card.completed.slice(0, 3).map((text) => compact(text, 200)),
     waiting: card.waiting ? compact(card.waiting, 300) : null,
+    ...(waitingState ? {
+      waitingOn: waitingState.waitingOn,
+      nextStep: waitingState.nextStep ? compact(waitingState.nextStep, 300) : null,
+      stepSource: waitingState.stepSource,
+    } : {}),
     artifacts: card.artifacts.slice(0, 3).map((artifact) => ({
       path: compact(artifact.path, 300),
       reportedState: artifact.state,
     })),
+    ...(card.work ? { work: {
+      target: card.work.target,
+      executor: card.work.executor,
+      lastObservedAt: card.work.lastObservedAt,
+      requirementsRevision: card.work.requirementsRevision,
+      nextStep: card.work.nextStep ? compact(card.work.nextStep,300) : null,
+      remainingCriteria: card.work.criteria.filter(c => c.state !== 'passed').slice(0,5).map(c=>({key:c.key,description:compact(c.description,240),state:c.state})),
+      reportedPassed: card.work.criteria.filter(c=>c.state==='passed').length,
+      totalCriteria: card.work.criteria.length,
+      evidence: 'reported_not_verified',
+    }} : {}),
     readFullRecordForOmittedDetails: true,
     evidence: 'reported_not_verified',
     source: source(project),

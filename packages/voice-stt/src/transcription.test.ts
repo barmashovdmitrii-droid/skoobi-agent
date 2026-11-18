@@ -1405,6 +1405,46 @@ describe('typed local transcription evidence', () => {
     expect(parseLocalTranscriptionResult(result)).toEqual(result);
   });
 
+  it.each([
+    ['Поправка. Перенеси встречу со среды на воскресенье.',
+      'Поправка. Перенеси встречу со среды на субботу.', 'date', ['воскресенье','субботу']],
+    ['Стоп, не отправляй письмо.','Стоп, отправляй письмо.', 'negation', undefined],
+  ])('compares a sensitive Russian instruction in one extra local pass: %s', async (first, second, kind, variants) => {
+    const exec = localExecForPasses({
+      auto:{text:first as string,language:'ru',languageProbability:0.99,tokenProbabilities:[0.99]},
+      ru:{text:second as string,language:'ru',tokenProbabilities:[0.98]},
+    });
+    const result = await createSerializedLocalTranscribers(() => config({initialPrompt:'fixture vocabulary'}), exec)
+      .detailed(await sourceFile());
+    expect(result.recheck).toMatchObject({reason:'sensitive_correction',comparison:'different'});
+    expect(result.status).toBe('doubtful');
+    expect(result.ambiguities).toContainEqual(expect.objectContaining({kind,...(variants ? {variants} : {})}));
+    expect(result.passes.map(pass => pass.requestedLanguage)).toEqual(['auto','ru']);
+    expect(exec.mock.calls[1][1]).toContain('--prompt');
+    expect(exec.mock.calls[2][1]).not.toContain('--prompt');
+    expect(parseLocalTranscriptionResult(result)).toEqual(result);
+  });
+
+  it.each([
+    ['Перенеси выставку с октябра на декабрь.', 'doubtful', 2],
+    ['Перенеси выставку с октября на декабрь.', 'success', 2],
+    ['Перенеси встречу с редактором на среду.', 'success', 2],
+    ['В прошлый вторник в городе прошла выставка.', 'success', 1],
+    ['Замени уровень 7 на уровень 8.', 'success', 1],
+    ['Продолжение следует в следующем выпуске, поэтому пока не публикуй окончательный вариант.', 'success', 2],
+  ] as const)('checks an incomplete schedule term without rewriting it: %s', async (text, status, count) => {
+    const exec = localExecForPasses({
+      auto:{text,language:'ru',languageProbability:0.99,tokenProbabilities:[0.99]},
+      ru:{text,language:'ru',tokenProbabilities:[0.98]},
+    });
+    const result = await createSerializedLocalTranscribers(() => config(), exec).detailed(await sourceFile());
+    expect(result.text).toBe(text);
+    expect(result.status).toBe(status);
+    expect(result.uncertainty).toEqual(status === 'doubtful' ? ['unrecognized_date_term'] : []);
+    expect(result.passes).toHaveLength(count);
+    expect(parseLocalTranscriptionResult(result)).toEqual(result);
+  });
+
   it('uses the existing bounded rechecks for an isolated suspect tail but never cuts the phrase out', async () => {
     const text = 'Отправь файл. Продолжение следует...';
     const exec = localExecForPasses({
@@ -1484,7 +1524,7 @@ describe('typed local transcription evidence', () => {
     'Для нового выпуска нашего небольшого проекта мы вместе заранее придумали название «Продолжение следует...».',
     'После просмотра нового выпуска нашего небольшого проекта все зрители задали один вопрос: Продолжение следует?',
     'Мы внимательно прочитали новый выпуск нашего небольшого проекта и уже знаем что продолжение следует...',
-    'Продолжение следует в следующем выпуске, поэтому пока не публикуй окончательный вариант.',
+    'Продолжение следует в следующем выпуске, поэтому окончательного варианта пока нет.',
   ])(
     'does not add a caption recheck for a title, quotation, question or ordinary use: %s',
     async (text) => {
