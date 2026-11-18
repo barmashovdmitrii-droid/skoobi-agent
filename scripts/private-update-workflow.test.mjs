@@ -11,10 +11,11 @@ it('checks isolated private update receipts, real process interruption and exact
       ),
     ],
     {
-      timeout: 90_000,
+      // This subprocess runs the whole sequential Python integration suite.
+      timeout: 180_000,
       maxBuffer: 128 * 1024,
       stdio: 'pipe',
       env: { PATH: process.env.PATH || '', PYTHONDONTWRITEBYTECODE: '1' },
     },
   );
-}, 100_000);
+}, 200_000);
