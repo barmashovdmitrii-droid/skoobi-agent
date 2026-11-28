@@ -8,6 +8,15 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { elideUnchangedStandingBlocks } from './index.js';
 import { withTaskContinuityPolicy } from './task-continuity.js';
 
+// Linux limits a single command-line argument to 128 KiB (MAX_ARG_STRLEN) and
+// some prompts here are larger, so the harness goes to a file instead of
+// `node -e`: on Linux the spawn failed with E2BIG.
+const writeHarness = (root: string, code: string): string => {
+  const file = path.join(root, `harness-${process.hrtime.bigint()}.cjs`);
+  fs.writeFileSync(file, code);
+  return file;
+};
+
 /**
  * W29: after a compaction the runner keeps re-sending only the standing
  * blocks the compacted thread no longer holds. The real provider loop runs
@@ -139,8 +148,7 @@ function compactionFixture() {
         [
           '--import',
           path.resolve('node_modules/tsx/dist/loader.mjs'),
-          '-e',
-          harness,
+          writeHarness(root, harness),
         ],
         {
           cwd: root,
@@ -396,8 +404,7 @@ function plannedFixture() {
         [
           '--import',
           path.resolve('node_modules/tsx/dist/loader.mjs'),
-          '-e',
-          harness,
+          writeHarness(root, harness),
         ],
         {
           cwd: root,
