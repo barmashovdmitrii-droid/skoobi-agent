@@ -1,0 +1,143 @@
+import path from 'path';
+
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import {
+  resetInstanceProfileForTests,
+  setInstanceProfileForTests,
+} from '@skoobi/shared/instance-profile';
+
+vi.mock('@skoobi/shared/env', () => ({
+  readEnvFile: vi.fn(() => ({})),
+}));
+
+const ENV_KEYS = [
+  'ASSISTANT_NAME',
+  'ASSISTANT_HAS_OWN_NUMBER',
+  'SKOOBI_WHATSAPP_STATE_ROOT',
+  'SKOOBI_WHATSAPP_PERSONAL_OBSERVER_ENABLED',
+  'SKOOBI_WHATSAPP_OWNER_FOLDER',
+  'SKOOBI_WHATSAPP_TEMPLATE_GROUP',
+  'SKOOBI_WHATSAPP_OBSERVER_RETENTION_DAYS',
+  'SKOOBI_WHATSAPP_OBSERVER_MAX_ROWS',
+  'INIT_CWD',
+] as const;
+
+const originalEnv = Object.fromEntries(
+  ENV_KEYS.map((key) => [key, process.env[key]]),
+);
+
+afterEach(() => {
+  for (const key of ENV_KEYS) {
+    const value = originalEnv[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  resetInstanceProfileForTests();
+  vi.resetModules();
+});
+
+describe('WhatsApp personal observer config', () => {
+  it('uses the shared Unicode assistant-name normalization', async () => {
+    process.env.ASSISTANT_NAME = '  A\u0301gent_2-Я  ';
+    vi.resetModules();
+
+    const config = await import('./channel-config.js');
+
+    expect(config.ASSISTANT_NAME).toBe('Ágent_2-Я');
+  });
+
+  it('fails closed for invalid assistant names and keeps the unset default', async () => {
+    process.env.ASSISTANT_NAME = '[a-z]+';
+    vi.resetModules();
+    expect((await import('./channel-config.js')).ASSISTANT_NAME).toBe('Skoobi');
+
+    // Unset: the name of the installation comes from its instance profile…
+    setInstanceProfileForTests({ assistant: { defaultName: 'fixture_bot' } });
+    delete process.env.ASSISTANT_NAME;
+    vi.resetModules();
+    expect((await import('./channel-config.js')).ASSISTANT_NAME).toBe(
+      'fixture_bot',
+    );
+
+    // …an invalid explicit name still fails closed to the product name, not
+    // to the profile name…
+    process.env.ASSISTANT_NAME = '[a-z]+';
+    vi.resetModules();
+    expect((await import('./channel-config.js')).ASSISTANT_NAME).toBe('Skoobi');
+
+    // …and without a profile the unset default is the neutral product name.
+    resetInstanceProfileForTests();
+    delete process.env.ASSISTANT_NAME;
+    vi.resetModules();
+    expect((await import('./channel-config.js')).ASSISTANT_NAME).toBe('Skoobi');
+  });
+
+  it('lets ASSISTANT_NAME from the environment win over the profile name', async () => {
+    setInstanceProfileForTests({ assistant: { defaultName: 'fixture_bot' } });
+    process.env.ASSISTANT_NAME = 'Envbot';
+    vi.resetModules();
+    expect((await import('./channel-config.js')).ASSISTANT_NAME).toBe('Envbot');
+  });
+
+  it('requires an explicit lowercase true for dedicated-number mode', async () => {
+    process.env.ASSISTANT_HAS_OWN_NUMBER = 'false';
+    vi.resetModules();
+    let config = await import('./channel-config.js');
+    expect(config.ASSISTANT_HAS_OWN_NUMBER).toBe(false);
+
+    process.env.ASSISTANT_HAS_OWN_NUMBER = 'TRUE';
+    vi.resetModules();
+    config = await import('./channel-config.js');
+    expect(config.ASSISTANT_HAS_OWN_NUMBER).toBe(false);
+    process.env.ASSISTANT_HAS_OWN_NUMBER = 'true';
+    vi.resetModules();
+    config = await import('./channel-config.js');
+    expect(config.ASSISTANT_HAS_OWN_NUMBER).toBe(true);
+  });
+
+  it('uses explicit state root and parses bounded observer settings', async () => {
+    process.env.SKOOBI_WHATSAPP_STATE_ROOT = '/tmp/skoobi-wa-explicit';
+    process.env.INIT_CWD = '/tmp/skoobi-wa-init';
+    process.env.SKOOBI_WHATSAPP_PERSONAL_OBSERVER_ENABLED = 'true';
+    process.env.SKOOBI_WHATSAPP_OWNER_FOLDER = 'wa_owner';
+    process.env.SKOOBI_WHATSAPP_TEMPLATE_GROUP = 'telegram_template';
+    process.env.SKOOBI_WHATSAPP_OBSERVER_RETENTION_DAYS = '365';
+    process.env.SKOOBI_WHATSAPP_OBSERVER_MAX_ROWS = '75000';
+    vi.resetModules();
+
+    const config = await import('./channel-config.js');
+    expect(config.WHATSAPP_STATE_ROOT).toBe('/tmp/skoobi-wa-explicit');
+    expect(config.STORE_DIR).toBe('/tmp/skoobi-wa-explicit/store');
+    expect(config.WHATSAPP_PERSONAL_OBSERVER).toEqual({
+      enabled: true,
+      ownerFolder: 'wa_owner',
+      templateGroupFolder: 'telegram_template',
+      retentionDays: 365,
+      maxRows: 75_000,
+    });
+  });
+
+  it('uses INIT_CWD for npm workspace auth and rejects unsafe/unbounded values', async () => {
+    delete process.env.SKOOBI_WHATSAPP_STATE_ROOT;
+    process.env.INIT_CWD = '/tmp/skoobi-wa-init';
+    process.env.SKOOBI_WHATSAPP_PERSONAL_OBSERVER_ENABLED = 'yes';
+    process.env.SKOOBI_WHATSAPP_OWNER_FOLDER = 'whatsapp.main';
+    process.env.SKOOBI_WHATSAPP_TEMPLATE_GROUP = 'also/unsafe';
+    process.env.SKOOBI_WHATSAPP_OBSERVER_RETENTION_DAYS = '999999';
+    process.env.SKOOBI_WHATSAPP_OBSERVER_MAX_ROWS = '1';
+    vi.resetModules();
+
+    const config = await import('./channel-config.js');
+    expect(config.WHATSAPP_STATE_ROOT).toBe(
+      path.resolve('/tmp/skoobi-wa-init'),
+    );
+    expect(config.WHATSAPP_PERSONAL_OBSERVER).toEqual({
+      enabled: false,
+      ownerFolder: 'whatsapp_main',
+      templateGroupFolder: undefined,
+      retentionDays: 90,
+      maxRows: 50_000,
+    });
+  });
+});

@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install runtime test dependencies
+        shell: bash
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              brew install ripgrep
+            else
+              sudo apt-get update
+              sudo apt-get install -y ripgrep
+            fi
+          fi
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install agent runner dependencies
+        run: npm ci --prefix agent/runner
+
+      - name: Install browser for artifact acceptance checks
+        run: npx playwright install --with-deps chromium
+
+      # Ubuntu restricts user namespaces for downloaded Chromium binaries.
+      # Allow only this installed executable to create its normal sandbox;
+      # keep the machine-wide policy and Chromium sandbox enabled.
+      - name: Allow Chromium sandbox on the Linux CI runner
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          restriction=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [[ -f "$restriction" && "$(cat "$restriction")" == 1 ]]; then
+            profile_path="$RUNNER_TEMP/skoobi-ci-chromium.apparmor"
+            node --input-type=module - "$profile_path" <<'NODE'
+          import fs from 'node:fs';
+          import { chromium } from 'playwright';
+          const executable = fs.realpathSync(chromium.executablePath());
+          if (!/^\/[a-zA-Z0-9_./ -]+$/.test(executable)) {
+            throw new Error('Unexpected Chromium path for an exact AppArmor rule');
+          }
+          fs.writeFileSync(process.argv[2], [
+            'abi <abi/4.0>,',
+            'include <tunables/global>',
+            `profile skoobi-ci-chromium "${executable}" flags=(unconfined) {`,
+            '  userns,',
+            '}',
+            '',
+          ].join('\n'), { mode: 0o600 });
+          NODE
+            sudo install -m 0644 "$profile_path" /etc/apparmor.d/skoobi-ci-chromium
+            sudo apparmor_parser --replace /etc/apparmor.d/skoobi-ci-chromium
+          fi
+
+      # Integration subprocesses need the compiled workspace exports.
+      - name: Build
+        run: npm run build
+
+      - name: Typecheck
+        id: typecheck
+        run: npm run typecheck
+
+      # Tests run as two required steps (the list is in setup/vitest-groups.ts).
+      # Tests that start real processes or a browser do not fit their limits
+      # when they share the runner's cores with the rest. No retries.
+      - name: Test
+        env:
+          SKOOBI_VITEST_GROUP: main
+        run: npm test
+
+      # Runs after a red Test step too (when build and types passed), so one
+      # run shows both results. The job is red if either step fails.
+      - name: Test (real processes, one file at a time)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        env:
+          SKOOBI_VITEST_GROUP: processes
+        run: npm test -- --no-file-parallelism
+
+      - name: Validate generated systemd unit
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="${RUNNER_TEMP}/Skoobi verify % dollar\$ quote\" кириллица"
+          service_home="${RUNNER_TEMP}/Home % dollar\$ quote\" slash\\ кириллица"
+          node_dir="${RUNNER_TEMP}/Node % dollar\$ кириллица"
+          unit="${RUNNER_TEMP}/skoobi-ci.service"
+          mkdir -p "$prefix/instances/ci" "$service_home" "$node_dir"
+          cp "$(command -v node)" "$node_dir/node"
+          chmod 700 "$node_dir/node"
+          HOME="$service_home" PATH="$node_dir:$PATH" bash scripts/install.sh \
+            --print-service linux \
+            --prefix "$prefix" \
+            --instance ci >"$unit"
+          systemd-analyze verify --recursive-errors=no "$unit"
+
+      - name: Check shell scripts
+        run: for script in scripts/*.sh; do bash -n "$script"; done

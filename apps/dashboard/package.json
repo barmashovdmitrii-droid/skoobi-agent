@@ -1,0 +1,14 @@
+{
+  "name": "@skoobi/app-dashboard",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Сборка Скуби-панели: локальный веб-интерфейс мониторинга и управления (127.0.0.1:8801). Запускается с cwd = каталог инстанса — панель показывает тот инстанс, из чьей папки запущена.",
+  "type": "module",
+  "main": "./dist/service.js",
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@skoobi/dashboard": "*"
+  }
+}

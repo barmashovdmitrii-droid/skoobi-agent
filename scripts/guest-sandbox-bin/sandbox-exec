@@ -1,0 +1,263 @@
+#!/usr/bin/env node
+
+/**
+ * macOS guest-only sandbox-exec shim.
+ *
+ * @anthropic-ai/sandbox-runtime 0.0.42 builds a good network/write Seatbelt
+ * profile, but its read-deny API can only name paths that already exist. The
+ * orchestrator places this owner-controlled directory first in PATH for a
+ * guest run only. srt consequently calls this shim, which validates a compact
+ * host-generated policy, appends non-enumerative compound denies to srt's
+ * profile, removes its private bootstrap environment, and delegates to the
+ * immutable system binary. Owner/main runs never receive this PATH prefix.
+ */
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+export const POLICY_ENV = 'CLAUDECLAW_GUEST_SEATBELT_POLICY_B64';
+const INTERNAL_ENV_PREFIX = 'CLAUDECLAW_GUEST_SEATBELT_';
+const MAX_POLICY_B64_LENGTH = 128 * 1024;
+const MAX_PROFILE_LENGTH = 4 * 1024 * 1024;
+const MAX_PATH_LENGTH = 4096;
+const MAX_BOUNDARIES = 128;
+const MAX_ALLOWED_PER_BOUNDARY = 128;
+
+function fail(message) {
+  throw new Error(`guest sandbox-exec: ${message}`);
+}
+
+function isPlainObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function hasExactKeys(value, expected) {
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return (
+    actual.length === wanted.length &&
+    actual.every((key, index) => key === wanted[index])
+  );
+}
+
+function isWithin(parent, child) {
+  const relative = path.posix.relative(parent, child);
+  return (
+    relative !== '' &&
+    !relative.startsWith('..') &&
+    !path.posix.isAbsolute(relative)
+  );
+}
+
+function validatePath(value, label, allowRoot = false) {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > MAX_PATH_LENGTH ||
+    /[\x00-\x1f\x7f]/.test(value) ||
+    !path.posix.isAbsolute(value) ||
+    path.posix.normalize(value) !== value ||
+    (!allowRoot && path.posix.dirname(value) === value)
+  ) {
+    fail(`invalid ${label}`);
+  }
+  return value;
+}
+
+export function decodeAndValidatePolicy(encoded) {
+  if (
+    typeof encoded !== 'string' ||
+    encoded.length === 0 ||
+    encoded.length > MAX_POLICY_B64_LENGTH ||
+    !/^[A-Za-z0-9_-]+$/.test(encoded)
+  ) {
+    fail('missing or malformed policy encoding');
+  }
+  let raw;
+  try {
+    raw = Buffer.from(encoded, 'base64url');
+    if (raw.toString('base64url') !== encoded) {
+      fail('non-canonical policy encoding');
+    }
+  } catch {
+    fail('malformed policy encoding');
+  }
+  let policy;
+  try {
+    policy = JSON.parse(raw.toString('utf8'));
+  } catch {
+    fail('policy is not valid JSON');
+  }
+  if (
+    !isPlainObject(policy) ||
+    !hasExactKeys(policy, ['version', 'boundaries', 'envRoots']) ||
+    policy.version !== 1 ||
+    !Array.isArray(policy.boundaries) ||
+    policy.boundaries.length > MAX_BOUNDARIES ||
+    !Array.isArray(policy.envRoots) ||
+    policy.envRoots.length > 8
+  ) {
+    fail('invalid policy shape/version');
+  }
+
+  const seenBoundaries = new Set();
+  const boundaries = policy.boundaries.map((boundary) => {
+    if (
+      !isPlainObject(boundary) ||
+      !hasExactKeys(boundary, ['parent', 'allowedSubtrees']) ||
+      !Array.isArray(boundary.allowedSubtrees) ||
+      boundary.allowedSubtrees.length > MAX_ALLOWED_PER_BOUNDARY
+    ) {
+      fail('invalid boundary shape');
+    }
+    const parent = validatePath(boundary.parent, 'boundary parent');
+    const seenAllowed = new Set();
+    const allowedSubtrees = boundary.allowedSubtrees.map((allowed) => {
+      const checked = validatePath(allowed, 'authorized subtree');
+      if (!isWithin(parent, checked)) {
+        fail('authorized subtree escapes or equals its boundary');
+      }
+      if (seenAllowed.has(checked)) fail('duplicate authorized subtree');
+      seenAllowed.add(checked);
+      return checked;
+    });
+    const fingerprint = JSON.stringify({ parent, allowedSubtrees });
+    if (seenBoundaries.has(fingerprint)) fail('duplicate boundary');
+    seenBoundaries.add(fingerprint);
+    return { parent, allowedSubtrees };
+  });
+  const envRoots = policy.envRoots.map((root) =>
+    validatePath(root, 'environment-file root'),
+  );
+  if (new Set(envRoots).size !== envRoots.length) {
+    fail('duplicate environment-file root');
+  }
+  return { version: 1, boundaries, envRoots };
+}
+
+function seatbeltString(value) {
+  return JSON.stringify(value);
+}
+
+function regexEscape(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function compoundFilterLines(boundary, indent) {
+  const lines = [`${indent}(subpath ${seatbeltString(boundary.parent)})`];
+  if (boundary.allowedSubtrees.length === 0) return lines;
+  lines.push(`${indent}(require-not`, `${indent}  (require-any`);
+  for (const allowed of boundary.allowedSubtrees) {
+    lines.push(`${indent}    (subpath ${seatbeltString(allowed)})`);
+  }
+  lines.push(`${indent}  )`, `${indent})`);
+  return lines;
+}
+
+function compoundDeny(operation, boundary) {
+  return [
+    `(deny ${operation}`,
+    '  (require-all',
+    ...compoundFilterLines(boundary, '    '),
+    '  )',
+    ')',
+  ].join('\n');
+}
+
+export function appendGuestPolicyToProfile(profile, policy) {
+  if (
+    typeof profile !== 'string' ||
+    profile.length === 0 ||
+    profile.length > MAX_PROFILE_LENGTH ||
+    profile.includes('\0') ||
+    !/^\s*\(version\s+1\)/.test(profile) ||
+    !profile.includes('(deny default')
+  ) {
+    fail('refusing malformed/unexpected upstream Seatbelt profile');
+  }
+  const rules = ['', '; ClaudeClaw guest non-enumerative host-read boundary'];
+  for (const boundary of policy.boundaries) {
+    rules.push(compoundDeny('file-read*', boundary));
+    // A denied file must not be movable into an authorized subtree and then
+    // read there. The identical compound selector still permits create/mv/rm
+    // wholly inside an authorized child.
+    rules.push(compoundDeny('file-write-unlink', boundary));
+  }
+  for (const envRoot of policy.envRoots) {
+    const escapedRoot = regexEscape(envRoot);
+    // Seatbelt's regex dialect accepts ordinary capturing groups but silently
+    // fails to match non-capturing `(?:...)` groups. Keep this deliberately in
+    // the same conservative syntax emitted by srt's own glob converter.
+    const envPattern = `^${escapedRoot}/\\.env(\\..*)?(/.*)?$`;
+    rules.push(
+      `(deny file-read* (regex ${seatbeltString(envPattern)}))`,
+      `(deny file-write-unlink (regex ${seatbeltString(envPattern)}))`,
+    );
+  }
+  // Keep path traversal/stat functional without reopening file contents or
+  // directory listings. srt already emits this for read restrictions; because
+  // our deny is appended later, repeat the metadata-only allowance last.
+  rules.push('(allow file-read-metadata (vnode-type DIRECTORY))');
+  return `${profile.trimEnd()}\n${rules.join('\n')}\n`;
+}
+
+export function sanitizedDelegateEnv(sourceEnv, wrapperDir) {
+  const env = { ...sourceEnv };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith(INTERNAL_ENV_PREFIX)) delete env[key];
+  }
+  const currentPath = String(sourceEnv.PATH || '');
+  const components = currentPath.split(path.delimiter);
+  if (components[0] !== wrapperDir) {
+    fail('wrapper PATH prefix is missing or displaced');
+  }
+  components.shift();
+  if (components.length === 0 || components.some((part) => part.length === 0)) {
+    fail('refusing empty/malformed delegate PATH');
+  }
+  env.PATH = components.join(path.delimiter);
+  return env;
+}
+
+export function run(argv = process.argv.slice(2), sourceEnv = process.env) {
+  if (
+    argv.length < 3 ||
+    argv[0] !== '-p' ||
+    typeof argv[1] !== 'string' ||
+    argv[2].startsWith('-')
+  ) {
+    fail('expected exactly: -p <profile> <program> [args...]');
+  }
+  const wrapperDir = path.dirname(fileURLToPath(import.meta.url));
+  const policy = decodeAndValidatePolicy(sourceEnv[POLICY_ENV]);
+  const profile = appendGuestPolicyToProfile(argv[1], policy);
+  const env = sanitizedDelegateEnv(sourceEnv, wrapperDir);
+  const result = spawnSync(
+    '/usr/bin/sandbox-exec',
+    ['-p', profile, ...argv.slice(2)],
+    { stdio: 'inherit', env },
+  );
+  if (result.error) throw result.error;
+  if (result.signal) {
+    process.kill(process.pid, result.signal);
+    return 128;
+  }
+  return result.status ?? 1;
+}
+
+const invokedPath = process.argv[1]
+  ? pathToFileURL(path.resolve(process.argv[1])).href
+  : '';
+if (invokedPath === import.meta.url) {
+  try {
+    process.exitCode = run();
+  } catch (error) {
+    process.stderr.write(
+      `${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    process.exitCode = 78;
+  }
+}

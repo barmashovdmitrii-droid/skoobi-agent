@@ -1,0 +1,15 @@
+{
+  "name": "@skoobi/app-art-bot",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Optional Skoobi image-bot assembly: core, Telegram channel, and an image provider configured by the instance environment.",
+  "type": "module",
+  "main": "./dist/service.js",
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@skoobi/core": "*",
+    "@skoobi/channel-telegram": "*"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "defaultMaxAgeDays": 30,
+  "voiceMaxAgeDays": 7,
+  "videoNoteMaxAgeDays": 7,
+  "photoMaxAgeDays": 14,
+  "documentMaxAgeDays": 30,
+  "perUserBytesLimit": 1.073741824e9,
+  "globalBytesLimit": 53687091200,
+  "mode": {
+    "voice": "dry",
+    "videoNote": "dry",
+    "photo": "dry",
+    "document": "dry"
+  }
+}

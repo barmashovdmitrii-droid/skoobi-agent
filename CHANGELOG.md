@@ -1,0 +1,190 @@
+# Changelog
+
+All notable public changes to Skoobi Agent are documented here.
+
+## 2.6.0
+
+- Build every public release from the same source tree as the maintained
+  installation, so a fix reaches both at once. This release brings the public
+  line up to date with that tree: reply delivery and recovery, memory recall
+  and secret detection, scheduled tasks, voice, the Telegram and WhatsApp
+  channels, the dashboard and the agent runner.
+- Keep the values that belong to one installation (owner names, chats,
+  calendar, service list, detector word lists) in `config/instance.json`. The
+  shipped file holds neutral defaults.
+- Edge voice: the helper is now `scripts/edge-tts-adapter.py` and runs in the
+  Python environment that `scripts/setup-edge-tts.sh` creates; the bundled
+  Node fallback is gone. The default Russian voice for Edge and Azure is
+  `ru-RU-SvetlanaNeural`; set `voice.edgeVoice` and `voice.azureVoice` in
+  `config/instance.json` to choose another. Select the provider with
+  `TTS_PROVIDER=edge`; its undocumented second name was removed.
+- Telegram mentions reach the model as written; the mention rewriting of
+  2.5.0 was not carried over.
+- Remove payments and billing.
+- Restart the repository history at this release. Earlier tags and release
+  assets are no longer published. Upgrade an existing installation with the
+  2.6.0 installer as usual.
+
+## 2.5.0
+
+- Recall projects by their full titles, domains and owner-confirmed short names. A comma within a complete title stays part of the name. Ambiguous names produce a choice of projects.
+- Keep project recall within the current identity and chat. Decision summaries carry their current evidence when available. Validation errors identify the field or revision to review, and the original operation ID can confirm whether a write succeeded.
+- Handle authenticated edits to newly received plain-text messages in private Telegram chats. Edits received before work begins replace the queued text. An edit to work already in progress stops delivery of the superseded answer and asks for the current request.
+
+## 2.4.1
+
+- Bound the size of sandbox permission files, their lists and individual
+  entries before starting an isolated task. A refused task reports the
+  reason in its originating chat.
+- Update Vite, Vitest and source-map-js development dependencies to versions
+  that address their published security advisories.
+
+## 2.4.0
+
+- Recover a prepared Telegram reply after an interrupted delivery without
+  running the task again. The host checks the owner, profile and original
+  inputs and invalidates the saved reply after a correction or cancellation.
+  A local report shows how many prepared replies have a transport acknowledgement.
+- Save the next step and acceptance criteria with a work item. Changing the
+  requirements invalidates checks from the earlier revision. Project-scoped
+  recall now has a separate evaluation corpus.
+- Flag uncertain dates, times and other meaningful differences between speech
+  recognition passes. A synthetic audio evaluation can be run locally.
+- Ship the game factory in the stable release. Capture a Roblox build and
+  attach a two-client Studio report to the exact place file that was tested.
+  Peer workers can record delivery receipts locally.
+- Record the requested model and the model observed in the current Codex turn
+  separately. An unobserved model stays unknown in usage reports.
+- Refresh the runtime dependency lockfiles for Node.js 22.
+
+## 2.3.0
+
+- Added an optional coordinated macOS worker with durable task identities,
+  explicit requirements, revision acknowledgements, cancellation, bounded
+  execution and independent host acceptance of exact returned files.
+- Added scoped, expiring structured-memory exports and supplemental context.
+  Corrections and forgetting invalidate old results; worker memory proposals
+  remain read-only data for the main assistant to review.
+- Routed peer progress and results through the main service's signed durable
+  inbox. Receipts distinguish confirmed API delivery, disabled notifications
+  and unknown outcomes; uncertain sends are not automatically replayed.
+- Added staged worker deployment, native build receipts, crash recovery and
+  rollback. The optional MacBook worker uses a reviewed macOS arm64 CLI pin;
+  the generic installer and global CLI selection remain unchanged.
+- Allowed bounded browser interaction delays while preserving exact scenario
+  checks and the host's overall execution deadline.
+- Kept private credentials, local configuration, conversations, host identities,
+  generated results and private Git history outside the public source update.
+
+## 2.2.0
+
+- Added bounded operation timelines linking admitted messages, queued work,
+  model/tool attempts and transport outcomes. Diagnostics do not treat API
+  acknowledgement as human acceptance or replay uncertain external actions.
+- Made Telegram audio intake durable across interruptions, with ordered
+  materialization, cancellation and bounded technical retries. Suspicious
+  transcripts can receive a bounded recheck using the existing speech model.
+- Added an opt-in artifact contract and a macOS producer sandbox with host-run
+  browser scenarios, exact-byte receipts and protected delivery snapshots.
+  Ordinary full-access runs cannot declare themselves isolated; unsupported
+  environments and missing required tools remain explicitly inconclusive.
+- Added a strict PDF/XLSX calculation reconciliation pilot with page/cell
+  evidence, exact decimal arithmetic, independent formula checks and final-file
+  rendering. This does not certify arbitrary layouts or financial correctness.
+- Added source-linked editorial feedback, read-only project comparisons and
+  optional local semantic recall. Search remains scoped to current authorized
+  records; corrections and forgetting invalidate derived indexes. Embedding
+  setup is explicit and does not change speech recognition.
+- Added reproducible skill verification, scoped file undo and a resumable
+  private feature-branch update helper. File undo does not reverse messages,
+  payments or other external actions; public export remains a separate review.
+- Preserved public installation safeguards, optional accounting interfaces,
+  dependency security overrides and existing data. New fixtures are synthetic;
+  operator-specific model pins and private runtime state are not distributed.
+
+## 2.1.1
+
+- Fixed structured memory writes from Telegram messages whose durable cursor
+  includes sub-millisecond precision. Source timestamps are normalized without
+  changing the original message cursor.
+- Preserved message-ID ordering for corrections received in the same
+  millisecond, and rejected invalid source timestamps.
+
+## 2.1.0
+
+- Added scoped project cards, versioned decisions, source quotations, expiry,
+  and explicit forgetting to structured memory. Reads are paginated; structured
+  memory tool requests and responses are authenticated and encrypted in local IPC.
+- Improved task continuity after corrections, interrupted runs, and short
+  follow-up messages. Background progress cannot replace the user's current
+  project focus, and old updates cannot overwrite newer direct decisions.
+- Updated transitive `shell-quote` and `proxy-addr` dependencies to versions
+  containing their critical security fixes.
+- Added bounded relevant-memory recall and clearer Telegram progress delivery.
+- Updated Desktop task result handling, local-file delivery checks, scheduled
+  task recovery, and run diagnostics.
+- Preserved existing public installation and upgrade safeguards, optional
+  accounting interfaces, and stored user data. Runtime telemetry no longer
+  presents subscription token counts as an API spending estimate.
+- Kept deployment-specific operations, runtime state, private reports, and
+  private Git history outside the public update. Examples and test fixtures
+  use synthetic identities.
+
+## 2.0.0
+
+- Added one fail-closed operation lock shared by install, update, uninstall,
+  and owner initialization. A lock is recovered only when its process identity
+  is proven stale; active or uncertain locks remain protected.
+- Added early non-terminal input checks, strict Telegram token parsing, and a
+  live `getMe` authentication check before service activation.
+- Preserved the selected provider, custom OpenAI-compatible base URL, and
+  pinned Codex executable during token-only reconfiguration.
+- Fixed managed CLI cleanup when an installation prefix has a symlinked
+  ancestor, while continuing to preserve foreign or relative CLI links.
+- Cleared failed Telegram startup state so health checks do not report a
+  rejected bot connection as connected.
+- Added regression coverage for stale and active cross-runtime locks,
+  unattended input, provider preservation, Telegram preflight, and lifecycle
+  cleanup.
+
+## 2.0.0-rc.3
+
+- Fixed managed Linux service generation and added systemd unit validation.
+- Prevented installer-generated Husky files from blocking reinstall, update,
+  or uninstall while continuing to protect owner-modified files.
+- Fixed application path handling for home directories containing spaces or
+  non-ASCII characters.
+- Made low-level updates fail closed unless both an exact ref and commit ID are
+  supplied; normal upgrades use the checksum-verified release installer.
+- Quiesced managed services before release swaps and improved failed-install
+  and failed-update rollback, including signals and partially completed file
+  operations.
+- Made launchd state checks fail closed on manager/transport errors and added
+  Linux journal output to `skoobi logs`.
+- Corrected extension discovery from the built workspace package layout.
+- Added per-instance backup cleanup and Linux lingering guidance.
+
+## 2.0.0-rc.2
+
+- Fixed the clean-install Telegram token prompt and CLI link creation.
+- Added a fail-closed, idempotent first-owner bootstrap command.
+- Routed default Codex turns only for the registered owner tenant.
+- Verified the pinned sandbox runtime without `npx` or network resolution.
+- Expanded dependency, authentication, owner, and runtime health checks.
+- Added an English five-minute Quick Start and troubleshooting guide.
+- Documented the required explicit rc.1 Codex-profile reconfiguration; a
+  normal update continues to preserve the existing private `.env`.
+
+## 2.0.0-rc.1
+
+- Reorganized the runtime into workspace packages.
+- Added optional WhatsApp, dashboard, Google Workspace, and Desktop bridge
+  components behind explicit configuration and authority checks.
+- Expanded runtime isolation, tenant protection, safe file handling, and
+  regression coverage.
+- Kept runtime data, credentials, private operations, and private Git history
+  outside the public source export.
+
+Historical note: `2.0.0-rc.1` starts a clean public-source history. Earlier
+`1.2.x` tags came from a different publication process and are retired as part
+of the privacy-hardening cutover.

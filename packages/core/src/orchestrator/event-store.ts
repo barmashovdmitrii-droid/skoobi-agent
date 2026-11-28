@@ -1,0 +1,686 @@
+import { createHash, randomUUID } from 'crypto';
+
+import type Database from 'better-sqlite3';
+import { maskChatSecrets } from '@skoobi/shared/chat-secrets';
+
+import type { TenantRecord } from './tenant-registry.js';
+
+export type EventType =
+  | 'telegram_inbound_message'
+  | 'telegram_inbound_callback_query'
+  | 'telegram_outbound_message'
+  // WhatsApp counterparts (finding M2). Separate types rather than renaming the
+  // Telegram pair: existing dashboards and queries read those names, and the
+  // channel column alone would have made every historical row ambiguous.
+  | 'whatsapp_inbound_message'
+  | 'whatsapp_outbound_message'
+  | 'admin_fast_command_handled'
+  | 'session_started'
+  | 'session_finished'
+  // A scheduled task's Codex run is over (r1109, item 6): the tier it asked
+  // for and the one codex applied, the quota reading and the ceiling. A type
+  // of its own, not session_finished: the chat checks (Fast streaks, reply
+  // latency, tool failures, the tier of a chat's last turn) read
+  // session_finished as chat turns, and a task's run in their middle would
+  // change what they count.
+  | 'scheduled_task_finished'
+  | 'runtime_selected'
+  | 'model_gateway_shadow_trace'
+  | 'model_gateway_live_response'
+  | 'codex_model_unavailable'
+  | 'codex_model_downgraded'
+  | 'codex_circuit_open'
+  // The runner dropped a chat's Codex thread (context changed, too old, too
+  // big) and started a fresh one. Until 28.09 this showed up only in
+  // debug-level runner logs.
+  | 'codex_thread_rotated'
+  // The runner stopped an early codex turn because newer messages arrived
+  // and restarted it with them (one answer to a burst). Until 09.10 this was
+  // visible only in the runner's stderr, which is kept for failed runs only.
+  | 'supersede_restart'
+  // A turn failed before codex started (lost login, failed routing, open
+  // breaker): its messages are held for a replay instead of «повтори»
+  // (prestart-replay.ts) — held, answered later, or given up after 6 h.
+  | 'codex_prestart_held'
+  | 'codex_prestart_replay_settled'
+  | 'codex_prestart_replay_expired'
+  // The same instant failure (the model never started) three times in a
+  // row: retries stopped, messages kept, one notice (fast-fail-park.ts, W05).
+  | 'chat_fast_fail_parked'
+  // The answer was ready while newer messages waited: whether the runner's
+  // finalize hold folded them into it (C12, 26.10).
+  | 'late_followup_merged'
+  // The held ready answer went out before the continuation's final: after
+  // the hold limit (90 s) or because the continuation failed (W03).
+  | 'finalize_hold_draft_released'
+  // A catch-up answer was not sent: silent on purpose or a verbatim repeat of
+  // the answer this run had just delivered (W31).
+  | 'follow_up_answer_suppressed'
+  // A start was postponed a few seconds for the caption of a photo, voice
+  // note or forwarded message (W31).
+  | 'caption_wait'
+  | 'provider_failover_attempt'
+  | 'provider_failover_used'
+  | 'provider_failover_exhausted'
+  | 'provider_circuit_opened'
+  | 'provider_circuit_half_open'
+  | 'provider_circuit_closed'
+  | 'web_search_requested'
+  | 'web_search_completed'
+  | 'web_search_failed'
+  | 'image_generation_requested'
+  | 'image_generation_completed'
+  | 'image_generation_failed'
+  // An image drawn in an ordinary turn that the model did not send itself:
+  // the host sent it before the turn's text (C06), or could not.
+  | 'image_generated_late_delivery'
+  | 'image_late_delivery_failed'
+  // Markdown links to files on the Mac in a final answer, and what the host
+  // made of them (file attached / already sent / name only) — C38.
+  | 'local_file_link'
+  | 'tool_call_requested'
+  | 'tool_policy_allowed'
+  | 'tool_policy_denied'
+  | 'tool_call_executed'
+  | 'tool_call_failed'
+  // Ход, в промпт которого подмешан текст третьих лиц. Раньше следа не
+  // оставалось вовсе, и расследовать инцидент было нечем
+  // (ULTRAREVIEW 2026-07-28, S5).
+  | 'untrusted_context_attached'
+  // Промежуточная реплика модели доставлена пользователю (не ответ).
+  | 'agent_progress_delivered'
+  // Итог проверки ссылок финального ответа: счётчики и хосты, без ссылок.
+  | 'agent_link_check'
+  | 'memory_delete_requested'
+  | 'memory_deleted'
+  | 'memory_delete_unavailable'
+  | 'skill_selected'
+  // What the memory blocks of a turn contain, without any text: recall mode
+  // and counters of structured memory, facts put in (W07), and the snippets of
+  // «похожая память» from files (W32).
+  | 'memory_recall'
+  | 'skill_proposed'
+  | 'skill_archived'
+  | 'error';
+
+export interface EventRecord {
+  event_id: string;
+  tenant_id: string;
+  session_id: string;
+  seq: number;
+  type: string;
+  actor: string;
+  channel: string;
+  chat_id: string;
+  sender_id: string | null;
+  payload_json: string;
+  created_at: number;
+}
+
+export interface RecordTenantEventInput {
+  tenant: TenantRecord;
+  type: EventType;
+  actor: string;
+  payload: Record<string, unknown>;
+  senderId?: string | null;
+  sessionId?: string;
+  createdAt?: number;
+}
+
+export interface RecordToolCallInput {
+  tenant: TenantRecord;
+  eventId?: string | null;
+  toolCallId: string;
+  toolName: string;
+  status: 'requested' | 'allowed' | 'denied' | 'completed' | 'error';
+  argsHash?: string | null;
+  payload: Record<string, unknown>;
+  senderId?: string | null;
+  sessionId?: string;
+  createdAt?: number;
+}
+
+export interface RecordModelTraceInput {
+  tenant: TenantRecord;
+  senderId?: string | null;
+  sessionId?: string;
+  runMode: 'shadow' | 'live' | 'test';
+  modelRole: string;
+  providerModel?: string | null;
+  status: 'success' | 'error';
+  legacyAnswerLength?: number | null;
+  skoobiAnswerLength?: number | null;
+  latencyMs?: number | null;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  costUsd?: number | null;
+  toolCallsRequested?: number | null;
+  toolCallsAllowed?: number | null;
+  toolCallsDenied?: number | null;
+  finalAnswerHash?: string | null;
+  payload: Record<string, unknown>;
+  createdAt?: number;
+}
+
+let eventStoreDb: Database.Database | undefined;
+
+const APPEND_ONLY_TABLES = [
+  'tenants',
+  'event_sessions',
+  'events',
+  'tool_calls',
+  'model_traces',
+];
+
+const SECRET_KEY_RE =
+  /(token|secret|password|api[_-]?key|authorization|cookie|credential)/i;
+const MAX_EVENT_STRING_LENGTH = 8000;
+
+function appendOnlyTriggers(table: string): string {
+  return `
+    CREATE TRIGGER IF NOT EXISTS ${table}_append_only_no_update
+    BEFORE UPDATE ON ${table}
+    BEGIN
+      SELECT RAISE(ABORT, '${table} is append-only');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS ${table}_append_only_no_delete
+    BEFORE DELETE ON ${table}
+    BEGIN
+      SELECT RAISE(ABORT, '${table} is append-only');
+    END;
+  `;
+}
+
+export function createEventStoreSchema(database: Database.Database): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS tenants (
+      tenant_id TEXT PRIMARY KEY,
+      folder TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_tenants_channel_chat
+      ON tenants(channel, chat_id);
+
+    CREATE TABLE IF NOT EXISTS event_sessions (
+      session_id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER,
+      FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_event_sessions_tenant
+      ON event_sessions(tenant_id, started_at);
+
+    CREATE TABLE IF NOT EXISTS events (
+      event_id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      sender_id TEXT,
+      payload_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      UNIQUE(tenant_id, session_id, seq),
+      FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id),
+      FOREIGN KEY (session_id) REFERENCES event_sessions(session_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_events_tenant_created
+      ON events(tenant_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_events_type_created
+      ON events(type, created_at);
+
+    CREATE TABLE IF NOT EXISTS tool_calls (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      event_id TEXT,
+      channel TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      sender_id TEXT,
+      tool_call_id TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      status TEXT NOT NULL,
+      args_hash TEXT,
+      payload_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id),
+      FOREIGN KEY (session_id) REFERENCES event_sessions(session_id),
+      FOREIGN KEY (event_id) REFERENCES events(event_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_tool_calls_tenant_created
+      ON tool_calls(tenant_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_call_id
+      ON tool_calls(tool_call_id);
+
+    CREATE TABLE IF NOT EXISTS model_traces (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      sender_id TEXT,
+      run_mode TEXT NOT NULL,
+      model_role TEXT NOT NULL,
+      provider_model TEXT,
+      status TEXT NOT NULL,
+      legacy_answer_length INTEGER,
+      skoobi_answer_length INTEGER,
+      latency_ms INTEGER,
+      input_tokens INTEGER,
+      output_tokens INTEGER,
+      cost_usd REAL,
+      tool_calls_requested INTEGER,
+      tool_calls_allowed INTEGER,
+      tool_calls_denied INTEGER,
+      final_answer_hash TEXT,
+      payload_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id),
+      FOREIGN KEY (session_id) REFERENCES event_sessions(session_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_model_traces_tenant_created
+      ON model_traces(tenant_id, created_at);
+  `);
+
+  for (const table of APPEND_ONLY_TABLES) {
+    database.exec(appendOnlyTriggers(table));
+  }
+
+  eventStoreDb = database;
+}
+
+function db(): Database.Database {
+  if (!eventStoreDb) {
+    throw new Error('Event store database is not initialized');
+  }
+  return eventStoreDb;
+}
+
+export function eventSessionIdForTenant(tenant: TenantRecord): string {
+  const digest = createHash('sha256')
+    .update(`${tenant.tenant_id}|${tenant.channel}|${tenant.chat_id}`)
+    .digest('hex')
+    .slice(0, 24);
+  return `evt_${digest}`;
+}
+
+function redactString(value: string): string {
+  // Everything past the limit is cut anyway; the margin keeps a key that
+  // straddles the cut whole, so it is masked rather than half-shown.
+  const head =
+    value.length > MAX_EVENT_STRING_LENGTH + 256
+      ? value.slice(0, MAX_EVENT_STRING_LENGTH + 256)
+      : value;
+  let redacted = head
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/g, 'Bearer [REDACTED]')
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, 'sk-[REDACTED]')
+    .replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}\b/g, 'xox-[REDACTED]')
+    .replace(
+      /\b(ANTHROPIC_API_KEY|OPENAI_API_KEY|TELEGRAM_BOT_TOKEN|CLAUDE_CODE_OAUTH_TOKEN)\s*=\s*[^\s]+/gi,
+      '$1=[REDACTED]',
+    );
+  // W19: a bot token, a Google key, «пароль 4821» or a Telegram login code
+  // sent in a chat used to stay here verbatim (append-only table).
+  redacted = maskChatSecrets(redacted);
+
+  if (
+    redacted.length > MAX_EVENT_STRING_LENGTH ||
+    head.length < value.length
+  ) {
+    redacted = `${redacted.slice(0, MAX_EVENT_STRING_LENGTH)}...[truncated]`;
+  }
+  return redacted;
+}
+
+export function redactEventPayload(value: unknown): unknown {
+  if (typeof value === 'string') return redactString(value);
+  if (value === null || value === undefined) return value;
+  if (typeof value !== 'object') return value;
+  if (Array.isArray(value))
+    return value.map((item) => redactEventPayload(item));
+
+  const result: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    result[key] = SECRET_KEY_RE.test(key)
+      ? '[REDACTED]'
+      : redactEventPayload(item);
+  }
+  return result;
+}
+
+function ensureTenant(
+  database: Database.Database,
+  tenant: TenantRecord,
+  createdAt: number,
+): void {
+  database
+    .prepare(
+      `
+      INSERT OR IGNORE INTO tenants
+        (tenant_id, folder, mode, channel, chat_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `,
+    )
+    .run(
+      tenant.tenant_id,
+      tenant.folder,
+      tenant.mode,
+      tenant.channel,
+      tenant.chat_id,
+      createdAt,
+    );
+}
+
+function ensureSession(
+  database: Database.Database,
+  tenant: TenantRecord,
+  sessionId: string,
+  createdAt: number,
+): boolean {
+  const result = database
+    .prepare(
+      `
+      INSERT OR IGNORE INTO event_sessions
+        (session_id, tenant_id, channel, chat_id, status, started_at, ended_at)
+      VALUES (?, ?, ?, ?, ?, ?, NULL)
+    `,
+    )
+    .run(
+      sessionId,
+      tenant.tenant_id,
+      tenant.channel,
+      tenant.chat_id,
+      'active',
+      createdAt,
+    );
+
+  // Finding #49: event_sessions has session_id as its sole PRIMARY KEY, so
+  // INSERT OR IGNORE silently keeps the first tenant that claimed a given
+  // session_id. The child tables (events/tool_calls/model_traces)
+  // carry their own tenant_id and only FK on session_id, so without this guard
+  // a row could be written with tenant_id=B referencing a session_id owned by
+  // tenant A, corrupting per-tenant event reconstruction and any audit/billing
+  // that joins through event_sessions. When the row was IGNOREd (changes===0),
+  // verify the existing session is owned by the same tenant and refuse to
+  // append cross-tenant rows on a mismatch. Legitimate callers never collide:
+  // each tenant uses a tenant-derived eventSessionIdForTenant() id or a
+  // host-set unique SDK session id, and guests cannot supply sessionId.
+  if (result.changes === 0) {
+    const existing = database
+      .prepare(
+        `SELECT tenant_id FROM event_sessions WHERE session_id = ?`,
+      )
+      .get(sessionId) as { tenant_id: string } | undefined;
+    if (existing && existing.tenant_id !== tenant.tenant_id) {
+      throw new Error(
+        `event_sessions session_id is owned by a different tenant; ` +
+          `refusing to attribute events to tenant ${tenant.tenant_id}`,
+      );
+    }
+  }
+
+  return result.changes > 0;
+}
+
+function nextSeq(
+  database: Database.Database,
+  tenantId: string,
+  sessionId: string,
+): number {
+  const row = database
+    .prepare(
+      `
+      SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
+      FROM events
+      WHERE tenant_id = ? AND session_id = ?
+    `,
+    )
+    .get(tenantId, sessionId) as { next_seq: number };
+  return row.next_seq;
+}
+
+function insertEvent(
+  database: Database.Database,
+  input: RecordTenantEventInput,
+  sessionId: string,
+  createdAt: number,
+): EventRecord {
+  const event: EventRecord = {
+    event_id: randomUUID(),
+    tenant_id: input.tenant.tenant_id,
+    session_id: sessionId,
+    seq: nextSeq(database, input.tenant.tenant_id, sessionId),
+    type: input.type,
+    actor: input.actor,
+    channel: input.tenant.channel,
+    chat_id: input.tenant.chat_id,
+    sender_id: input.senderId || null,
+    payload_json: JSON.stringify(redactEventPayload(input.payload)),
+    created_at: createdAt,
+  };
+
+  database
+    .prepare(
+      `
+      INSERT INTO events
+        (event_id, tenant_id, session_id, seq, type, actor, channel, chat_id,
+         sender_id, payload_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+    )
+    .run(
+      event.event_id,
+      event.tenant_id,
+      event.session_id,
+      event.seq,
+      event.type,
+      event.actor,
+      event.channel,
+      event.chat_id,
+      event.sender_id,
+      event.payload_json,
+      event.created_at,
+    );
+
+  return event;
+}
+
+export function recordTenantEvent(input: RecordTenantEventInput): EventRecord {
+  const database = db();
+  return database.transaction((eventInput: RecordTenantEventInput) => {
+    const createdAt = eventInput.createdAt ?? Date.now();
+    const sessionId =
+      eventInput.sessionId || eventSessionIdForTenant(eventInput.tenant);
+    ensureTenant(database, eventInput.tenant, createdAt);
+    const sessionCreated = ensureSession(
+      database,
+      eventInput.tenant,
+      sessionId,
+      createdAt,
+    );
+    if (sessionCreated && eventInput.type !== 'session_started') {
+      insertEvent(
+        database,
+        {
+          tenant: eventInput.tenant,
+          type: 'session_started',
+          actor: 'system',
+          senderId: null,
+          sessionId,
+          createdAt,
+          payload: {
+            tenant_id: eventInput.tenant.tenant_id,
+            channel: eventInput.tenant.channel,
+            chat_id: eventInput.tenant.chat_id,
+          },
+        },
+        sessionId,
+        createdAt,
+      );
+    }
+    return insertEvent(database, eventInput, sessionId, createdAt);
+  })(input);
+}
+
+export function recordToolCall(input: RecordToolCallInput): string {
+  const database = db();
+  return database.transaction((toolInput: RecordToolCallInput) => {
+    const createdAt = toolInput.createdAt ?? Date.now();
+    const sessionId =
+      toolInput.sessionId || eventSessionIdForTenant(toolInput.tenant);
+    ensureTenant(database, toolInput.tenant, createdAt);
+    const sessionCreated = ensureSession(
+      database,
+      toolInput.tenant,
+      sessionId,
+      createdAt,
+    );
+    if (sessionCreated) {
+      insertEvent(
+        database,
+        {
+          tenant: toolInput.tenant,
+          type: 'session_started',
+          actor: 'system',
+          senderId: null,
+          sessionId,
+          createdAt,
+          payload: {
+            tenant_id: toolInput.tenant.tenant_id,
+            channel: toolInput.tenant.channel,
+            chat_id: toolInput.tenant.chat_id,
+          },
+        },
+        sessionId,
+        createdAt,
+      );
+    }
+
+    const id = randomUUID();
+    database
+      .prepare(
+        `
+        INSERT INTO tool_calls
+          (id, tenant_id, session_id, event_id, channel, chat_id, sender_id,
+           tool_call_id, tool_name, status, args_hash, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      )
+      .run(
+        id,
+        toolInput.tenant.tenant_id,
+        sessionId,
+        toolInput.eventId || null,
+        toolInput.tenant.channel,
+        toolInput.tenant.chat_id,
+        toolInput.senderId || null,
+        toolInput.toolCallId,
+        toolInput.toolName,
+        toolInput.status,
+        toolInput.argsHash || null,
+        JSON.stringify(redactEventPayload(toolInput.payload)),
+        createdAt,
+      );
+    return id;
+  })(input);
+}
+
+export function recordModelTrace(input: RecordModelTraceInput): string {
+  const database = db();
+  return database.transaction((traceInput: RecordModelTraceInput) => {
+    const createdAt = traceInput.createdAt ?? Date.now();
+    const sessionId =
+      traceInput.sessionId || eventSessionIdForTenant(traceInput.tenant);
+    ensureTenant(database, traceInput.tenant, createdAt);
+    const sessionCreated = ensureSession(
+      database,
+      traceInput.tenant,
+      sessionId,
+      createdAt,
+    );
+    if (sessionCreated) {
+      insertEvent(
+        database,
+        {
+          tenant: traceInput.tenant,
+          type: 'session_started',
+          actor: 'system',
+          senderId: null,
+          sessionId,
+          createdAt,
+          payload: {
+            tenant_id: traceInput.tenant.tenant_id,
+            channel: traceInput.tenant.channel,
+            chat_id: traceInput.tenant.chat_id,
+          },
+        },
+        sessionId,
+        createdAt,
+      );
+    }
+
+    const id = randomUUID();
+    database
+      .prepare(
+        `
+        INSERT INTO model_traces
+          (id, tenant_id, session_id, channel, chat_id, sender_id, run_mode,
+           model_role, provider_model, status, legacy_answer_length,
+           skoobi_answer_length, latency_ms, input_tokens, output_tokens,
+           cost_usd, tool_calls_requested, tool_calls_allowed,
+           tool_calls_denied, final_answer_hash, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      )
+      .run(
+        id,
+        traceInput.tenant.tenant_id,
+        sessionId,
+        traceInput.tenant.channel,
+        traceInput.tenant.chat_id,
+        traceInput.senderId || null,
+        traceInput.runMode,
+        traceInput.modelRole,
+        traceInput.providerModel || null,
+        traceInput.status,
+        traceInput.legacyAnswerLength ?? null,
+        traceInput.skoobiAnswerLength ?? null,
+        traceInput.latencyMs ?? null,
+        traceInput.inputTokens ?? null,
+        traceInput.outputTokens ?? null,
+        traceInput.costUsd ?? null,
+        traceInput.toolCallsRequested ?? null,
+        traceInput.toolCallsAllowed ?? null,
+        traceInput.toolCallsDenied ?? null,
+        traceInput.finalAnswerHash || null,
+        JSON.stringify(redactEventPayload(traceInput.payload)),
+        createdAt,
+      );
+
+    return id;
+  })(input);
+}
+
+export function getEventsForTenant(tenantId: string): EventRecord[] {
+  return db()
+    .prepare(
+      `
+      SELECT event_id, tenant_id, session_id, seq, type, actor, channel, chat_id,
+             sender_id, payload_json, created_at
+      FROM events
+      WHERE tenant_id = ?
+      ORDER BY session_id, seq
+    `,
+    )
+    .all(tenantId) as EventRecord[];
+}

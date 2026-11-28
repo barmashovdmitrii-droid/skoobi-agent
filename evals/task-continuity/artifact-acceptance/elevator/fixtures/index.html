@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Synthetic elevator journey</title>
+    <link rel="stylesheet" href="scene.css" />
+    <script src="scene.js" defer></script>
+  </head>
+  <body>
+    <h1>Elevator delivery fixture</h1>
+    <p>This is a synthetic interaction test, with no production game assets.</p>
+    <main
+      id="world"
+      tabindex="0"
+      aria-label="Mine scene; use Arrow Right to move"
+    >
+      <div id="shaft" aria-label="Lift shaft"></div>
+      <div class="platform upper"></div>
+      <div class="platform lower"></div>
+      <div id="bridge" aria-label="Shaft crossing"></div>
+      <div id="cabin" aria-label="Lift cabin"></div>
+      <div id="player" aria-label="Courier carrying one resource"></div>
+      <div id="destination" aria-label="Resource destination"></div>
+    </main>
+    <p id="journey-state" role="status">Ready with one resource</p>
+    <p id="lift-state">Cabin at upper level</p>
+    <p id="resource-state">Resources delivered: 0</p>
+    <p id="inventory">Carrying: 1</p>
+    <button id="call-lift" type="button" disabled>
+      Call cabin to lower landing
+    </button>
+    <button id="deliver" type="button" disabled>
+      Board and deliver resource
+    </button>
+  </body>
+</html>

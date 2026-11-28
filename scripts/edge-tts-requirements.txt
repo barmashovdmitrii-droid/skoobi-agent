@@ -1,0 +1,19 @@
+# Python-пакеты голоса Edge (scripts/edge-tts-adapter.py). Ставит их
+# scripts/setup-edge-tts.sh в отдельный venv, без подтягивания зависимостей.
+# Версии — ровно те, с которыми голос проверен в работе. Обновлять только
+# вместе с проверкой голосового ответа: адаптер берёт внутреннюю константу
+# edge_tts.constants.TRUSTED_CLIENT_TOKEN, которая может пропасть.
+aiohappyeyeballs==2.6.1
+aiohttp==3.13.5
+aiosignal==1.4.0
+async-timeout==5.0.1
+attrs==26.1.0
+certifi==2026.7.22
+edge-tts==7.2.8
+frozenlist==1.8.0
+idna==3.18
+multidict==6.7.1
+propcache==0.4.1
+tabulate==0.9.0
+typing-extensions==4.16.0
+yarl==1.22.0

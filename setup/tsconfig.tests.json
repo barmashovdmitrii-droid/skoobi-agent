@@ -1,0 +1,17 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "allowImportingTsExtensions": true
+  },
+  "include": [
+    "./**/*.ts",
+    "../vitest.config.ts",
+    "../src/**/*.test.ts",
+    "../packages/**/src/**/*.test.ts",
+    "../agent/runner/src/**/*.test.ts"
+  ],
+  "exclude": ["../**/node_modules", "../**/dist"]
+}

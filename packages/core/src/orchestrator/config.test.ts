@@ -1,0 +1,127 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+import {
+  resetInstanceProfileForTests,
+  setInstanceProfileForTests,
+} from './instance-profile.js';
+
+describe('config path resolution', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    vi.resetModules();
+    process.env = { ...originalEnv };
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  it('uses cwd as STATE_ROOT', async () => {
+    delete process.env.SKOOBI_TEST_STATE_ROOT;
+    const config = await import('./config.js');
+    expect(config.STATE_ROOT).toBe(process.cwd());
+  });
+
+  // Единственный способ увести состояние из cwd —
+  // явная тестовая переменная. Без неё прогон писал бы в боевой инстанс.
+  it('redirects STATE_ROOT to SKOOBI_TEST_STATE_ROOT when it is set', async () => {
+    const stateRoot = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'skoobi-state-root-')),
+    );
+    process.env.SKOOBI_TEST_STATE_ROOT = stateRoot;
+    const config = await import('./config.js');
+    expect(config.STATE_ROOT).toBe(stateRoot);
+    expect(config.STORE_DIR).toBe(path.join(stateRoot, 'store'));
+    expect(config.GROUPS_DIR).toBe(path.join(stateRoot, 'groups'));
+    expect(config.STATE_ROOT).not.toBe(process.cwd());
+  });
+
+  it('decodes spaces and Unicode when resolving CODE_ROOT', async () => {
+    const tempRoot = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'skoobi-code-root-')),
+    );
+    const codeRoot = path.join(tempRoot, 'Skoobi path Юникод');
+    const modulePath = path.join(
+      codeRoot,
+      'packages',
+      'core',
+      'dist',
+      'orchestrator',
+      'config.js',
+    );
+    fs.mkdirSync(path.dirname(modulePath), { recursive: true });
+    fs.writeFileSync(modulePath, '');
+
+    try {
+      const config = await import('./config.js');
+      expect(
+        config.resolveCodeRootFromModuleUrl(pathToFileURL(modulePath)),
+      ).toBe(codeRoot);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('derives STORE_DIR from STATE_ROOT', async () => {
+    const config = await import('./config.js');
+    expect(config.STORE_DIR).toContain('store');
+  });
+
+  it('derives GROUPS_DIR from STATE_ROOT', async () => {
+    const config = await import('./config.js');
+    expect(config.GROUPS_DIR).toContain('groups');
+  });
+
+  it('derives LOG_DIR from STATE_ROOT', async () => {
+    const config = await import('./config.js');
+    expect(config.LOG_DIR).toContain('logs');
+  });
+
+  it('derives DATA_DIR from STATE_ROOT', async () => {
+    const config = await import('./config.js');
+    expect(config.DATA_DIR).toContain('data');
+    expect(config.DATA_DIR).toBe(path.resolve(config.STATE_ROOT, 'data'));
+  });
+});
+
+describe('default assistant name', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    vi.resetModules();
+    process.env = { ...originalEnv };
+    delete process.env.ASSISTANT_NAME;
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+    resetInstanceProfileForTests();
+  });
+
+  it('is the neutral product name without an instance profile', async () => {
+    const config = await import('./config.js');
+    expect(config.ASSISTANT_NAME).toBe('Skoobi');
+    expect(config.TRIGGER_PATTERN.test('@Skoobi привет')).toBe(true);
+  });
+
+  it('comes from the instance profile when ASSISTANT_NAME is not set', async () => {
+    setInstanceProfileForTests({ assistant: { defaultName: 'fixture_bot' } });
+    const config = await import('./config.js');
+    expect(config.ASSISTANT_NAME).toBe('fixture_bot');
+    expect(config.TRIGGER_PATTERN.test('@fixture_bot привет')).toBe(true);
+    expect(config.TRIGGER_PATTERN.test('@Skoobi привет')).toBe(false);
+  });
+
+  it('gives way to ASSISTANT_NAME from the environment', async () => {
+    setInstanceProfileForTests({ assistant: { defaultName: 'fixture_bot' } });
+    process.env.ASSISTANT_NAME = 'Envbot';
+    const config = await import('./config.js');
+    expect(config.ASSISTANT_NAME).toBe('Envbot');
+  });
+});

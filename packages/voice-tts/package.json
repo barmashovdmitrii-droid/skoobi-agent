@@ -1,0 +1,21 @@
+{
+  "name": "@skoobi/voice-tts",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Skoobi brick: text-to-speech voice replies (edge-tts neural voice, Azure, rhvoice/espeak fallbacks)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@skoobi/shared": "*"
+  }
+}

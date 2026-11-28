@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+# Delegate to the canonical hook in .githooks so both husky-managed and
+# manually-configured (`git config core.hooksPath .githooks`) checkouts run
+# the same script.
+exec "$(git rev-parse --show-toplevel)/.githooks/pre-commit"

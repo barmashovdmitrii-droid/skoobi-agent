@@ -1,0 +1,2641 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+CANONICAL_REPO="https://github.com/barmashovdmitrii-droid/skoobi-agent.git"
+REF_DEFAULT="main"
+EXPECTED_COMMIT_DEFAULT=""
+APP_NAME="skoobi-agent"
+VERSION="2.6.0"
+
+PREFIX="${SKOOBI_PREFIX:-$HOME/.skoobi}"
+INSTANCE="default"
+REPO="$CANONICAL_REPO"
+REF="$REF_DEFAULT"
+EXPECTED_COMMIT="$EXPECTED_COMMIT_DEFAULT"
+NO_SERVICE=0
+NO_START=0
+YES=0
+DRY_RUN=0
+RECONFIGURE=0
+ADOPT_MANAGED=0
+MIGRATE_LEGACY_NAME=""
+PRINT_SERVICE=""
+
+STAGE_DIR=""
+OLD_RELEASE=""
+OLD_RELEASE_ROOT=""
+CLI_CHANGED=0
+CLI_BACKUP=""
+CLI_MOVED_ASIDE=0
+CLI_CHANGE_ATTEMPTED=0
+CLI_MOVE_ATTEMPTED=0
+SERVICE_CHANGED=0
+SERVICE_BACKUP=""
+SERVICE_EXISTED=0
+SERVICE_WAS_ACTIVE=0
+SERVICE_WAS_ENABLED=0
+SERVICE_WAS_ENABLED_RUNTIME=0
+SERVICE_ENABLEMENT_KNOWN=0
+SERVICE_ACTIVATION_ATTEMPTED=0
+SERVICE_STOP_ATTEMPTED=0
+SERVICE_STOP_CONFIRMED=0
+INSTALL_SUCCEEDED=0
+BUILD_HOME=""
+GIT_HOME=""
+STAGE_ACTIVATION_STARTED=0
+LOCK_DIR=""
+LOCK_HELD=0
+LOCK_TOKEN=""
+LOCK_IDENTITY=""
+LOCK_OWNER_IDENTITY=""
+LOCK_OWNER_SNAPSHOT=""
+MARKER_CREATED_BY_INSTALL=0
+ENV_BACKUP=""
+ENV_BACKUP_PENDING=""
+ENV_CREATED_BY_INSTALL=0
+TELEGRAM_PREFLIGHT_VERIFIED=""
+
+prefer_node22_path() {
+  local candidate
+  for candidate in /opt/homebrew/opt/node@22/bin /usr/local/opt/node@22/bin; do
+    if [[ -x "$candidate/node" && -x "$candidate/npm" ]]; then
+      PATH="$candidate:$PATH"
+      export PATH
+      return 0
+    fi
+  done
+}
+
+prefer_node22_path
+
+log() { printf '%s\n' "$*"; }
+err() { printf 'ERROR: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Skoobi installer
+
+Usage:
+  bash install.sh [options]
+
+Download install.sh from a tagged GitHub release and verify the published
+SHA-256 checksum before running it. Do not pipe a moving branch into a shell.
+
+Options:
+  --prefix <path>        Install prefix (default: ~/.skoobi)
+  --instance <name>      Instance name (default: default)
+  --repo <url>           Must be the canonical public HTTPS repository
+  --ref <branch/tag>     Git branch or tag (release assets are tag-pinned)
+  --expected-commit <id> Require the resolved ref to match this 40-hex commit
+  --no-service           Do not create launchd/systemd service
+  --no-start             Create service but do not start it
+  --yes                  Non-interactive mode; pass required values via env
+  --reconfigure          Explicitly update an existing instance .env
+  --adopt-managed        Adopt a verified old public install missing its marker
+  --migrate-legacy <dir> Preserve a verified legacy app directory by basename
+  --dry-run              Print planned actions without changing files
+  --version              Show installer version
+  --help                 Show this help
+
+Existing instance configuration is preserved on a normal rerun. Use
+--reconfigure only when you intentionally want the installer to edit it.
+The one exception is SKOOBI_CODEX_COMMAND, and only when the installer pointed
+it at this app's pinned Codex: it follows the pinned version of the new
+release, or is commented out when that release has no pinned Codex. A copy of
+.env is saved to <prefix>/backups/instances/<instance> first.
+
+Security:
+  The installer accepts only the canonical public HTTPS repository. It never
+  reads Codex/Claude auth files, browser cookies, or token stores. Build
+  subprocesses receive a minimal environment without provider or bot secrets.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prefix)
+      PREFIX="${2:-}"
+      [[ -n "$PREFIX" ]] || die "--prefix requires a path"
+      shift 2
+      ;;
+    --instance)
+      INSTANCE="${2:-}"
+      [[ -n "$INSTANCE" ]] || die "--instance requires a name"
+      shift 2
+      ;;
+    --repo)
+      REPO="${2:-}"
+      [[ -n "$REPO" ]] || die "--repo requires a URL"
+      shift 2
+      ;;
+    --ref)
+      REF="${2:-}"
+      [[ -n "$REF" ]] || die "--ref requires a branch or tag"
+      shift 2
+      ;;
+    --expected-commit)
+      EXPECTED_COMMIT="${2:-}"
+      [[ -n "$EXPECTED_COMMIT" ]] || die "--expected-commit requires a commit"
+      shift 2
+      ;;
+    --no-service) NO_SERVICE=1; shift ;;
+    --no-start) NO_START=1; shift ;;
+    --yes|-y) YES=1; shift ;;
+    --reconfigure) RECONFIGURE=1; shift ;;
+    --adopt-managed) ADOPT_MANAGED=1; shift ;;
+    --migrate-legacy)
+      MIGRATE_LEGACY_NAME="${2:-}"
+      [[ -n "$MIGRATE_LEGACY_NAME" &&
+          "$MIGRATE_LEGACY_NAME" != -* ]] ||
+        die "--migrate-legacy requires a directory basename"
+      shift 2
+      ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --version|-V)
+      printf 'skoobi-installer %s\n' "$VERSION"
+      exit 0
+      ;;
+    --print-service)
+      PRINT_SERVICE="${2:-}"
+      [[ "$PRINT_SERVICE" == "macos" || "$PRINT_SERVICE" == "linux" ]] ||
+        die "--print-service requires macos or linux"
+      shift 2
+      ;;
+    --help|-h) usage; exit 0 ;;
+    *) die "Unknown option" ;;
+  esac
+done
+
+case "$INSTANCE" in
+  *[!A-Za-z0-9_-]*|'') die "Instance name must contain only letters, digits, _ or -" ;;
+esac
+[[ ${#INSTANCE} -le 63 ]] ||
+  die "Instance name must be at most 63 characters"
+case "$INSTANCE" in
+  [Dd][Aa][Ss][Hh][Bb][Oo][Aa][Rr][Dd])
+    die "Instance name 'dashboard' is reserved"
+    ;;
+esac
+if [[ -n "$MIGRATE_LEGACY_NAME" ]]; then
+  [[ "$MIGRATE_LEGACY_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    die "Legacy directory must be a safe basename"
+  [[ "$MIGRATE_LEGACY_NAME" != "$APP_NAME" &&
+      "$MIGRATE_LEGACY_NAME" != *.lock ]] ||
+    die "Legacy directory must be different from the managed app directory"
+fi
+case "$REF" in
+  -*|*:*|*' '*|*$'\t'*|*$'\n'*|*$'\r'*|*~*|*^*|*\?*|*\**|*\[*|*\\*)
+    die "Git ref contains unsafe characters"
+    ;;
+esac
+[[ "$REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] ||
+  die "Git ref contains unsafe characters"
+case "$REF" in
+  *..*|*//*|*/.|*.lock|*/) die "Git ref is not a valid branch or tag name" ;;
+esac
+if [[ -n "$EXPECTED_COMMIT" ]]; then
+  [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
+    die "Expected commit must be exactly 40 lowercase hexadecimal characters"
+fi
+case "$PREFIX" in
+  *$'\n'*|*$'\r'*) die "Install prefix must not contain newlines" ;;
+esac
+case "$HOME" in
+  *$'\n'*|*$'\r'*) die "HOME must not contain newlines" ;;
+esac
+[[ "$REPO" == "$CANONICAL_REPO" ]] ||
+  die "Repository must be the canonical public HTTPS Skoobi repository"
+
+PREFIX="${PREFIX/#\~/$HOME}"
+[[ "$PREFIX" == /* ]] || PREFIX="$PWD/$PREFIX"
+APP_BASE="$PREFIX/app"
+APP_DIR="$APP_BASE/$APP_NAME"
+LEGACY_APP_DIR=""
+if [[ -n "$MIGRATE_LEGACY_NAME" ]]; then
+  LEGACY_APP_DIR="$APP_BASE/$MIGRATE_LEGACY_NAME"
+fi
+INSTANCE_ROOT="$PREFIX/instances"
+INSTANCE_DIR="$INSTANCE_ROOT/$INSTANCE"
+BACKUP_DIR="$PREFIX/backups"
+BACKUP_INSTANCE_ROOT="$BACKUP_DIR/instances"
+INSTANCE_BACKUP_DIR="$BACKUP_INSTANCE_ROOT/$INSTANCE"
+ENV_FILE="$INSTANCE_DIR/.env"
+MARKER_FILE="$PREFIX/.skoobi-managed-install"
+SERVICE_LABEL="com.skoobi.$INSTANCE"
+MACOS_PLIST="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
+LINUX_UNIT="$HOME/.config/systemd/user/skoobi-$INSTANCE.service"
+CLI_LINK_DIR="$HOME/.local/bin"
+CLI_LINK="$CLI_LINK_DIR/skoobi"
+CLI_TARGET="$APP_DIR/bin/skoobi.js"
+
+run() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '[dry-run] %q' "$1"
+    shift || true
+    for arg in "$@"; do printf ' %q' "$arg"; done
+    printf '\n'
+  else
+    "$@"
+  fi
+}
+
+require_interactive_terminal() {
+  [[ -t 0 ]] ||
+    die "Interactive input requires a terminal; use --yes and the documented SKOOBI_* environment variables"
+}
+
+lock_host_os() {
+  if [[ -x /usr/bin/uname ]]; then
+    /usr/bin/uname -s
+  elif [[ -x /bin/uname ]]; then
+    /bin/uname -s
+  else
+    return 1
+  fi
+}
+
+lock_path_identity() {
+  case "$(lock_host_os)" in
+    Darwin) stat -f '%d:%i' "$1" 2>/dev/null ;;
+    Linux) stat -c '%d:%i' "$1" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+lock_path_uid() {
+  case "$(lock_host_os)" in
+    Darwin) stat -f '%u' "$1" 2>/dev/null ;;
+    Linux) stat -c '%u' "$1" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+lock_path_mode() {
+  case "$(lock_host_os)" in
+    Darwin) stat -f '%Lp' "$1" 2>/dev/null ;;
+    Linux) stat -c '%a' "$1" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+lock_path_links() {
+  case "$(lock_host_os)" in
+    Darwin) stat -f '%l' "$1" 2>/dev/null ;;
+    Linux) stat -c '%h' "$1" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+lock_private_directory() {
+  local path="$1" uid="" mode=""
+  [[ -d "$path" && ! -L "$path" ]] || return 1
+  uid="$(lock_path_uid "$path" || true)"
+  mode="$(lock_path_mode "$path" || true)"
+  [[ "$uid" == "$(id -u)" && "$mode" == "700" ]]
+}
+
+lock_boot_id() {
+  local value="" sec="" usec=""
+  if [[ -r /proc/sys/kernel/random/boot_id ]]; then
+    IFS= read -r value </proc/sys/kernel/random/boot_id || true
+    if [[ "$value" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+      printf 'linux:%s' "$value"
+      return 0
+    fi
+  elif [[ -x /usr/sbin/sysctl ]]; then
+    value="$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null || true)"
+    sec="${value#*sec = }"
+    usec="${value#*usec = }"
+    if [[ "$sec" != "$value" && "$usec" != "$value" ]]; then
+      sec="${sec%%,*}"
+      usec="${usec%% *}"
+      if [[ "$sec" =~ ^[0-9]+$ && "$usec" =~ ^[0-9]+$ ]]; then
+        printf 'darwin:%s:%s' "$sec" "$usec"
+        return 0
+      fi
+    fi
+  fi
+  printf 'unknown'
+}
+
+lock_process_start_id() {
+  local pid="$1" record="" rest="" value=""
+  local uid="" weekday="" month="" day="" clock="" year="" extra=""
+  local -a fields
+  if [[ -r "/proc/$pid/stat" ]]; then
+    IFS= read -r record <"/proc/$pid/stat" || return 1
+    rest="${record##*) }"
+    read -r -a fields <<<"$rest"
+    [[ ${#fields[@]} -ge 20 && "${fields[19]}" =~ ^[0-9]+$ ]] ||
+      return 1
+    printf 'linux:%s' "${fields[19]}"
+    return 0
+  fi
+  value="$(LC_ALL=C TZ=UTC /bin/ps -p "$pid" -o uid= -o lstart= 2>/dev/null || true)"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\r'* ]] ||
+    return 1
+  read -r uid weekday month day clock year extra <<<"$value"
+  [[ "$uid" =~ ^(0|[1-9][0-9]*)$ &&
+      "$weekday" =~ ^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)$ &&
+      "$month" =~ ^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$ &&
+      "$day" =~ ^([1-9]|[12][0-9]|3[01])$ &&
+      "$clock" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$ &&
+      "$year" =~ ^[0-9]{4}$ && -z "$extra" ]] || return 1
+  printf 'darwin:%s:%s:%s:%s:%s:%s' \
+    "$uid" "$weekday" "$month" "$day" "$clock" "$year"
+}
+
+lock_parse_owner() {
+  local file="$1" line="" size="" uid="" mode="" links=""
+  local identity_before="" identity_after="" checksum_before=""
+  local checksum_after="" hex=""
+  local line_number=0
+  LOCK_META_FORMAT=""
+  LOCK_META_TOKEN=""
+  LOCK_META_PID=""
+  LOCK_META_UID=""
+  LOCK_META_BOOT_ID=""
+  LOCK_META_START_ID=""
+  LOCK_META_OPERATION=""
+  LOCK_META_CREATED_AT=""
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  uid="$(lock_path_uid "$file" || true)"
+  mode="$(lock_path_mode "$file" || true)"
+  links="$(lock_path_links "$file" || true)"
+  [[ "$uid" == "$(id -u)" && "$mode" == "600" && "$links" == "1" ]] ||
+    return 1
+  size="$(wc -c <"$file" | tr -d '[:space:]')"
+  [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 && "$size" -le 4096 ]] ||
+    return 1
+  identity_before="$(lock_path_identity "$file" || true)"
+  checksum_before="$(lock_file_checksum "$file" || true)"
+  hex="$(lock_file_hex "$file" || true)"
+  [[ -n "$identity_before" && -n "$checksum_before" && -n "$hex" ]] ||
+    return 1
+  [[ ! "$hex" =~ (^|[[:space:]])00([[:space:]]|$) ]] || return 1
+  [[ "$(tail -c 1 "$file" | wc -l | tr -d '[:space:]')" == "1" ]] ||
+    return 1
+  while IFS= read -r line; do
+    line_number=$((line_number + 1))
+    case "$line_number" in
+      1) [[ "$line" == "format=1" ]] || return 1; LOCK_META_FORMAT=1 ;;
+      2) LOCK_META_TOKEN="${line#token=}"; [[ "$line" == token=* ]] || return 1 ;;
+      3) LOCK_META_PID="${line#pid=}"; [[ "$line" == pid=* ]] || return 1 ;;
+      4) LOCK_META_UID="${line#uid=}"; [[ "$line" == uid=* ]] || return 1 ;;
+      5) LOCK_META_BOOT_ID="${line#boot_id=}"; [[ "$line" == boot_id=* ]] || return 1 ;;
+      6) LOCK_META_START_ID="${line#start_id=}"; [[ "$line" == start_id=* ]] || return 1 ;;
+      7) LOCK_META_OPERATION="${line#operation=}"; [[ "$line" == operation=* ]] || return 1 ;;
+      8) LOCK_META_CREATED_AT="${line#created_at=}"; [[ "$line" == created_at=* ]] || return 1 ;;
+      *) return 1 ;;
+    esac
+  done <"$file"
+  [[ "$line_number" == "8" &&
+      "$LOCK_META_TOKEN" =~ ^[A-Za-z0-9_-]+$ &&
+      ${#LOCK_META_TOKEN} -ge 32 &&
+      ${#LOCK_META_TOKEN} -le 256 &&
+      "$LOCK_META_PID" =~ ^[1-9][0-9]*$ &&
+      "$LOCK_META_UID" =~ ^(0|[1-9][0-9]*)$ &&
+      "$LOCK_META_BOOT_ID" =~ ^(linux:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|darwin:[0-9]+:[0-9]+)$ &&
+      "$LOCK_META_START_ID" =~ ^(linux:[0-9]+|darwin:(0|[1-9][0-9]*):(Sun|Mon|Tue|Wed|Thu|Fri|Sat):(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec):([1-9]|[12][0-9]|3[01]):([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]:[0-9]{4})$ &&
+      "$LOCK_META_OPERATION" =~ ^[a-z][a-z0-9_-]{0,31}$ &&
+      "$LOCK_META_CREATED_AT" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  if [[ "$LOCK_META_BOOT_ID" == linux:* ]]; then
+    [[ "$LOCK_META_START_ID" == linux:* ]] || return 1
+  else
+    [[ "$LOCK_META_START_ID" == "darwin:$LOCK_META_UID:"* ]] || return 1
+  fi
+  identity_after="$(lock_path_identity "$file" || true)"
+  checksum_after="$(lock_file_checksum "$file" || true)"
+  [[ "$identity_after" == "$identity_before" &&
+      "$checksum_after" == "$checksum_before" ]]
+}
+
+# Return 0 for active, 3 for provably stale, and 1 for unknown.
+lock_owner_state() {
+  local file="$1" current_boot="" current_start="" live_uid=""
+  lock_parse_owner "$file" || return 1
+  [[ "$LOCK_META_UID" == "$(id -u)" ]] || return 1
+  current_boot="$(lock_boot_id)"
+  [[ "$current_boot" != "unknown" ]] || return 1
+  [[ "$LOCK_META_BOOT_ID" == "$current_boot" ]] || return 3
+  live_uid="$(/bin/ps -o uid= -p "$LOCK_META_PID" 2>/dev/null || true)"
+  live_uid="${live_uid#"${live_uid%%[![:space:]]*}"}"
+  live_uid="${live_uid%"${live_uid##*[![:space:]]}"}"
+  [[ -n "$live_uid" ]] || return 3
+  [[ "$live_uid" =~ ^[0-9]+$ && "$live_uid" == "$LOCK_META_UID" ]] ||
+    return 1
+  current_start="$(lock_process_start_id "$LOCK_META_PID" || true)"
+  [[ -n "$current_start" ]] || return 1
+  [[ "$current_start" == "$LOCK_META_START_ID" ]] && return 0
+  return 3
+}
+
+lock_directory_has_only() {
+  local allowed_reclaim="$1" entry="" name=""
+  for entry in "$LOCK_DIR"/* "$LOCK_DIR"/.[!.]* "$LOCK_DIR"/..?*; do
+    [[ -e "$entry" || -L "$entry" ]] || continue
+    name="${entry##*/}"
+    if [[ "$name" == "owner" ]]; then
+      continue
+    fi
+    if [[ "$allowed_reclaim" == "1" && "$name" == "reclaim" &&
+        -d "$entry" && ! -L "$entry" ]]; then
+      continue
+    fi
+    return 1
+  done
+  return 0
+}
+
+lock_directory_is_empty() {
+  local path="$1" entry=""
+  for entry in "$path"/* "$path"/.[!.]* "$path"/..?*; do
+    [[ -e "$entry" || -L "$entry" ]] && return 1
+  done
+  return 0
+}
+
+lock_file_checksum() {
+  [[ -x /usr/bin/cksum ]] || return 1
+  LC_ALL=C /usr/bin/cksum <"$1" 2>/dev/null
+}
+
+lock_file_hex() {
+  [[ -x /usr/bin/od ]] || return 1
+  LC_ALL=C /usr/bin/od -An -v -tx1 "$1" 2>/dev/null
+}
+
+publish_operation_lock_owner() {
+  local operation="$1" owner="$LOCK_DIR/owner" tmp="" boot="" start=""
+  local uid="" created=""
+  tmp="$(mktemp "$LOCK_DIR/.owner.XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")" ||
+    return 1
+  LOCK_TOKEN="${tmp##*.owner.}"
+  [[ "$LOCK_TOKEN" =~ ^[A-Za-z0-9_-]+$ &&
+      ${#LOCK_TOKEN} -ge 32 &&
+      ${#LOCK_TOKEN} -le 256 ]] || {
+    rm -f "$tmp" >/dev/null 2>&1 || true
+    return 1
+  }
+  boot="$(lock_boot_id)"
+  start="$(lock_process_start_id "$$" || true)"
+  [[ "$boot" != "unknown" && -n "$start" ]] || {
+    rm -f "$tmp" >/dev/null 2>&1 || true
+    return 1
+  }
+  uid="$(id -u)"
+  created="$(date +%s)"
+  if ! printf \
+      'format=1\ntoken=%s\npid=%s\nuid=%s\nboot_id=%s\nstart_id=%s\noperation=%s\ncreated_at=%s\n' \
+      "$LOCK_TOKEN" "$$" "$uid" "$boot" "$start" "$operation" "$created" \
+      >"$tmp" ||
+      ! chmod 600 "$tmp" ||
+      ! /bin/mv -f "$tmp" "$owner"; then
+    rm -f "$tmp" >/dev/null 2>&1 || true
+    return 1
+  fi
+  LOCK_OWNER_SNAPSHOT="$(cat "$owner")" || return 1
+  LOCK_IDENTITY="$(lock_path_identity "$LOCK_DIR")" || return 1
+  LOCK_OWNER_IDENTITY="$(lock_path_identity "$owner")" || return 1
+  lock_private_directory "$LOCK_DIR" || return 1
+  lock_directory_has_only 0 || return 1
+  lock_parse_owner "$owner" || return 1
+  [[ "$LOCK_META_TOKEN" == "$LOCK_TOKEN" && "$LOCK_META_PID" == "$$" ]]
+}
+
+reclaim_stale_operation_lock() {
+  local expected_identity="$1" expected_owner_identity="$2"
+  local expected_owner="$3" owner="$LOCK_DIR/owner"
+  local current_identity="" current_owner_identity="" current_owner=""
+  local reclaim_identity="" status=0
+  mkdir "$LOCK_DIR/reclaim" 2>/dev/null ||
+    die "Another process is already recovering the Skoobi operation lock: $LOCK_DIR"
+  chmod 700 "$LOCK_DIR/reclaim" || {
+    rmdir "$LOCK_DIR/reclaim" >/dev/null 2>&1 || true
+    die "Could not secure the Skoobi lock recovery gate: $LOCK_DIR"
+  }
+  reclaim_identity="$(lock_path_identity "$LOCK_DIR/reclaim" || true)"
+  current_identity="$(lock_path_identity "$LOCK_DIR" || true)"
+  current_owner_identity="$(lock_path_identity "$owner" || true)"
+  current_owner="$(cat "$owner" 2>/dev/null || true)"
+  if [[ -z "$reclaim_identity" ||
+      "$current_identity" != "$expected_identity" ||
+      "$current_owner_identity" != "$expected_owner_identity" ||
+      "$current_owner" != "$expected_owner" ]] ||
+      ! lock_private_directory "$LOCK_DIR/reclaim" ||
+      ! lock_directory_is_empty "$LOCK_DIR/reclaim" ||
+      ! lock_directory_has_only 1; then
+    rmdir "$LOCK_DIR/reclaim" >/dev/null 2>&1 || true
+    die "Skoobi operation lock changed during recovery: $LOCK_DIR"
+  fi
+  if lock_owner_state "$owner"; then
+    status=0
+  else
+    status=$?
+  fi
+  current_identity="$(lock_path_identity "$LOCK_DIR" || true)"
+  current_owner_identity="$(lock_path_identity "$owner" || true)"
+  current_owner="$(cat "$owner" 2>/dev/null || true)"
+  if [[ "$status" != "3" ||
+      "$current_identity" != "$expected_identity" ||
+      "$current_owner_identity" != "$expected_owner_identity" ||
+      "$current_owner" != "$expected_owner" ||
+      "$(lock_path_identity "$LOCK_DIR/reclaim" || true)" != "$reclaim_identity" ]] ||
+      ! lock_directory_is_empty "$LOCK_DIR/reclaim" ||
+      ! lock_directory_has_only 1; then
+    rmdir "$LOCK_DIR/reclaim" >/dev/null 2>&1 || true
+    die "Skoobi operation lock could not be proven stale: $LOCK_DIR"
+  fi
+  rm -f "$owner" ||
+    die "Could not remove stale Skoobi lock metadata: $LOCK_DIR"
+  [[ "$(lock_path_identity "$LOCK_DIR/reclaim" || true)" == "$reclaim_identity" ]] &&
+    lock_directory_is_empty "$LOCK_DIR/reclaim" &&
+    rmdir "$LOCK_DIR/reclaim" ||
+    die "Could not release stale Skoobi lock recovery gate: $LOCK_DIR"
+  [[ "$(lock_path_identity "$LOCK_DIR" || true)" == "$expected_identity" ]] &&
+    lock_directory_is_empty "$LOCK_DIR" &&
+    rmdir "$LOCK_DIR" ||
+    die "Could not remove the stale Skoobi operation lock: $LOCK_DIR"
+  log "Recovered a stale Skoobi operation lock: $LOCK_DIR"
+}
+
+acquire_operation_lock() {
+  local attempt=0 identity="" owner="" owner_identity=""
+  local snapshot="" status=0 uid=""
+  LOCK_DIR="$PREFIX/.skoobi-operation.lock"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "[dry-run] acquire exclusive installer operation lock"
+    return 0
+  fi
+  [[ ! -L "$PREFIX" && (! -e "$PREFIX" || -d "$PREFIX") ]] ||
+    die "Install prefix must be a real directory"
+  mkdir -p "$PREFIX"
+  chmod 700 "$PREFIX"
+  while [[ "$attempt" -lt 2 ]]; do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      chmod 700 "$LOCK_DIR"
+      if ! publish_operation_lock_owner install; then
+        rm -f "$LOCK_DIR"/.owner.* "$LOCK_DIR/owner" >/dev/null 2>&1 || true
+        rmdir "$LOCK_DIR" >/dev/null 2>&1 || true
+        die "Could not publish safe Skoobi operation lock metadata"
+      fi
+      LOCK_HELD=1
+      return 0
+    fi
+    lock_private_directory "$LOCK_DIR" ||
+      die "Skoobi operation lock path is unsafe: $LOCK_DIR"
+    lock_directory_has_only 0 ||
+      die "Skoobi operation lock state is unknown; inspect it before recovery: $LOCK_DIR"
+    uid="$(lock_path_uid "$LOCK_DIR" || true)"
+    [[ "$uid" == "$(id -u)" ]] ||
+      die "Skoobi operation lock is not owned by the current user: $LOCK_DIR"
+    identity="$(lock_path_identity "$LOCK_DIR" || true)"
+    owner="$LOCK_DIR/owner"
+    owner_identity="$(lock_path_identity "$owner" || true)"
+    snapshot="$(cat "$owner" 2>/dev/null || true)"
+    if [[ -z "$identity" || -z "$owner_identity" || -z "$snapshot" ]]; then
+      die "Skoobi operation lock has no safe recovery metadata: $LOCK_DIR"
+    fi
+    if lock_owner_state "$owner"; then
+      status=0
+    else
+      status=$?
+    fi
+    case "$status" in
+      0)
+        die "Another Skoobi ${LOCK_META_OPERATION} operation is active (pid $LOCK_META_PID); lock: $LOCK_DIR"
+        ;;
+      3)
+        reclaim_stale_operation_lock \
+          "$identity" "$owner_identity" "$snapshot"
+        attempt=$((attempt + 1))
+        ;;
+      *)
+        die "Skoobi operation lock state is unknown; inspect it before recovery: $LOCK_DIR"
+        ;;
+    esac
+  done
+  die "Could not acquire the Skoobi operation lock after stale recovery"
+}
+
+release_operation_lock() {
+  local owner="$LOCK_DIR/owner" identity="" owner_identity="" snapshot=""
+  [[ "$LOCK_HELD" == "1" ]] || return 0
+  identity="$(lock_path_identity "$LOCK_DIR" || true)"
+  owner_identity="$(lock_path_identity "$owner" || true)"
+  snapshot="$(cat "$owner" 2>/dev/null || true)"
+  [[ "$identity" == "$LOCK_IDENTITY" &&
+      "$owner_identity" == "$LOCK_OWNER_IDENTITY" &&
+      "$snapshot" == "$LOCK_OWNER_SNAPSHOT" ]] || return 1
+  lock_private_directory "$LOCK_DIR" || return 1
+  lock_directory_has_only 0 || return 1
+  lock_parse_owner "$owner" || return 1
+  [[ "$LOCK_META_TOKEN" == "$LOCK_TOKEN" && "$LOCK_META_PID" == "$$" ]] ||
+    return 1
+  [[ "$(lock_path_identity "$LOCK_DIR" || true)" == "$LOCK_IDENTITY" &&
+      "$(lock_path_identity "$owner" || true)" == "$LOCK_OWNER_IDENTITY" &&
+      "$(cat "$owner" 2>/dev/null || true)" == "$LOCK_OWNER_SNAPSHOT" ]] ||
+    return 1
+  rm -f "$owner" || return 1
+  [[ "$(lock_path_identity "$LOCK_DIR" || true)" == "$LOCK_IDENTITY" ]] ||
+    return 1
+  lock_directory_is_empty "$LOCK_DIR" || return 1
+  rmdir "$LOCK_DIR" || return 1
+  LOCK_HELD=0
+  LOCK_TOKEN=""
+  LOCK_IDENTITY=""
+  LOCK_OWNER_IDENTITY=""
+  LOCK_OWNER_SNAPSHOT=""
+}
+
+ensure_git_home() {
+  if [[ -z "$GIT_HOME" ]]; then
+    GIT_HOME="$(mktemp -d "${TMPDIR:-/tmp}/skoobi-git-home.XXXXXXXX")"
+    chmod 700 "$GIT_HOME"
+  fi
+}
+
+git_safe() {
+  ensure_git_home
+  local -a clean_env=(
+    env -i
+    "HOME=$GIT_HOME"
+    "PATH=$PATH"
+    "TMPDIR=${TMPDIR:-/tmp}"
+    "LANG=${LANG:-C}"
+    "LC_ALL=${LC_ALL:-C}"
+    GIT_CONFIG_NOSYSTEM=1
+    GIT_CONFIG_GLOBAL=/dev/null
+    GIT_CONFIG_COUNT=0
+    GIT_NO_REPLACE_OBJECTS=1
+    GIT_TERMINAL_PROMPT=0
+  )
+  "${clean_env[@]}" git --no-replace-objects \
+    -c core.hooksPath=/dev/null \
+    -c core.fsmonitor=false \
+    -c submodule.recurse=false \
+    "$@"
+}
+
+safe_npm() {
+  local npm_userconfig status=0
+  if [[ -z "$BUILD_HOME" ]]; then
+    BUILD_HOME="$(mktemp -d "${TMPDIR:-/tmp}/skoobi-build-home.XXXXXXXX")"
+    chmod 700 "$BUILD_HOME"
+  fi
+  npm_userconfig="$BUILD_HOME/npmrc"
+  touch "$npm_userconfig"
+  chmod 600 "$npm_userconfig"
+  env -i \
+    HOME="$BUILD_HOME" \
+    PATH="$PATH" \
+    TMPDIR="${TMPDIR:-/tmp}" \
+    LANG="${LANG:-C}" \
+    LC_ALL="${LC_ALL:-C}" \
+    HUSKY=0 \
+    NPM_CONFIG_CACHE="$BUILD_HOME/npm-cache" \
+    NPM_CONFIG_USERCONFIG="$npm_userconfig" \
+    NPM_CONFIG_GLOBALCONFIG=/dev/null \
+    npm "$@" || status=$?
+  return "$status"
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required"
+}
+
+detect_os() {
+  case "$(uname -s)" in
+    Darwin) echo "macos" ;;
+    Linux) echo "linux" ;;
+    *) echo "unsupported" ;;
+  esac
+}
+
+# Return 0 when the job is loaded, 3 only when launchd can prove that the
+# containing user domain is reachable but the label is absent, and 1 when the
+# state is unknown (for example, a transport or permission failure).
+launchd_job_state() {
+  local target="$1" domain="${1%/*}" status
+  if launchctl print "$target" >/dev/null 2>&1; then
+    return 0
+  else
+    status=$?
+  fi
+  [[ "$status" == "113" ]] || return 1
+  launchctl print "$domain" >/dev/null 2>&1 || return 1
+  return 3
+}
+
+node_major() {
+  node -p "Number(process.versions.node.split('.')[0])" 2>/dev/null || echo 0
+}
+
+node_bin() {
+  node -p 'process.execPath'
+}
+
+xml_escape() {
+  local value="$1"
+  value="${value//&/&amp;}"
+  value="${value//</&lt;}"
+  value="${value//>/&gt;}"
+  value="${value//\"/&quot;}"
+  printf '%s' "$value"
+}
+
+systemd_exec_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\%/%%}"
+  printf '%s' "$value"
+}
+
+systemd_environment_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\%/%%}"
+  printf '%s' "$value"
+}
+
+systemd_path_escape() {
+  local value="$1"
+  case "$value" in
+    *$'\n'*|*$'\r'*) die "systemd path must not contain newlines" ;;
+  esac
+  value="${value//\%/%%}"
+  printf '%s' "$value"
+}
+
+# systemd's ExecStart is not a shell command line: it applies its own quoting
+# and escaping rules, and a unit file is line-oriented with `key=value` pairs.
+# A Node path carrying any of these bytes would be silently reinterpreted (or
+# would break the unit) rather than executed as written, so refuse to emit a
+# unit at all instead of writing one that means something other than intended.
+systemd_executable_path_is_safe() {
+  local value="$1" LC_ALL=C
+  [[ -n "$value" ]] || return 1
+  case "$value" in
+    *$'\n'*|*$'\r'*|*:*)
+      return 1
+      ;;
+  esac
+  [[ "$value" != *[[:cntrl:]]* ]] || return 1
+  [[ "$value" != *'\'* ]] || return 1
+  [[ "$value" != *'"'* ]] || return 1
+  [[ "$value" != *"'"* ]] || return 1
+  [[ "$value" != *'*'* ]] || return 1
+  [[ "$value" != *'?'* ]] || return 1
+  [[ "$value" != *'['* ]] || return 1
+  command -v iconv >/dev/null 2>&1 || return 1
+  printf '%s' "$value" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 ||
+    return 1
+  return 0
+}
+
+launchd_plist() {
+  local node_path="$1" node_dir
+  case "$node_path" in
+    *$'\n'*|*$'\r'*|*:*) die "Node executable path is unsafe for service PATH" ;;
+  esac
+  node_dir="$(dirname "$node_path")"
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$(xml_escape "$SERVICE_LABEL")</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$(xml_escape "$node_path")</string>
+    <string>$(xml_escape "$APP_DIR/dist/service.js")</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>$(xml_escape "$INSTANCE_DIR")</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>$(xml_escape "$node_dir"):/opt/homebrew/opt/node@22/bin:/usr/local/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$(xml_escape "$HOME")/.local/bin</string>
+    <key>HOME</key>
+    <string>$(xml_escape "$HOME")</string>
+    <key>SKOOBI_SERVICE_LABEL</key>
+    <string>$(xml_escape "$SERVICE_LABEL")</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>$(xml_escape "$INSTANCE_DIR/logs/service.out.log")</string>
+  <key>StandardErrorPath</key>
+  <string>$(xml_escape "$INSTANCE_DIR/logs/service.err.log")</string>
+</dict>
+</plist>
+EOF
+}
+
+systemd_unit() {
+  local node_path="$1" node_dir
+  systemd_executable_path_is_safe "$node_path" ||
+    die "Node executable path cannot be represented safely in systemd ExecStart"
+  node_dir="$(dirname "$node_path")"
+  cat <<EOF
+[Unit]
+Description=Skoobi ($INSTANCE)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=":$(systemd_exec_escape "$node_path")" "$(systemd_exec_escape "$APP_DIR/dist/service.js")"
+WorkingDirectory=$(systemd_path_escape "$INSTANCE_DIR")
+Restart=always
+RestartSec=5
+UMask=0077
+Environment="HOME=$(systemd_environment_escape "$HOME")"
+Environment="PATH=$(systemd_environment_escape "$node_dir"):/opt/homebrew/opt/node@22/bin:/usr/local/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$(systemd_environment_escape "$HOME")/.local/bin"
+Environment="SKOOBI_SERVICE_LABEL=$(systemd_environment_escape "$SERVICE_LABEL")"
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+if [[ -n "$PRINT_SERVICE" ]]; then
+  if [[ "$PRINT_SERVICE" == "macos" ]]; then
+    launchd_plist "$(node_bin || printf '/usr/bin/node')"
+  else
+    systemd_unit "$(node_bin || printf '/usr/bin/node')"
+  fi
+  exit 0
+fi
+
+marker_content() {
+  local app_name="$1"
+  printf 'format=1\nrepository=%s\napp=%s\n' "$CANONICAL_REPO" "$app_name"
+}
+
+valid_marker_for() {
+  local app_name="$1"
+  [[ -f "$MARKER_FILE" && ! -L "$MARKER_FILE" ]] || return 1
+  [[ "$(cat "$MARKER_FILE")" == "$(marker_content "$app_name")" ]]
+}
+
+validate_origin() {
+  local app_path="$1"
+  local expected_origin="${2:-$CANONICAL_REPO}"
+  local origin
+  origin="$(git_safe -C "$app_path" config --local --get-all remote.origin.url 2>/dev/null || true)"
+  [[ "$origin" == "$expected_origin" ]] ||
+    die "Managed app origin is not an allowed canonical HTTPS repository"
+}
+
+sha256_file() {
+  local file="$1" output=""
+  if command -v shasum >/dev/null 2>&1; then
+    output="$(shasum -a 256 <"$file")" || return 1
+  elif command -v sha256sum >/dev/null 2>&1; then
+    output="$(sha256sum <"$file")" || return 1
+  else
+    return 1
+  fi
+  printf '%s' "${output%% *}"
+}
+
+is_husky_generated_file() {
+  local app_root="$1" rel="$2" file="$1/$2" expected_hash="" actual_hash=""
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  case "$rel" in
+    .husky/_/.gitignore)
+      expected_hash="684888c0ebb17f374298b65ee2807526c066094c701bcc7ebbe1c1095f494fc1"
+      ;;
+    .husky/_/h)
+      expected_hash="70200b200ca709b0622784f93839a5b2872333a917a09afddefd7dc2d8cdc680"
+      ;;
+    .husky/_/husky.sh)
+      expected_hash="21122903fca7209a13c991e5be68780636e28f1b8f0ae7ea07ed0065dfe37268"
+      ;;
+    .husky/_/applypatch-msg|.husky/_/commit-msg|.husky/_/post-applypatch|\
+      .husky/_/post-checkout|.husky/_/post-commit|.husky/_/post-merge|\
+      .husky/_/post-rewrite|.husky/_/pre-applypatch|.husky/_/pre-auto-gc|\
+      .husky/_/pre-commit|.husky/_/pre-merge-commit|.husky/_/pre-push|\
+      .husky/_/pre-rebase|.husky/_/prepare-commit-msg)
+      expected_hash="34fe496008be71d8fdd446b2cce81e4bb0406109c130eafc583fbd9fe33244e2"
+      ;;
+    *) return 1 ;;
+  esac
+  actual_hash="$(sha256_file "$file")" || return 1
+  [[ "$actual_hash" == "$expected_hash" ]]
+}
+
+is_ephemeral_ignored_path() {
+  local app_root="$1" rel="$2"
+  is_husky_generated_file "$app_root" "$rel" && return 0
+  case "$rel" in
+    node_modules/*|*/node_modules/*|dist/*|*/dist/*|coverage/*|*/coverage/*|\
+      .vite/*|*/.vite/*|*.tsbuildinfo|*/.DS_Store|.DS_Store)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+has_owner_ignored_files() {
+  local rel listing found=1
+  ensure_git_home
+  listing="$(mktemp "$GIT_HOME/ignored.XXXXXXXX")"
+  git_safe -C "$1" ls-files --others --ignored --exclude-standard -z >"$listing" ||
+    die "Could not inspect ignored files in the managed app"
+  while IFS= read -r -d '' rel; do
+    if ! is_ephemeral_ignored_path "$1" "$rel"; then
+      found=0
+      break
+    fi
+  done <"$listing"
+  rm -f "$listing"
+  return "$found"
+}
+
+has_any_ignored_files() {
+  local _ignored listing found=1
+  ensure_git_home
+  listing="$(mktemp "$GIT_HOME/ignored-all.XXXXXXXX")"
+  git_safe -C "$1" ls-files --others --ignored --exclude-standard -z >"$listing" ||
+    die "Could not inspect ignored files in the legacy app"
+  if IFS= read -r -d '' _ignored <"$listing"; then
+    found=0
+  fi
+  rm -f "$listing"
+  return "$found"
+}
+
+has_gitlinks() {
+  local entry listing found=1
+  ensure_git_home
+  listing="$(mktemp "$GIT_HOME/gitlinks.XXXXXXXX")"
+  git_safe -C "$1" ls-files --stage -z >"$listing" ||
+    die "Could not inspect Git entries in the managed app"
+  while IFS= read -r -d '' entry; do
+    if [[ "${entry%% *}" == "160000" ]]; then
+      found=0
+      break
+    fi
+  done <"$listing"
+  rm -f "$listing"
+  return "$found"
+}
+
+assert_git_status_clean() {
+  local app_path="$1" status_output
+  status_output="$(git_safe -C "$app_path" status --porcelain --untracked-files=normal)" ||
+    die "Could not inspect managed app status"
+  [[ -z "$status_output" ]]
+}
+
+assert_real_git_checkout() {
+  local app_path="$1"
+  [[ -d "$app_path" && ! -L "$app_path" ]] ||
+    die "Managed app path must be a real directory"
+  [[ -d "$app_path/.git" && ! -L "$app_path/.git" ]] ||
+    die "Managed app .git must be a real directory"
+}
+
+verify_published_commit() {
+  local app_path="$1" commit probe_dir fetched
+  commit="$(git_safe -C "$app_path" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true)"
+  [[ "$commit" =~ ^[0-9a-f]{40}$ ]] ||
+    die "Managed app HEAD is not an exact commit"
+  probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/skoobi-adoption-probe.XXXXXXXX")"
+  chmod 700 "$probe_dir"
+  if ! git_safe -C "$probe_dir" init -q --template= ||
+    ! git_safe -C "$probe_dir" remote add origin "$CANONICAL_REPO" ||
+    ! git_safe -C "$probe_dir" fetch --depth=1 origin "$commit" >/dev/null 2>&1; then
+    rm -rf "$probe_dir"
+    die "Managed app commit is not published by the canonical repository"
+  fi
+  fetched="$(git_safe -C "$probe_dir" rev-parse --verify 'FETCH_HEAD^{commit}' 2>/dev/null || true)"
+  rm -rf "$probe_dir"
+  [[ "$fetched" == "$commit" ]] ||
+    die "Managed app commit could not be verified against the canonical repository"
+}
+
+assert_existing_install_safe() {
+  [[ ! -L "$PREFIX" && ! -L "$APP_BASE" && ! -L "$APP_DIR" &&
+      ! -L "$BACKUP_DIR" ]] ||
+    die "Refusing to install through a symlinked managed path"
+  if [[ -n "$LEGACY_APP_DIR" && -L "$LEGACY_APP_DIR" ]]; then
+    die "Refusing to migrate a symlinked legacy app path"
+  fi
+  if [[ -n "$LEGACY_APP_DIR" && -e "$APP_DIR" &&
+      "$LEGACY_APP_DIR" -ef "$APP_DIR" ]]; then
+    die "Legacy directory must be different from the managed app directory"
+  fi
+
+  if [[ -e "$APP_DIR" ]]; then
+    assert_real_git_checkout "$APP_DIR"
+    validate_origin "$APP_DIR"
+    if ! valid_marker_for "$APP_NAME"; then
+      [[ "$ADOPT_MANAGED" == "1" ]] ||
+        die "Managed-install marker missing or invalid; use --adopt-managed only after verification"
+      verify_published_commit "$APP_DIR"
+    fi
+    assert_git_status_clean "$APP_DIR" ||
+      die "App checkout has local changes; use the updater to preserve them"
+    ! has_owner_ignored_files "$APP_DIR" ||
+      die "App checkout contains ignored owner files; preserve them before reinstalling"
+    ! has_gitlinks "$APP_DIR" ||
+      die "Managed app contains unsupported Git submodules"
+  fi
+  if [[ -n "$LEGACY_APP_DIR" ]]; then
+    [[ -e "$LEGACY_APP_DIR" ]] ||
+      die "Requested legacy app directory was not found"
+    assert_real_git_checkout "$LEGACY_APP_DIR"
+    local legacy_origin
+    legacy_origin="$(git_safe -C "$LEGACY_APP_DIR" config --local --get-all remote.origin.url 2>/dev/null || true)"
+    [[ "$legacy_origin" == "$CANONICAL_REPO" ]] ||
+      die "Legacy app origin is not an allowed canonical HTTPS repository"
+    assert_git_status_clean "$LEGACY_APP_DIR" ||
+      die "Legacy app checkout has local changes; preserve them before migration"
+    ! has_any_ignored_files "$LEGACY_APP_DIR" ||
+      die "Legacy app checkout contains ignored files; preserve them before migration"
+    ! has_gitlinks "$LEGACY_APP_DIR" ||
+      die "Legacy app checkout contains unsupported Git submodules"
+    log "Verified legacy install will be preserved while the new app directory is installed."
+  fi
+}
+
+check_requirements() {
+  if [[ "${SKOOBI_INSTALLER_SKIP_REQUIREMENTS:-}" == "1" ]]; then
+    log "Skipping requirement checks (test mode)"
+    return 0
+  fi
+  local os_name major
+  os_name="$(detect_os)"
+  [[ "$os_name" != "unsupported" ]] || die "Only macOS and Linux are supported"
+  require_command curl
+  require_command git
+  require_command npm
+  require_command node
+  require_command sqlite3
+  require_command rg
+  major="$(node_major)"
+  [[ "$major" -ge 22 ]] ||
+    die "Node.js >= 22 is required"
+  if [[ "$os_name" == "linux" ]]; then
+    require_command bwrap
+    require_command socat
+  fi
+  if [[ "$NO_SERVICE" == "0" ]]; then
+    if [[ "$os_name" == "macos" ]]; then
+      require_command launchctl
+    else
+      require_command systemctl
+    fi
+  fi
+}
+
+warn_if_linux_linger_disabled() {
+  [[ "$NO_SERVICE" == "0" && "$(detect_os)" == "linux" ]] || return 0
+  local linger="" user_name=""
+  user_name="$(id -un 2>/dev/null || true)"
+  if command -v loginctl >/dev/null 2>&1; then
+    linger="$(loginctl show-user "$(id -u)" -p Linger --value 2>/dev/null || true)"
+  fi
+  if [[ "$linger" != "yes" ]]; then
+    log "WARNING: systemd user lingering is not confirmed."
+    log "The bot may stop after the last logout and may not start at boot."
+    if [[ -n "$user_name" ]]; then
+      printf 'After reviewing the host policy, enable it with: loginctl enable-linger %q\n' \
+        "$user_name"
+    else
+      log "After reviewing the host policy, enable lingering with loginctl."
+    fi
+  fi
+}
+
+env_value_for_key() {
+  local key="$1" line="" name="" value="" trimmed="" found=0
+  [[ -f "$ENV_FILE" ]] || {
+    printf ''
+    return 0
+  }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    [[ -n "$trimmed" && "$trimmed" != \#* && "$trimmed" == *=* ]] ||
+      continue
+    name="${trimmed%%=*}"
+    name="${name#"${name%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+    [[ "$name" == "$key" ]] || continue
+    [[ "$found" == "0" ]] ||
+      die "Instance .env contains duplicate $key entries"
+    found=1
+    value="${trimmed#*=}"
+  done <"$ENV_FILE"
+  [[ "$found" == "1" ]] || {
+    printf ''
+    return 0
+  }
+  trimmed="${value#"${value%%[![:space:]]*}"}"
+  trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+  if [[ "$trimmed" == \"*\" && ${#trimmed} -ge 2 ]]; then
+    trimmed="${trimmed:1:${#trimmed}-2}"
+  elif [[ "$trimmed" == \'*\' && ${#trimmed} -ge 2 ]]; then
+    trimmed="${trimmed:1:${#trimmed}-2}"
+  fi
+  printf '%s' "$trimmed"
+}
+
+selected_install_provider() {
+  local provider="${SKOOBI_INSTALL_PROVIDER:-}" gateway=""
+  if [[ -n "$provider" ]]; then
+    printf '%s' "$provider"
+    return 0
+  fi
+  if [[ -f "$ENV_FILE" ]]; then
+    gateway="$(env_value_for_key SKOOBI_MODEL_GATEWAY_TYPE)"
+    case "$gateway" in
+      codex_subscription_cli) provider="codex" ;;
+      openai_compatible) provider="openai" ;;
+      disabled) provider="claude" ;;
+      '') provider="codex" ;;
+      *)
+        die "Existing provider type is unsupported; set SKOOBI_INSTALL_PROVIDER explicitly"
+        ;;
+    esac
+  else
+    provider="codex"
+  fi
+  printf '%s' "$provider"
+}
+
+check_provider_requirements() {
+  local provider="" gateway=""
+  local codex_command="" configured_command=""
+  if [[ "${SKOOBI_INSTALLER_SKIP_REQUIREMENTS:-}" == "1" ]]; then
+    return 0
+  fi
+  if [[ -f "$ENV_FILE" && "$RECONFIGURE" == "0" ]]; then
+    gateway="$(env_value_for_key SKOOBI_MODEL_GATEWAY_TYPE)"
+    if [[ "$gateway" == "codex_subscription_cli" ]]; then
+      provider="codex"
+      configured_command="$(env_value_for_key SKOOBI_CODEX_COMMAND)"
+    else
+      log "Existing non-Codex provider configuration will be preserved."
+      return 0
+    fi
+  elif [[ -f "$ENV_FILE" ]]; then
+    gateway="$(env_value_for_key SKOOBI_MODEL_GATEWAY_TYPE)"
+    if [[ "$gateway" == "codex_subscription_cli" ]]; then
+      configured_command="$(env_value_for_key SKOOBI_CODEX_COMMAND)"
+    fi
+  fi
+  provider="$(selected_install_provider)"
+  case "$provider" in
+    codex)
+      # Закреплённый Codex этого приложения ставит сам установщик: после
+      # удаления приложения (инстанс сохранён) его ещё нет, и вход проверяем
+      # по `codex` из PATH. Путь в .env вернётся в строй после установки.
+      if [[ -n "$configured_command" ]] &&
+          is_app_pinned_codex_path "$configured_command" "$APP_DIR" &&
+          [[ ! -x "$configured_command" ]]; then
+        configured_command=""
+      fi
+      if [[ -n "$configured_command" ]]; then
+        case "$configured_command" in
+          /*)
+            [[ -f "$configured_command" && -x "$configured_command" ]] ||
+              die "Configured Codex executable is missing or not executable"
+            codex_command="$configured_command"
+            ;;
+          *[!A-Za-z0-9._-]*)
+            die "Configured Codex command is unsafe"
+            ;;
+          *)
+            require_command "$configured_command"
+            codex_command="$(type -P "$configured_command")"
+            ;;
+        esac
+      else
+        require_command codex
+        codex_command="$(type -P codex)"
+      fi
+      if ! "$codex_command" login status >/dev/null 2>&1; then
+        # Закреплённый Codex лежит в node_modules приложения и в PATH не попадает:
+        # голое `codex login` на чистом Mac дало бы «command not found». Поэтому
+        # подсказываем полный путь.
+        if [[ "$codex_command" != "$(type -P codex || true)" &&
+            "$codex_command" != *[[:cntrl:]]* ]]; then
+          die "Codex CLI is not authenticated; run '\"$codex_command\" login' first"
+        fi
+        die "Codex CLI is not authenticated; run 'codex login' first"
+      fi
+      ;;
+    claude)
+      if ! env_has_nonempty_value ANTHROPIC_API_KEY &&
+        ! env_has_nonempty_value CLAUDE_CODE_OAUTH_TOKEN &&
+        ! env_has_nonempty_value ANTHROPIC_AUTH_TOKEN; then
+        require_command claude
+        claude auth status >/dev/null 2>&1 ||
+          die "Claude CLI is not authenticated; run 'claude auth login' first"
+      fi
+      ;;
+    openai)
+      if [[ -z "${SKOOBI_MODEL_GATEWAY_KEY:-}" ]] &&
+        ! env_has_nonempty_value SKOOBI_MODEL_GATEWAY_KEY; then
+        die "OpenAI-compatible provider key is required"
+      fi
+      ;;
+    *) die "Unknown provider selection" ;;
+  esac
+}
+
+preflight_service_path() {
+  [[ "$NO_SERVICE" == "0" ]] || return 0
+  local service_file service_dir relative_dir
+  [[ -d "$HOME" && ! -L "$HOME" ]] ||
+    die "HOME must be a real directory"
+  if [[ "$(detect_os)" == "macos" ]]; then
+    service_file="$MACOS_PLIST"
+    relative_dir="Library/LaunchAgents"
+  else
+    service_file="$LINUX_UNIT"
+    relative_dir=".config/systemd/user"
+  fi
+  assert_home_directory_chain "$relative_dir"
+  service_dir="$(dirname "$service_file")"
+  [[ ! -L "$service_dir" ]] ||
+    die "Refusing to use a symlinked service directory"
+  [[ ! -L "$service_file" ]] ||
+    die "Refusing to replace a symlinked service file"
+  [[ ! -e "$service_file" || -f "$service_file" ]] ||
+    die "Refusing to replace a non-regular service file"
+}
+
+assert_home_directory_chain() {
+  local relative="$1" current="$HOME" part
+  local -a parts
+  IFS='/' read -r -a parts <<<"$relative"
+  for part in "${parts[@]}"; do
+    [[ -n "$part" && "$part" != "." && "$part" != ".." ]] ||
+      die "Unsafe directory path below HOME"
+    current="$current/$part"
+    [[ ! -L "$current" ]] ||
+      die "Refusing to use a symlinked directory ancestor below HOME"
+    [[ ! -e "$current" || -d "$current" ]] ||
+      die "Directory ancestor below HOME is not a directory"
+  done
+}
+
+resolve_advertised_commit() {
+  local repo_dir="$1" target_kind="$2" target_ref="$3"
+  local output status
+  if [[ "$target_kind" == "tag" ]]; then
+    if output="$(git_safe -C "$repo_dir" ls-remote --exit-code origin "${target_ref}^{}")"; then
+      :
+    else
+      status=$?
+      [[ "$status" == "2" ]] ||
+        die "Could not resolve the requested tag from the public repository"
+      output="$(git_safe -C "$repo_dir" ls-remote --exit-code origin "$target_ref")" ||
+        die "Could not resolve the requested tag from the public repository"
+    fi
+  else
+    output="$(git_safe -C "$repo_dir" ls-remote --exit-code origin "$target_ref")" ||
+      die "Could not resolve the requested branch from the public repository"
+  fi
+  [[ "$output" != *$'\n'* ]] ||
+    die "Remote ref resolution returned multiple unexpected results"
+  ADVERTISED_COMMIT="${output%%$'\t'*}"
+  [[ "$ADVERTISED_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
+    die "Remote ref did not advertise an exact commit"
+}
+
+resolve_and_fetch_ref() {
+  local repo_dir="$1"
+  local target_kind="" target_ref="" target_commit=""
+  local tag_exists=0 branch_exists=0 short_ref="$REF"
+  git_safe -C "$repo_dir" init -q --template=
+  git_safe -C "$repo_dir" remote add origin "$CANONICAL_REPO"
+
+  case "$REF" in
+    refs/tags/*)
+      short_ref="${REF#refs/tags/}"
+      target_kind="tag"
+      target_ref="$REF"
+      git_safe -C "$repo_dir" ls-remote --exit-code origin "$target_ref" >/dev/null 2>&1 ||
+        die "Requested tag does not exist in the public repository"
+      ;;
+    refs/heads/*)
+      short_ref="${REF#refs/heads/}"
+      target_kind="branch"
+      target_ref="$REF"
+      git_safe -C "$repo_dir" ls-remote --exit-code origin "$target_ref" >/dev/null 2>&1 ||
+        die "Requested branch does not exist in the public repository"
+      ;;
+    refs/*)
+      die "Only refs/heads/* and refs/tags/* are accepted"
+      ;;
+    *)
+      git_safe -C "$repo_dir" ls-remote --exit-code origin "refs/tags/$short_ref" >/dev/null 2>&1 &&
+        tag_exists=1
+      git_safe -C "$repo_dir" ls-remote --exit-code origin "refs/heads/$short_ref" >/dev/null 2>&1 &&
+        branch_exists=1
+      if [[ "$tag_exists" == "1" && "$branch_exists" == "1" ]]; then
+        die "Requested name is both a branch and a tag; use an explicit refs/heads/* or refs/tags/* ref"
+      elif [[ "$tag_exists" == "1" ]]; then
+        target_kind="tag"
+        target_ref="refs/tags/$short_ref"
+      elif [[ "$branch_exists" == "1" ]]; then
+        target_kind="branch"
+        target_ref="refs/heads/$short_ref"
+      else
+        die "Requested branch or tag does not exist in the public repository"
+      fi
+      ;;
+  esac
+
+  resolve_advertised_commit "$repo_dir" "$target_kind" "$target_ref"
+  git_safe -C "$repo_dir" fetch --depth=1 origin "$target_ref"
+  target_commit="$(git_safe -C "$repo_dir" rev-parse --verify 'FETCH_HEAD^{commit}')"
+  [[ "$target_commit" =~ ^[0-9a-f]{40}$ ]] ||
+    die "Remote ref did not resolve to an exact commit"
+  [[ "$target_commit" == "$ADVERTISED_COMMIT" ]] ||
+    die "Remote ref changed while it was being fetched"
+  if [[ -n "$EXPECTED_COMMIT" && "$target_commit" != "$EXPECTED_COMMIT" ]]; then
+    die "Resolved ref does not match the release asset's expected commit"
+  fi
+  git_safe -C "$repo_dir" checkout --detach "$target_commit"
+  [[ "$(git_safe -C "$repo_dir" rev-parse --verify HEAD)" == "$target_commit" ]] ||
+    die "Exact commit checkout verification failed"
+  RESOLVED_COMMIT="$target_commit"
+  [[ "$(git_safe -C "$repo_dir" config --local --get-all remote.origin.url)" == "$CANONICAL_REPO" ]] ||
+    die "Staged checkout origin verification failed"
+  assert_git_status_clean "$repo_dir" ||
+    die "Staged checkout is unexpectedly dirty"
+  ! has_gitlinks "$repo_dir" ||
+    die "Public releases with Git submodules are not supported"
+  log "Verified $target_kind commit: $target_commit"
+}
+
+# Закреплённый Codex (runtime/codex-toolchain.json) собран только для macOS
+# arm64. На других системах бот берёт `codex` из PATH, как раньше.
+pinned_codex_supported() {
+  [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]
+}
+
+# Манифест закреплённого Codex версии, выкачанной в каталог $1. В версиях без
+# манифеста и `npm run runtime:bootstrap` установка и откат не должны падать
+# на этом шаге. Читаем только саму выкачанную версию: иначе в .env попал бы
+# путь к Codex, которого в ней нет.
+pinned_codex_manifest() {
+  local manifest="$1/runtime/codex-toolchain.json"
+  [[ -f "$manifest" && ! -L "$manifest" ]] || return 1
+  printf '%s\n' "$manifest"
+}
+
+# Ставить закреплённый Codex можно, только если в версии есть и манифест, и
+# скрипт runtime:bootstrap в её package.json.
+pinned_codex_available() {
+  local app_root="$1" manifest
+  pinned_codex_supported || return 1
+  manifest="$(pinned_codex_manifest "$app_root")" || return 1
+  node -e '
+const p = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+process.exit(p.scripts && p.scripts["runtime:bootstrap"] ? 0 : 1);
+' "$app_root/package.json" </dev/null 2>/dev/null
+}
+
+# Путь запуска закреплённого Codex — по манифесту версии в каталоге $1. Сам
+# путь строится от $APP_DIR: там версия работает после переключения.
+pinned_codex_command() {
+  local manifest rel
+  manifest="$(pinned_codex_manifest "$1")" || return 1
+  rel="$(node -e '
+const m = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+if (!/^node_modules\/\.skoobi-codex-[0-9.]+$/.test(String(m.destination)) ||
+    m.launcher !== "node_modules/.bin/codex") process.exit(1);
+process.stdout.write(m.destination + "/" + m.launcher);
+' "$manifest" </dev/null 2>/dev/null)" || return 1
+  printf '%s/%s\n' "$APP_DIR" "$rel"
+}
+
+# Строка, которой заменяется SKOOBI_CODEX_COMMAND, когда в выкачанной версии
+# закреплённого Codex нет: путь в node_modules после `npm ci` уже не
+# существует, и бот без этого не нашёл бы codex вовсе. Следующее обновление на
+# версию с манифестом вернёт ключ само.
+CODEX_COMMAND_DISABLED_PREFIX='# skoobi update: no pinned Codex in this app version; was: SKOOBI_CODEX_COMMAND='
+
+# Значение SKOOBI_CODEX_COMMAND из .env (без кавычек); с --disabled — из
+# строки, закомментированной при обновлении.
+env_codex_command() {
+  local env_file="$1" mode="${2:-}"
+  PREFIX_LINE="$CODEX_COMMAND_DISABLED_PREFIX" MODE="$mode" awk '
+    BEGIN { key = (ENVIRON["MODE"] == "--disabled") ? ENVIRON["PREFIX_LINE"] : "SKOOBI_CODEX_COMMAND=" }
+    index($0, key) == 1 {
+      v = substr($0, length(key) + 1)
+      gsub(/^"|"$/, "", v)
+      print v
+      exit
+    }
+  ' "$env_file"
+}
+
+is_app_pinned_codex_path() {
+  local value="$1" app_dir="$2"
+  case "$value" in
+    "$app_dir"/node_modules/.skoobi-codex-*/node_modules/.bin/codex) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Заменяет первую строку SKOOBI_CODEX_COMMAND (действующую или
+# закомментированную при обновлении) на $2. Остальное в .env не меняется;
+# сначала — сверенная копия .env (600) в каталоге копий инстанса, из неё же
+# .env возвращается при откате. Значения передаются через ENVIRON: `awk -v`
+# разворачивал бы обратные косые черты в пути.
+rewrite_codex_command_line() {
+  local env_file="$1" new_line="$2" pending suffix backup tmp
+  [[ -f "$env_file" && ! -L "$env_file" ]] ||
+    die "Instance .env must be a regular file"
+  [[ ! -L "$BACKUP_DIR" && ! -L "$BACKUP_INSTANCE_ROOT" &&
+      ! -L "$INSTANCE_BACKUP_DIR" ]] ||
+    die "Refusing to back up the instance .env through a symlinked path"
+  mkdir -p "$INSTANCE_BACKUP_DIR"
+  chmod 700 "$BACKUP_DIR" "$BACKUP_INSTANCE_ROOT" "$INSTANCE_BACKUP_DIR"
+  pending="$(mktemp "$INSTANCE_BACKUP_DIR/.env-backup-pending.XXXXXXXX")"
+  ENV_BACKUP_PENDING="$pending"
+  suffix="${pending##*.env-backup-pending.}"
+  backup="$INSTANCE_BACKUP_DIR/env.bak.$suffix"
+  if ! cp "$env_file" "$pending" ||
+      ! chmod 600 "$pending" ||
+      ! cmp -s "$env_file" "$pending" ||
+      [[ -e "$backup" || -L "$backup" ]] ||
+      ! mv "$pending" "$backup"; then
+    rm -f "$pending" >/dev/null 2>&1 || true
+    ENV_BACKUP_PENDING=""
+    die "Could not create a verified backup of the instance .env"
+  fi
+  ENV_BACKUP_PENDING=""
+  ENV_BACKUP="$backup"
+  tmp="$(mktemp "$env_file.tmp.XXXXXX")"
+  NEW_LINE="$new_line" PREFIX_LINE="$CODEX_COMMAND_DISABLED_PREFIX" awk '
+    !done && (index($0, "SKOOBI_CODEX_COMMAND=") == 1 || index($0, ENVIRON["PREFIX_LINE"]) == 1) {
+      print ENVIRON["NEW_LINE"]
+      done = 1
+      next
+    }
+    { print }
+  ' "$env_file" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$env_file"
+  log "Backed up instance .env before editing: $backup"
+}
+
+# Если установщик прописал в .env закреплённый Codex этого приложения, а версия
+# в манифесте сменилась, переводим ключ на новую версию; ключ, закомментированный
+# при откате на версию без манифеста, возвращаем. Чужой путь (свой codex
+# владельца) и отсутствие ключа не трогаем.
+sync_pinned_codex_command() {
+  local env_file="$1" app_dir="$2" command="$3"
+  [[ -f "$env_file" && ! -L "$env_file" ]] || return 0
+  local current restoring=0
+  current="$(env_codex_command "$env_file")"
+  if [[ -z "$current" ]] && ! grep -q '^SKOOBI_CODEX_COMMAND=' "$env_file"; then
+    current="$(env_codex_command "$env_file" --disabled)"
+    restoring=1
+  fi
+  is_app_pinned_codex_path "$current" "$app_dir" || return 0
+  [[ "$restoring" == "1" || "$current" != "$command" ]] || return 0
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "[dry-run] set SKOOBI_CODEX_COMMAND=\"$command\" in $env_file"
+    return 0
+  fi
+  rewrite_codex_command_line "$env_file" "SKOOBI_CODEX_COMMAND=\"$command\""
+  log "SKOOBI_CODEX_COMMAND -> $command"
+}
+
+# Выкачана версия без закреплённого Codex, а .env смотрит на закреплённый Codex
+# этого приложения, которого после `npm ci` больше нет: комментируем строку,
+# чтобы бот взял `codex` из PATH, а не падал на каждом ходе.
+disable_pinned_codex_command() {
+  local env_file="$1" app_dir="$2"
+  [[ -f "$env_file" && ! -L "$env_file" ]] || return 0
+  local current
+  current="$(env_codex_command "$env_file")"
+  is_app_pinned_codex_path "$current" "$app_dir" || return 0
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "[dry-run] comment out SKOOBI_CODEX_COMMAND in $env_file (no pinned Codex in this version)"
+    return 0
+  fi
+  rewrite_codex_command_line "$env_file" "$CODEX_COMMAND_DISABLED_PREFIX\"$current\""
+  log "SKOOBI_CODEX_COMMAND commented out: this version has no pinned Codex, the bot will use codex from PATH."
+}
+
+# После переключения версии: единственная правка .env без --reconfigure —
+# строка SKOOBI_CODEX_COMMAND, и только когда установщик направил её на
+# закреплённый Codex этого приложения (в пути есть версия Codex, и после смены
+# версии старый путь перестаёт существовать).
+sync_instance_codex_command() {
+  local env_file="$1" pinned_cmd=""
+  if pinned_codex_available "$APP_DIR"; then
+    pinned_cmd="$(pinned_codex_command "$APP_DIR")" || return 0
+    sync_pinned_codex_command "$env_file" "$APP_DIR" "$pinned_cmd"
+  elif pinned_codex_supported; then
+    disable_pinned_codex_command "$env_file" "$APP_DIR"
+  fi
+}
+# pinned Codex .env sync: end
+
+build_staged_release() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "[dry-run] create owner-only staging checkout"
+    log "[dry-run] fetch $REF from the canonical public repository"
+    log "[dry-run] verify exact commit, npm ci, runner npm ci, and build in staging"
+    if pinned_codex_supported; then
+      log "[dry-run] install the pinned Codex in staging (npm run runtime:bootstrap) when the release ships one"
+    fi
+    return 0
+  fi
+  STAGE_DIR="$(mktemp -d "$APP_BASE/.skoobi-agent.stage.XXXXXXXX")"
+  chmod 700 "$STAGE_DIR"
+  resolve_and_fetch_ref "$STAGE_DIR"
+  safe_npm --prefix "$STAGE_DIR" ci
+  [[ ! -e "$STAGE_DIR/.husky/_" && ! -L "$STAGE_DIR/.husky/_" ]] ||
+    die "Managed production build unexpectedly created Husky runtime hooks"
+  if [[ -f "$STAGE_DIR/agent/runner/package.json" ]]; then
+    safe_npm --prefix "$STAGE_DIR/agent/runner" ci
+  fi
+  safe_npm --prefix "$STAGE_DIR" run build
+  # `npm ci` стирает node_modules вместе с закреплённым Codex — ставим заново
+  # (скачивает только закреплённые пакеты и сверяет их контрольные суммы).
+  if pinned_codex_available "$STAGE_DIR"; then
+    safe_npm --prefix "$STAGE_DIR" run runtime:bootstrap
+  elif pinned_codex_supported; then
+    log "This app version has no pinned Codex (runtime/codex-toolchain.json + runtime:bootstrap); skipping its install."
+  fi
+  [[ -f "$STAGE_DIR/dist/service.js" ]] ||
+    die "Build completed without dist/service.js"
+  assert_real_git_checkout "$STAGE_DIR"
+  [[ "$(git_safe -C "$STAGE_DIR" rev-parse --verify 'HEAD^{commit}')" == "$RESOLVED_COMMIT" ]] ||
+    die "Build changed the staged release commit"
+  assert_git_status_clean "$STAGE_DIR" ||
+    die "Build modified tracked or non-ignored staged source files"
+  rm -rf "$BUILD_HOME"
+  BUILD_HOME=""
+}
+
+switch_release() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "[dry-run] atomically switch the verified staged release into $APP_DIR"
+    return 0
+  fi
+  if [[ -e "$APP_DIR" ]]; then
+    OLD_RELEASE_ROOT="$(mktemp -d "$APP_BASE/.skoobi-agent.previous.XXXXXXXX")"
+    chmod 700 "$OLD_RELEASE_ROOT"
+    OLD_RELEASE="$OLD_RELEASE_ROOT/release"
+    if ! mv "$APP_DIR" "$OLD_RELEASE"; then
+      if [[ (-e "$APP_DIR" || -L "$APP_DIR") &&
+          ! -e "$OLD_RELEASE" && ! -L "$OLD_RELEASE" ]]; then
+        OLD_RELEASE=""
+        rmdir "$OLD_RELEASE_ROOT" >/dev/null 2>&1 || true
+        OLD_RELEASE_ROOT=""
+      fi
+      die "Could not preserve the active release before activation"
+    fi
+  fi
+  STAGE_ACTIVATION_STARTED=1
+  if ! mv "$STAGE_DIR" "$APP_DIR"; then
+    die "Could not activate the staged release"
+  fi
+  STAGE_DIR=""
+}
+
+env_quote() {
+  local value="$1"
+  case "$value" in
+    *$'\n'*|*$'\r'*) die "Configuration values must not contain newlines" ;;
+  esac
+  printf '"%s"' "$value"
+}
+
+set_env_key() {
+  local key="$1" value="$2" quoted tmp line found=0
+  quoted="$(env_quote "$value")"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    if [[ "$key" == *TOKEN* || "$key" == *KEY* || "$key" == *SECRET* ||
+        "$key" == *URL* ]]; then
+      log "[dry-run] set $key=<redacted> in $ENV_FILE"
+    else
+      log "[dry-run] set $key=$quoted in $ENV_FILE"
+    fi
+    return
+  fi
+  tmp="$(mktemp "$ENV_FILE.tmp.XXXXXX")"
+  if [[ -f "$ENV_FILE" ]] &&
+    grep -Eq "^[[:space:]]*${key}=" "$ENV_FILE"; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" =~ ^[[:space:]]*${key}= ]]; then
+        if [[ "$found" == "0" ]]; then
+          printf '%s=%s\n' "$key" "$quoted" >>"$tmp"
+          found=1
+        fi
+      else
+        printf '%s\n' "$line" >>"$tmp"
+      fi
+    done <"$ENV_FILE"
+    if [[ "$found" == "0" ]]; then
+      printf '%s=%s\n' "$key" "$quoted" >>"$tmp"
+    fi
+  else
+    [[ ! -f "$ENV_FILE" ]] || cp "$ENV_FILE" "$tmp"
+    printf '\n%s=%s\n' "$key" "$quoted" >>"$tmp"
+  fi
+  chmod 600 "$tmp"
+  mv "$tmp" "$ENV_FILE"
+}
+
+env_has_key() {
+  [[ -f "$ENV_FILE" ]] && grep -Eq "^[[:space:]]*$1=" "$ENV_FILE"
+}
+
+env_has_nonempty_value() {
+  local key="$1" line value trimmed
+  [[ -f "$ENV_FILE" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*${key}= ]] || continue
+    value="${line#*=}"
+    trimmed="${value#"${value%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ "$trimmed" == \"*\" && "$trimmed" == *\" ]]; then
+      trimmed="${trimmed:1:${#trimmed}-2}"
+    elif [[ "$trimmed" == \'*\' && "$trimmed" == *\' ]]; then
+      trimmed="${trimmed:1:${#trimmed}-2}"
+    fi
+    trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    [[ -n "$trimmed" ]] && return 0
+  done <"$ENV_FILE"
+  return 1
+}
+
+valid_telegram_bot_token() {
+  [[ "$1" =~ ^[1-9][0-9]{5,19}:[A-Za-z0-9_-]{30,100}$ ]]
+}
+
+telegram_token_candidate() {
+  local token=""
+  if [[ -f "$ENV_FILE" && "$RECONFIGURE" == "0" ]]; then
+    token="$(env_value_for_key TELEGRAM_BOT_TOKEN)"
+  else
+    token="${SKOOBI_TELEGRAM_BOT_TOKEN:-}"
+    if [[ -z "$token" && -f "$ENV_FILE" ]]; then
+      token="$(env_value_for_key TELEGRAM_BOT_TOKEN)"
+    fi
+  fi
+  printf '%s' "$token"
+}
+
+verify_telegram_token_live() {
+  local token="$1" response="" status="" curl_status=0
+  [[ "$NO_SERVICE" == "0" && "$NO_START" == "0" &&
+      "$DRY_RUN" == "0" ]] || return 0
+  [[ "$TELEGRAM_PREFLIGHT_VERIFIED" != "$token" ]] || return 0
+  if [[ "${SKOOBI_INSTALLER_SKIP_REQUIREMENTS:-}" == "1" ]]; then
+    TELEGRAM_PREFLIGHT_VERIFIED="$token"
+    return 0
+  fi
+  response="$(mktemp "${TMPDIR:-/tmp}/skoobi-telegram-preflight.XXXXXXXX")"
+  chmod 600 "$response"
+  status="$(
+    printf 'url = "https://api.telegram.org/bot%s/getMe"\n' "$token" |
+      curl --config - --silent --show-error \
+        --connect-timeout 10 --max-time 30 \
+        --output "$response" --write-out '%{http_code}' 2>/dev/null
+  )" || curl_status=$?
+  if [[ "$curl_status" != "0" ]]; then
+    rm -f "$response"
+    die "Could not verify the Telegram bot token; check network access and retry"
+  fi
+  if [[ "$status" != "200" ]] ||
+      ! node -e '
+        const fs = require("node:fs");
+        const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        process.exit(value?.ok === true && value?.result?.is_bot === true ? 0 : 1);
+      ' "$response" </dev/null >/dev/null 2>&1; then
+    rm -f "$response"
+    die "Telegram rejected the bot token"
+  fi
+  rm -f "$response"
+  TELEGRAM_PREFLIGHT_VERIFIED="$token"
+}
+
+validate_telegram_configuration() {
+  local token=""
+  token="$(telegram_token_candidate)"
+  if [[ -n "$token" ]]; then
+    valid_telegram_bot_token "$token" ||
+      die "Telegram bot token format is invalid"
+    verify_telegram_token_live "$token"
+    return 0
+  fi
+  if [[ "$NO_SERVICE" == "0" && "$NO_START" == "0" &&
+      "$DRY_RUN" == "0" ]]; then
+    die "Telegram bot token is required before starting the service"
+  fi
+}
+
+preflight_install_configuration() {
+  local token="" will_configure=0
+  if [[ "$YES" == "0" && ! -t 0 ]]; then
+    die "Non-interactive installation requires --yes and the documented SKOOBI_* environment variables"
+  fi
+  if [[ ! -f "$ENV_FILE" || "$RECONFIGURE" == "1" ]]; then
+    will_configure=1
+  fi
+  token="$(telegram_token_candidate)"
+  if [[ -n "$token" ]]; then
+    valid_telegram_bot_token "$token" ||
+      die "Telegram bot token format is invalid"
+    verify_telegram_token_live "$token"
+  elif [[ "$NO_SERVICE" == "0" && "$NO_START" == "0" &&
+      "$DRY_RUN" == "0" &&
+      ("$YES" == "1" || "$will_configure" == "0") ]]; then
+    die "Telegram bot token is required before starting the service"
+  fi
+}
+
+assert_instance_path_types() {
+  local path
+  for path in "$INSTANCE_ROOT" "$INSTANCE_DIR" "$INSTANCE_DIR/store" \
+    "$INSTANCE_DIR/groups" "$INSTANCE_DIR/logs" "$INSTANCE_DIR/data" \
+    "$BACKUP_DIR" "$BACKUP_INSTANCE_ROOT" "$INSTANCE_BACKUP_DIR"; do
+    [[ ! -L "$path" ]] ||
+      die "Refusing to configure an instance through a symlinked managed path"
+    [[ ! -e "$path" || -d "$path" ]] ||
+      die "Managed instance directory path is not a directory"
+  done
+  [[ ! -L "$ENV_FILE" ]] ||
+    die "Refusing to configure a symlinked instance .env"
+  [[ ! -e "$ENV_FILE" || -f "$ENV_FILE" ]] ||
+    die "Instance .env must be a regular file"
+}
+
+prepare_instance() {
+  assert_instance_path_types
+  run mkdir -p "$INSTANCE_DIR/store" "$INSTANCE_DIR/groups" \
+    "$INSTANCE_DIR/logs" "$INSTANCE_DIR/data" "$INSTANCE_BACKUP_DIR"
+  assert_instance_path_types
+  run chmod 700 "$PREFIX" "$INSTANCE_ROOT" "$INSTANCE_DIR" \
+    "$INSTANCE_DIR/store" "$INSTANCE_DIR/groups" "$INSTANCE_DIR/logs" \
+    "$INSTANCE_DIR/data" "$BACKUP_DIR" "$BACKUP_INSTANCE_ROOT" \
+    "$INSTANCE_BACKUP_DIR"
+
+  if [[ -f "$ENV_FILE" ]]; then
+    if [[ "$RECONFIGURE" == "0" ]]; then
+      log "Existing instance configuration preserved unchanged."
+      return 1
+    fi
+    local backup pending suffix
+    if [[ "$DRY_RUN" == "1" ]]; then
+      log "[dry-run] back up existing .env before explicit reconfiguration"
+      return 0
+    fi
+    pending="$(mktemp "$INSTANCE_BACKUP_DIR/.env-backup-pending.XXXXXXXX")"
+    ENV_BACKUP_PENDING="$pending"
+    suffix="${pending##*.env-backup-pending.}"
+    backup="$INSTANCE_BACKUP_DIR/env.bak.$suffix"
+    if ! cp "$ENV_FILE" "$pending" ||
+        ! chmod 600 "$pending" ||
+        ! cmp -s "$ENV_FILE" "$pending"; then
+      rm -f "$pending" >/dev/null 2>&1 || true
+      ENV_BACKUP_PENDING=""
+      die "Could not create a verified backup of the existing .env"
+    fi
+    [[ ! -e "$backup" && ! -L "$backup" ]] ||
+      die "Generated .env backup path already exists"
+    if ! mv "$pending" "$backup"; then
+      rm -f "$pending" >/dev/null 2>&1 || true
+      ENV_BACKUP_PENDING=""
+      die "Could not publish the verified .env backup"
+    fi
+    ENV_BACKUP_PENDING=""
+    ENV_BACKUP="$backup"
+    log "Backed up existing .env before explicit reconfiguration: $backup"
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "[dry-run] create owner-only $ENV_FILE"
+  elif [[ -f "$APP_DIR/.env.example" ]]; then
+    cp "$APP_DIR/.env.example" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    ENV_CREATED_BY_INSTALL=1
+  else
+    printf 'RUNTIME=sandbox\nASSISTANT_NAME=Skoobi\nSKOOBI_TELEGRAM_GUEST_LIVE_ENABLED=false\n' >"$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    ENV_CREATED_BY_INSTALL=1
+  fi
+  return 0
+}
+
+configure_env() {
+  local assistant="${SKOOBI_ASSISTANT_NAME:-}"
+  if [[ -z "$assistant" && "$YES" == "0" ]]; then
+    require_interactive_terminal
+    read -r -p "Assistant name [Skoobi]: " assistant || true
+  fi
+  assistant="${assistant:-Skoobi}"
+  set_env_key ASSISTANT_NAME "$assistant"
+  set_env_key RUNTIME "sandbox"
+  set_env_key SKOOBI_SERVICE_LABEL "$SERVICE_LABEL"
+  set_env_key SKOOBI_TELEGRAM_GUEST_LIVE_ENABLED "false"
+  set_env_key SKOOBI_LIVE_CANARY_ENABLED "false"
+  # Голос (Edge TTS): venv (scripts/setup-edge-tts.sh) и адаптер лежат в каталоге
+  # приложения, а служба работает из каталога инстанса, так что пути по
+  # умолчанию (от рабочего каталога) туда не ведут. Свои значения не трогаем.
+  # Версии без адаптера эти ключи не нужны.
+  if [[ -f "$APP_DIR/scripts/edge-tts-adapter.py" ]]; then
+    env_has_key EDGE_TTS_BIN ||
+      set_env_key EDGE_TTS_BIN "$APP_DIR/.runtime/edge-tts/venv/bin/python"
+    env_has_key EDGE_TTS_SCRIPT ||
+      set_env_key EDGE_TTS_SCRIPT "$APP_DIR/scripts/edge-tts-adapter.py"
+  fi
+
+  local token="${SKOOBI_TELEGRAM_BOT_TOKEN:-}"
+  if [[ -z "$token" && "$YES" == "0" ]] &&
+    ! env_has_nonempty_value TELEGRAM_BOT_TOKEN; then
+    require_interactive_terminal
+    read -r -s -p "Telegram bot token (input hidden): " token || true
+    printf '\n'
+  fi
+  if [[ -n "$token" ]]; then
+    valid_telegram_bot_token "$token" ||
+      die "Telegram bot token format is invalid"
+    set_env_key TELEGRAM_BOT_TOKEN "$token"
+  fi
+
+  local provider=""
+  provider="$(selected_install_provider)"
+  case "$provider" in
+    codex)
+      local codex_path="" pinned_path=""
+      if [[ -z "${SKOOBI_INSTALL_PROVIDER:-}" &&
+          -f "$ENV_FILE" &&
+          "$(env_value_for_key SKOOBI_MODEL_GATEWAY_TYPE)" == "codex_subscription_cli" ]]; then
+        codex_path="$(env_value_for_key SKOOBI_CODEX_COMMAND)"
+      fi
+      # Закреплённый Codex версии важнее случайного `codex` из PATH. Свой путь
+      # владельца сохраняем; прежний путь к закреплённому Codex этого
+      # приложения переводим на версию из манифеста.
+      if [[ -z "$codex_path" ]] ||
+          is_app_pinned_codex_path "$codex_path" "$APP_DIR"; then
+        if pinned_codex_available "$APP_DIR" &&
+            pinned_path="$(pinned_codex_command "$APP_DIR")" &&
+            [[ -f "$pinned_path" && -x "$pinned_path" ]]; then
+          codex_path="$pinned_path"
+        else
+          codex_path=""
+        fi
+      fi
+      if [[ -z "$codex_path" ]]; then
+        codex_path="$(type -P codex || true)"
+      fi
+      if [[ -n "$codex_path" ]]; then
+        case "$codex_path" in
+          /*) ;;
+          *) die "Codex executable path must be absolute" ;;
+        esac
+        case "$codex_path" in
+          *$'\n'*|*$'\r'*) die "Codex executable path must not contain newlines" ;;
+        esac
+        set_env_key SKOOBI_CODEX_COMMAND "$codex_path"
+      fi
+      set_env_key SKOOBI_MODEL_GATEWAY_TYPE "codex_subscription_cli"
+      set_env_key SKOOBI_CODEX_SUBSCRIPTION_ENABLED "true"
+      set_env_key SKOOBI_TELEGRAM_OWNER_LIVE_ENABLED "true"
+      set_env_key SKOOBI_CODEX_OWNER_FULL_AGENT_ENABLED "true"
+      set_env_key SKOOBI_CODEX_OWNER_FULL_AGENT_MODE "always"
+      set_env_key SKOOBI_SANDBOX_CODEX_PRIMARY "false"
+      set_env_key SKOOBI_SCHEDULED_TASKS_CODEX_PRIMARY "true"
+      ;;
+    claude)
+      set_env_key SKOOBI_MODEL_GATEWAY_TYPE "disabled"
+      set_env_key SKOOBI_CODEX_SUBSCRIPTION_ENABLED "false"
+      set_env_key SKOOBI_TELEGRAM_OWNER_LIVE_ENABLED "false"
+      set_env_key SKOOBI_CODEX_OWNER_FULL_AGENT_ENABLED "false"
+      set_env_key SKOOBI_CODEX_OWNER_FULL_AGENT_MODE "auto"
+      set_env_key SKOOBI_SANDBOX_CODEX_PRIMARY "false"
+      set_env_key SKOOBI_SCHEDULED_TASKS_CODEX_PRIMARY "false"
+      ;;
+    openai)
+      local gateway_base_url="${SKOOBI_MODEL_GATEWAY_BASE_URL:-}"
+      if [[ -z "$gateway_base_url" ]]; then
+        gateway_base_url="$(env_value_for_key SKOOBI_MODEL_GATEWAY_BASE_URL)"
+      fi
+      gateway_base_url="${gateway_base_url:-https://api.openai.com/v1}"
+      set_env_key SKOOBI_MODEL_GATEWAY_TYPE "openai_compatible"
+      set_env_key SKOOBI_CODEX_SUBSCRIPTION_ENABLED "false"
+      set_env_key SKOOBI_TELEGRAM_OWNER_LIVE_ENABLED "true"
+      set_env_key SKOOBI_CODEX_OWNER_FULL_AGENT_ENABLED "false"
+      set_env_key SKOOBI_CODEX_OWNER_FULL_AGENT_MODE "auto"
+      set_env_key SKOOBI_SANDBOX_CODEX_PRIMARY "false"
+      set_env_key SKOOBI_SCHEDULED_TASKS_CODEX_PRIMARY "false"
+      set_env_key SKOOBI_MODEL_GATEWAY_BASE_URL "$gateway_base_url"
+      [[ -z "${SKOOBI_MODEL_GATEWAY_KEY:-}" ]] ||
+        set_env_key SKOOBI_MODEL_GATEWAY_KEY "$SKOOBI_MODEL_GATEWAY_KEY"
+      ;;
+    *) die "Unknown provider selection" ;;
+  esac
+}
+
+confirm_cli_replace() {
+  [[ "$YES" == "1" || "$DRY_RUN" == "1" ]] && return 0
+  local answer=""
+  require_interactive_terminal
+  read -r -p "Back up and replace the existing skoobi CLI path? [y/N]: " answer || true
+  [[ "$answer" =~ ^(y|Y|yes|YES)$ ]]
+}
+
+install_cli_symlink() {
+  [[ -d "$HOME" && ! -L "$HOME" ]] ||
+    die "HOME must be a real directory"
+  assert_home_directory_chain ".local/bin"
+  if [[ ! -d "$CLI_LINK_DIR" ]]; then
+    run mkdir -p "$CLI_LINK_DIR"
+  fi
+  assert_home_directory_chain ".local/bin"
+  [[ ! -L "$CLI_LINK_DIR" ]] || die "Refusing to use a symlinked CLI directory"
+  if [[ -L "$CLI_LINK" && "$(readlink "$CLI_LINK" 2>/dev/null || true)" == "$CLI_TARGET" ]]; then
+    log "CLI symlink already installed."
+    return 0
+  fi
+  if [[ -e "$CLI_LINK" || -L "$CLI_LINK" ]]; then
+    confirm_cli_replace || {
+      log "Existing CLI path preserved."
+      return 0
+    }
+    if [[ "$DRY_RUN" == "1" ]]; then
+      log "[dry-run] move existing CLI path into an owner-only backup"
+    else
+      local cli_backup_root
+      cli_backup_root="$(mktemp -d "$BACKUP_DIR/cli-backup-XXXXXXXX")"
+      chmod 700 "$cli_backup_root"
+      CLI_BACKUP="$cli_backup_root/skoobi"
+      CLI_MOVE_ATTEMPTED=1
+      if ! mv "$CLI_LINK" "$CLI_BACKUP"; then
+        die "Could not move the existing CLI path into its backup"
+      fi
+      CLI_MOVED_ASIDE=1
+    fi
+  fi
+  if [[ "$DRY_RUN" == "1" ]]; then
+    run ln -s "$CLI_TARGET" "$CLI_LINK"
+  else
+    CLI_CHANGE_ATTEMPTED=1
+    if ! ln -s "$CLI_TARGET" "$CLI_LINK"; then
+      die "Could not install the Skoobi CLI symlink"
+    fi
+    CLI_CHANGED=1
+  fi
+  log "CLI symlink: $CLI_LINK -> $CLI_TARGET"
+}
+
+atomic_write_service() {
+  local file="$1" content="$2" dir tmp
+  dir="$(dirname "$file")"
+  preflight_service_path
+  run mkdir -p "$dir"
+  [[ "$DRY_RUN" == "1" ]] && {
+    log "[dry-run] atomically write regular service file $file"
+    return 0
+  }
+  preflight_service_path
+  if [[ -e "$file" ]]; then
+    SERVICE_EXISTED=1
+    SERVICE_BACKUP="$(mktemp "$BACKUP_DIR/service.$(basename "$file").XXXXXXXX")"
+    cp "$file" "$SERVICE_BACKUP"
+    chmod 600 "$SERVICE_BACKUP"
+  fi
+  tmp="$(mktemp "$dir/.skoobi-service.XXXXXXXX")"
+  printf '%s' "$content" >"$tmp"
+  chmod 600 "$tmp"
+  SERVICE_CHANGED=1
+  mv -f "$tmp" "$file"
+}
+
+stop_existing_service() {
+  local os_name status target
+  os_name="$(detect_os)"
+  if [[ "$DRY_RUN" != "0" ]]; then
+    SERVICE_STOP_CONFIRMED=1
+    return 0
+  fi
+  if [[ "$NO_SERVICE" != "0" ]]; then
+    if [[ "$os_name" == "macos" ]]; then
+      if [[ -e "$MACOS_PLIST" || -L "$MACOS_PLIST" ]]; then
+        [[ -f "$MACOS_PLIST" && ! -L "$MACOS_PLIST" ]] ||
+          die "Managed launchd service definition is not a safe regular file"
+      fi
+      if ! command -v launchctl >/dev/null 2>&1; then
+        [[ ! -e "$MACOS_PLIST" && ! -L "$MACOS_PLIST" ]] ||
+          die "launchctl is required to verify --no-service safely"
+        SERVICE_STOP_CONFIRMED=1
+        return 0
+      fi
+      target="gui/$(id -u)/$SERVICE_LABEL"
+      if launchd_job_state "$target"; then
+        die "A managed launchd service is running; stop it before using --no-service"
+      else
+        status=$?
+        [[ "$status" == "3" ]] ||
+          die "Could not prove the managed launchd service is inactive for --no-service"
+      fi
+    elif [[ "$os_name" == "linux" ]]; then
+      if [[ -e "$LINUX_UNIT" || -L "$LINUX_UNIT" ]]; then
+        [[ -f "$LINUX_UNIT" && ! -L "$LINUX_UNIT" ]] ||
+          die "Managed systemd service definition is not a safe regular file"
+      fi
+      if ! command -v systemctl >/dev/null 2>&1; then
+        [[ ! -e "$LINUX_UNIT" && ! -L "$LINUX_UNIT" ]] ||
+          die "systemctl is required to verify --no-service safely"
+        SERVICE_STOP_CONFIRMED=1
+        return 0
+      fi
+      if systemctl --user is-active --quiet "skoobi-$INSTANCE"; then
+        status=0
+      else
+        status=$?
+      fi
+      case "$status" in
+        3|4) ;;
+        0) die "A managed systemd service is running; stop it before using --no-service" ;;
+        *) die "Could not prove the managed systemd service is inactive for --no-service" ;;
+      esac
+    fi
+    SERVICE_STOP_CONFIRMED=1
+    return 0
+  fi
+  SERVICE_STOP_ATTEMPTED=1
+  if [[ "$os_name" == "macos" ]]; then
+    local disabled_state="" target
+    target="gui/$(id -u)/$SERVICE_LABEL"
+    if [[ -f "$MACOS_PLIST" ]]; then
+      SERVICE_WAS_ENABLED=1
+      disabled_state="$(launchctl print-disabled "gui/$(id -u)" 2>/dev/null)" ||
+        die "Could not determine whether the existing launchd service is enabled"
+      if grep -F "\"$SERVICE_LABEL\" => true" <<<"$disabled_state" >/dev/null; then
+        SERVICE_WAS_ENABLED=0
+      fi
+      SERVICE_ENABLEMENT_KNOWN=1
+    fi
+    if launchd_job_state "$target"; then
+      SERVICE_WAS_ACTIVE=1
+      [[ -f "$MACOS_PLIST" ]] ||
+        die "Active launchd service has no regular managed plist"
+      launchctl disable "$target" >/dev/null 2>&1 || true
+      launchctl bootout "$target" >/dev/null 2>&1 || true
+      if launchd_job_state "$target"; then
+        die "Existing launchd service did not stop"
+      else
+        status=$?
+        [[ "$status" == "3" ]] ||
+          die "Could not prove that the existing launchd service stopped"
+      fi
+    else
+      status=$?
+      [[ "$status" == "3" ]] ||
+        die "Could not determine whether the existing launchd service is active"
+    fi
+    SERVICE_STOP_CONFIRMED=1
+  else
+    local enabled_state="" status
+    if [[ -f "$LINUX_UNIT" ]]; then
+      enabled_state="$(systemctl --user is-enabled "skoobi-$INSTANCE" 2>/dev/null || true)"
+      case "$enabled_state" in
+        enabled)
+          SERVICE_WAS_ENABLED=1
+          SERVICE_ENABLEMENT_KNOWN=1
+          ;;
+        enabled-runtime)
+          SERVICE_WAS_ENABLED=1
+          SERVICE_WAS_ENABLED_RUNTIME=1
+          SERVICE_ENABLEMENT_KNOWN=1
+          ;;
+        disabled)
+          SERVICE_WAS_ENABLED=0
+          SERVICE_ENABLEMENT_KNOWN=1
+          ;;
+        *)
+          die "Existing systemd service has an unsupported enablement state: $enabled_state"
+          ;;
+      esac
+    fi
+    if systemctl --user is-active --quiet "skoobi-$INSTANCE"; then
+      status=0
+    else
+      status=$?
+    fi
+    case "$status" in
+      0)
+        SERVICE_WAS_ACTIVE=1
+        [[ -f "$LINUX_UNIT" ]] ||
+          die "Active systemd service has no regular managed unit"
+        ;;
+      3) ;;
+      4)
+        if [[ ! -e "$LINUX_UNIT" ]]; then
+          SERVICE_STOP_CONFIRMED=1
+          return 0
+        fi
+        ;;
+      *) die "Could not determine whether the existing systemd service is active" ;;
+    esac
+    systemctl --user disable --now "skoobi-$INSTANCE" >/dev/null 2>&1 ||
+      die "Could not stop and disable the existing systemd service"
+    if systemctl --user is-active --quiet "skoobi-$INSTANCE"; then
+      status=0
+    else
+      status=$?
+    fi
+    case "$status" in
+      3|4) ;;
+      0) die "Existing systemd service did not stop" ;;
+      *) die "Could not prove that the existing systemd service stopped" ;;
+    esac
+    SERVICE_STOP_CONFIRMED=1
+  fi
+}
+
+restore_previous_service_state() {
+  local os_name status target
+  os_name="$(detect_os)"
+  if [[ "$os_name" == "macos" ]]; then
+    target="gui/$(id -u)/$SERVICE_LABEL"
+    if [[ "$SERVICE_WAS_ACTIVE" == "1" ]]; then
+      launchctl enable "$target" >/dev/null 2>&1 || return 1
+      if launchd_job_state "$target"; then
+        :
+      else
+        status=$?
+        [[ "$status" == "3" ]] || return 1
+        launchctl bootstrap "gui/$(id -u)" "$MACOS_PLIST" \
+          >/dev/null 2>&1 || return 1
+      fi
+      launchctl kickstart -k "$target" >/dev/null 2>&1 || return 1
+      if [[ "$SERVICE_ENABLEMENT_KNOWN" == "1" &&
+          "$SERVICE_WAS_ENABLED" == "0" ]]; then
+        launchctl disable "$target" >/dev/null 2>&1 || return 1
+      fi
+      launchd_job_state "$target" || return 1
+    elif [[ "$SERVICE_ENABLEMENT_KNOWN" == "1" ]]; then
+      if [[ "$SERVICE_WAS_ENABLED" == "1" ]]; then
+        launchctl enable "$target" >/dev/null 2>&1 || return 1
+      else
+        launchctl disable "$target" >/dev/null 2>&1 || return 1
+      fi
+    fi
+  elif [[ "$os_name" == "linux" ]]; then
+    systemctl --user daemon-reload >/dev/null 2>&1 || return 1
+    if [[ "$SERVICE_ENABLEMENT_KNOWN" == "1" ]]; then
+      if [[ "$SERVICE_WAS_ENABLED" == "1" ]]; then
+        if [[ "$SERVICE_WAS_ENABLED_RUNTIME" == "1" ]]; then
+          systemctl --user enable --runtime "skoobi-$INSTANCE" >/dev/null 2>&1 ||
+            return 1
+        else
+          systemctl --user enable "skoobi-$INSTANCE" >/dev/null 2>&1 ||
+            return 1
+        fi
+      else
+        systemctl --user disable "skoobi-$INSTANCE" >/dev/null 2>&1 ||
+          return 1
+      fi
+    fi
+    if [[ "$SERVICE_WAS_ACTIVE" == "1" ]]; then
+      systemctl --user start "skoobi-$INSTANCE" >/dev/null 2>&1 || return 1
+      if systemctl --user is-active --quiet "skoobi-$INSTANCE"; then
+        status=0
+      else
+        status=$?
+      fi
+      [[ "$status" == "0" ]] || return 1
+    fi
+  fi
+  return 0
+}
+
+install_service() {
+  [[ "$NO_SERVICE" == "0" ]] || return 0
+  local os_name node_path
+  os_name="$(detect_os)"
+  node_path="$(node_bin)"
+  case "$node_path" in
+    *$'\n'*|*$'\r'*) die "Node executable path must not contain newlines" ;;
+  esac
+  if [[ "$os_name" == "macos" ]]; then
+    atomic_write_service "$MACOS_PLIST" "$(launchd_plist "$node_path")"
+    if [[ "$NO_START" == "0" && "$DRY_RUN" == "0" ]]; then
+      local target
+      target="gui/$(id -u)/$SERVICE_LABEL"
+      SERVICE_ACTIVATION_ATTEMPTED=1
+      launchctl enable "$target"
+      launchctl bootstrap "gui/$(id -u)" "$MACOS_PLIST"
+      launchctl kickstart -k "$target"
+      launchctl print "$target" >/dev/null
+    elif [[ "$NO_START" == "1" && "$DRY_RUN" == "0" &&
+        "$SERVICE_ENABLEMENT_KNOWN" == "1" &&
+        "$SERVICE_WAS_ENABLED" == "1" ]]; then
+      launchctl enable "gui/$(id -u)/$SERVICE_LABEL"
+    fi
+  else
+    atomic_write_service "$LINUX_UNIT" "$(systemd_unit "$node_path")"
+    if [[ "$NO_START" == "0" && "$DRY_RUN" == "0" ]]; then
+      SERVICE_ACTIVATION_ATTEMPTED=1
+      systemctl --user daemon-reload
+      systemctl --user enable --now "skoobi-$INSTANCE"
+      systemctl --user is-active --quiet "skoobi-$INSTANCE"
+    elif [[ "$NO_START" == "1" && "$DRY_RUN" == "0" ]]; then
+      systemctl --user daemon-reload
+      if [[ "$SERVICE_ENABLEMENT_KNOWN" == "1" &&
+          "$SERVICE_WAS_ENABLED" == "1" ]]; then
+        if [[ "$SERVICE_WAS_ENABLED_RUNTIME" == "1" ]]; then
+          systemctl --user enable --runtime "skoobi-$INSTANCE"
+        else
+          systemctl --user enable "skoobi-$INSTANCE"
+        fi
+      fi
+    fi
+  fi
+}
+
+write_marker() {
+  [[ "$DRY_RUN" == "0" ]] || {
+    log "[dry-run] atomically write managed-install marker"
+    return 0
+  }
+  [[ ! -L "$MARKER_FILE" ]] ||
+    die "Refusing to replace a symlinked managed-install marker"
+  local tmp
+  tmp="$(mktemp "$PREFIX/.skoobi-managed-install.XXXXXXXX")"
+  marker_content "$APP_NAME" >"$tmp"
+  chmod 600 "$tmp"
+  if [[ ! -e "$MARKER_FILE" && ! -L "$MARKER_FILE" ]]; then
+    MARKER_CREATED_BY_INSTALL=1
+  fi
+  mv -f "$tmp" "$MARKER_FILE"
+}
+
+reconcile_cli_mutation_state() {
+  local target=""
+  if [[ "$CLI_CHANGE_ATTEMPTED" == "1" && "$CLI_CHANGED" != "1" ]]; then
+    if [[ -L "$CLI_LINK" ]]; then
+      target="$(readlink "$CLI_LINK" 2>/dev/null || true)"
+      [[ "$target" == "$CLI_TARGET" ]] || return 1
+      CLI_CHANGED=1
+    elif [[ -e "$CLI_LINK" ]]; then
+      return 1
+    fi
+  fi
+
+  if [[ "$CLI_MOVE_ATTEMPTED" == "1" && "$CLI_MOVED_ASIDE" != "1" ]]; then
+    if [[ -n "$CLI_BACKUP" &&
+        (-e "$CLI_BACKUP" || -L "$CLI_BACKUP") ]]; then
+      if [[ "$CLI_CHANGED" == "1" ||
+          (! -e "$CLI_LINK" && ! -L "$CLI_LINK") ]]; then
+        CLI_MOVED_ASIDE=1
+      else
+        return 1
+      fi
+    elif [[ "$CLI_CHANGED" == "1" ||
+        (! -e "$CLI_LINK" && ! -L "$CLI_LINK") ]]; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
+rollback_transaction() {
+  local status="$1" os_name="" service_stopped="$SERVICE_STOP_CONFIRMED"
+  local app_moved_aside=0 cli_state_unknown=0 mutation_started=0
+  local pre_stop_state_restored=0
+  local launchd_status=0 rollback_app="" restore_ok=1 systemd_status=0 target=""
+  [[ "$INSTALL_SUCCEEDED" == "0" ]] || return 0
+  set +e
+  os_name="$(detect_os)"
+  if ! reconcile_cli_mutation_state; then
+    cli_state_unknown=1
+    err "Rollback could not safely determine the CLI path state"
+  fi
+  if [[ "$SERVICE_ACTIVATION_ATTEMPTED" == "1" ]]; then
+    if [[ "$os_name" == "macos" ]]; then
+      target="gui/$(id -u)/$SERVICE_LABEL"
+      launchctl disable "$target" >/dev/null 2>&1 || true
+      launchctl bootout "$target" >/dev/null 2>&1 || true
+      if launchd_job_state "$target"; then
+        service_stopped=0
+      else
+        launchd_status=$?
+        if [[ "$launchd_status" == "3" ]]; then
+          service_stopped=1
+        else
+          service_stopped=0
+        fi
+      fi
+    else
+      systemctl --user disable --now "skoobi-$INSTANCE" >/dev/null 2>&1 || true
+      systemctl --user daemon-reload >/dev/null 2>&1 || true
+      if systemctl --user is-active --quiet "skoobi-$INSTANCE"; then
+        systemd_status=0
+      else
+        systemd_status=$?
+      fi
+      case "$systemd_status" in
+        3|4) ;;
+        *) service_stopped=0 ;;
+      esac
+    fi
+  fi
+  if [[ "$STAGE_ACTIVATION_STARTED" != "1" && -n "$OLD_RELEASE" &&
+      ! -e "$OLD_RELEASE" && ! -L "$OLD_RELEASE" &&
+      (-e "$APP_DIR" || -L "$APP_DIR") ]]; then
+    OLD_RELEASE=""
+    if [[ -n "$OLD_RELEASE_ROOT" && -d "$OLD_RELEASE_ROOT" ]]; then
+      rmdir "$OLD_RELEASE_ROOT" >/dev/null 2>&1 || true
+      [[ -e "$OLD_RELEASE_ROOT" ]] || OLD_RELEASE_ROOT=""
+    fi
+  fi
+  if [[ "$STAGE_ACTIVATION_STARTED" == "1" || "$SERVICE_CHANGED" == "1" ||
+      "$CLI_CHANGED" == "1" || "$CLI_MOVED_ASIDE" == "1" ||
+      "$CLI_CHANGE_ATTEMPTED" == "1" || "$CLI_MOVE_ATTEMPTED" == "1" ||
+      "$ENV_CREATED_BY_INSTALL" == "1" || -n "$ENV_BACKUP" ]]; then
+    mutation_started=1
+  fi
+  if [[ "$cli_state_unknown" == "1" ]]; then
+    service_stopped=0
+  fi
+  if [[ "$service_stopped" != "1" && "$mutation_started" == "0" &&
+      "$SERVICE_STOP_ATTEMPTED" == "1" ]]; then
+    if restore_previous_service_state; then
+      service_stopped=1
+      pre_stop_state_restored=1
+    else
+      err "Rollback could not restore the service state after a failed stop"
+    fi
+  fi
+  if [[ "$service_stopped" == "1" && "$SERVICE_CHANGED" == "1" &&
+      "$SERVICE_EXISTED" == "1" &&
+      (! -f "$SERVICE_BACKUP" || -L "$SERVICE_BACKUP") ]]; then
+    service_stopped=0
+    err "Rollback cannot safely restore the previous service definition; its backup is missing or unsafe"
+  fi
+  if [[ "$service_stopped" == "1" && -n "$OLD_RELEASE" &&
+      (! -d "$OLD_RELEASE" || -L "$OLD_RELEASE") ]]; then
+    service_stopped=0
+    err "Rollback cannot safely restore the previous app release; its backup is missing or unsafe"
+  fi
+  if [[ "$service_stopped" == "1" && -n "$ENV_BACKUP" &&
+      (! -f "$ENV_BACKUP" || -L "$ENV_BACKUP") ]]; then
+    service_stopped=0
+    err "Rollback cannot safely restore the previous .env; its backup is missing or unsafe"
+  fi
+  if [[ "$service_stopped" == "1" && "$CLI_MOVED_ASIDE" == "1" &&
+      (-z "$CLI_BACKUP" || (! -e "$CLI_BACKUP" && ! -L "$CLI_BACKUP")) ]]; then
+    service_stopped=0
+    err "Rollback cannot safely restore the previous CLI path; its backup is missing"
+  fi
+  if [[ "$service_stopped" != "1" &&
+      ("$mutation_started" == "1" || "$SERVICE_STOP_ATTEMPTED" == "1") ]]; then
+    err "Rollback could not prove a complete safe restore; preserving the current app and service definition"
+    err "Manual recovery is required before another lifecycle operation"
+    err "Preserved app: $APP_DIR"
+    [[ -z "$OLD_RELEASE" ]] || err "Previous release retained: $OLD_RELEASE"
+  fi
+  if [[ "$service_stopped" == "1" && "$SERVICE_CHANGED" == "1" ]]; then
+    if [[ "$SERVICE_EXISTED" == "1" ]]; then
+      if [[ "$os_name" == "macos" ]]; then
+        cp "$SERVICE_BACKUP" "$MACOS_PLIST" &&
+          cmp -s "$SERVICE_BACKUP" "$MACOS_PLIST" ||
+          restore_ok=0
+      else
+        cp "$SERVICE_BACKUP" "$LINUX_UNIT" &&
+          cmp -s "$SERVICE_BACKUP" "$LINUX_UNIT" ||
+          restore_ok=0
+      fi
+    else
+      if [[ "$os_name" == "macos" ]]; then
+        rm -f "$MACOS_PLIST" || restore_ok=0
+      else
+        rm -f "$LINUX_UNIT" || restore_ok=0
+      fi
+    fi
+    if [[ "$restore_ok" == "1" && "$os_name" == "linux" ]]; then
+      systemctl --user daemon-reload >/dev/null 2>&1 || true
+    fi
+  fi
+  if [[ "$service_stopped" == "1" && "$restore_ok" == "1" ]]; then
+    if [[ "$CLI_CHANGED" == "1" ]]; then
+      if [[ -L "$CLI_LINK" &&
+          "$(readlink "$CLI_LINK" 2>/dev/null || true)" == "$CLI_TARGET" ]]; then
+        rm -f "$CLI_LINK" || restore_ok=0
+      else
+        restore_ok=0
+      fi
+    fi
+    if [[ "$restore_ok" == "1" && "$CLI_MOVED_ASIDE" == "1" &&
+        -n "$CLI_BACKUP" && (-e "$CLI_BACKUP" || -L "$CLI_BACKUP") ]]; then
+      if [[ ! -e "$CLI_LINK" && ! -L "$CLI_LINK" ]]; then
+        if mv "$CLI_BACKUP" "$CLI_LINK"; then
+          CLI_MOVED_ASIDE=0
+        else
+          restore_ok=0
+        fi
+      else
+        restore_ok=0
+      fi
+    fi
+    if [[ "$restore_ok" == "1" &&
+        -n "$ENV_BACKUP" && -f "$ENV_BACKUP" ]]; then
+      rm -f "$ENV_FILE" &&
+        cp "$ENV_BACKUP" "$ENV_FILE" &&
+        chmod 600 "$ENV_FILE" &&
+        cmp -s "$ENV_BACKUP" "$ENV_FILE" ||
+        restore_ok=0
+    elif [[ "$restore_ok" == "1" &&
+        "$ENV_CREATED_BY_INSTALL" == "1" ]]; then
+      rm -f "$ENV_FILE" || restore_ok=0
+    fi
+    if [[ "$restore_ok" == "1" &&
+        -n "$OLD_RELEASE" && -e "$OLD_RELEASE" ]]; then
+      rollback_app="$OLD_RELEASE_ROOT/failed-release"
+      if [[ -e "$APP_DIR" || -L "$APP_DIR" ]]; then
+        if mv "$APP_DIR" "$rollback_app"; then
+          app_moved_aside=1
+        else
+          restore_ok=0
+        fi
+      fi
+      if [[ "$restore_ok" == "1" ]]; then
+        if mv "$OLD_RELEASE" "$APP_DIR"; then
+          OLD_RELEASE=""
+          STAGE_ACTIVATION_STARTED=0
+          [[ "$app_moved_aside" == "0" ]] || rm -rf "$rollback_app"
+        else
+          restore_ok=0
+          if [[ "$app_moved_aside" == "1" &&
+              ! -e "$APP_DIR" && ! -L "$APP_DIR" ]]; then
+            mv "$rollback_app" "$APP_DIR" || true
+          fi
+        fi
+      fi
+    elif [[ "$restore_ok" == "1" &&
+        "$STAGE_ACTIVATION_STARTED" == "1" && -e "$APP_DIR" ]]; then
+      if rm -rf "$APP_DIR"; then
+        STAGE_ACTIVATION_STARTED=0
+      else
+        restore_ok=0
+      fi
+    fi
+    if [[ "$restore_ok" == "1" &&
+        "$MARKER_CREATED_BY_INSTALL" == "1" ]]; then
+      if rm -f "$MARKER_FILE"; then
+        MARKER_CREATED_BY_INSTALL=0
+      else
+        err "Rollback could not remove the newly created managed-install marker"
+      fi
+    fi
+  fi
+  if [[ "$service_stopped" == "1" && "$restore_ok" != "1" ]]; then
+    err "Rollback restore failed; the previous service will not be restarted"
+    err "Manual recovery is required before another lifecycle operation"
+  fi
+  if [[ "$service_stopped" == "1" && "$restore_ok" == "1" &&
+      "$pre_stop_state_restored" != "1" ]]; then
+    restore_previous_service_state ||
+      err "Rollback could not confirm the previous service state was restored"
+  fi
+  [[ -z "$STAGE_DIR" || ! -e "$STAGE_DIR" ]] || rm -rf "$STAGE_DIR"
+  [[ -z "$BUILD_HOME" || ! -e "$BUILD_HOME" ]] || rm -rf "$BUILD_HOME"
+  [[ -z "$GIT_HOME" || ! -e "$GIT_HOME" ]] || rm -rf "$GIT_HOME"
+  [[ -z "$ENV_BACKUP_PENDING" || ! -e "$ENV_BACKUP_PENDING" ]] ||
+    rm -f "$ENV_BACKUP_PENDING"
+  if [[ -n "$OLD_RELEASE_ROOT" && -d "$OLD_RELEASE_ROOT" ]]; then
+    rmdir "$OLD_RELEASE_ROOT" >/dev/null 2>&1 || true
+  fi
+  if [[ "$LOCK_HELD" == "1" ]]; then
+    release_operation_lock >/dev/null 2>&1 || true
+  fi
+  set -e
+  return "$status"
+}
+
+cleanup_exit_artifacts() {
+  local cleanup_failed=0
+  set +e
+  [[ -z "$STAGE_DIR" || ! -e "$STAGE_DIR" ]] || rm -rf "$STAGE_DIR"
+  [[ -z "$BUILD_HOME" || ! -e "$BUILD_HOME" ]] || rm -rf "$BUILD_HOME"
+  [[ -z "$GIT_HOME" || ! -e "$GIT_HOME" ]] || rm -rf "$GIT_HOME"
+  [[ -z "$ENV_BACKUP_PENDING" || ! -e "$ENV_BACKUP_PENDING" ]] ||
+    rm -f "$ENV_BACKUP_PENDING"
+  if [[ "$INSTALL_SUCCEEDED" == "1" ]]; then
+    if [[ -n "$OLD_RELEASE" && -e "$OLD_RELEASE" ]]; then
+      rm -rf "$OLD_RELEASE"
+      if [[ ! -e "$OLD_RELEASE" && ! -L "$OLD_RELEASE" ]]; then
+        OLD_RELEASE=""
+      else
+        err "Install succeeded, but the previous release backup could not be removed: $OLD_RELEASE"
+      fi
+    fi
+    if [[ -n "$OLD_RELEASE_ROOT" && -d "$OLD_RELEASE_ROOT" ]]; then
+      rmdir "$OLD_RELEASE_ROOT"
+      if [[ ! -e "$OLD_RELEASE_ROOT" ]]; then
+        OLD_RELEASE_ROOT=""
+      else
+        err "Install succeeded, but the previous release directory could not be removed: $OLD_RELEASE_ROOT"
+      fi
+    fi
+  fi
+  if [[ "$LOCK_HELD" == "1" ]]; then
+    if ! release_operation_lock >/dev/null 2>&1; then
+      err "Could not release the installer operation lock: $LOCK_DIR"
+      cleanup_failed=1
+    fi
+  fi
+  set -e
+  return "$cleanup_failed"
+}
+
+on_exit() {
+  local status="$1"
+  trap - EXIT
+  trap '' HUP INT TERM
+  rollback_transaction "$status" || true
+  cleanup_exit_artifacts || true
+  exit "$status"
+}
+trap 'on_exit $?' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+main() {
+  log "Skoobi installer"
+  log "prefix: $PREFIX"
+  log "app: $APP_DIR"
+  log "instance: $INSTANCE_DIR"
+  log "repository: canonical public HTTPS"
+  log "ref: $REF"
+  [[ "$DRY_RUN" == "0" ]] || log "mode: dry-run"
+
+  if [[ "$YES" == "0" && ! -t 0 ]]; then
+    die "Non-interactive installation requires --yes and the documented SKOOBI_* environment variables"
+  fi
+  check_requirements
+  warn_if_linux_linger_disabled
+  assert_instance_path_types
+  preflight_install_configuration
+  check_provider_requirements
+  preflight_service_path
+  acquire_operation_lock
+  assert_existing_install_safe
+  run mkdir -p "$APP_BASE" "$BACKUP_DIR"
+  run chmod 700 "$PREFIX" "$APP_BASE" "$BACKUP_DIR"
+  build_staged_release
+  stop_existing_service
+  switch_release
+  if prepare_instance; then
+    configure_env
+  elif [[ "$DRY_RUN" == "0" ]]; then
+    sync_instance_codex_command "$ENV_FILE"
+  fi
+  validate_telegram_configuration
+  install_cli_symlink
+  install_service
+  write_marker
+
+  INSTALL_SUCCEEDED=1
+  cleanup_exit_artifacts ||
+    die "Install committed, but its operation lock could not be released"
+  log "Skoobi install complete."
+  log "App: $APP_DIR"
+  log "Instance data: $INSTANCE_DIR"
+  log "Existing configuration is preserved unless --reconfigure is explicit."
+  if ! env_has_nonempty_value TELEGRAM_BOT_TOKEN; then
+    log "Telegram is not configured. Rerun with --reconfigure and enter the bot token."
+  else
+    log "Next: send /chatid to the bot, then run:"
+    log "  skoobi owner init <the-private-tg-id>"
+    log "  skoobi restart"
+  fi
+  log "If skoobi is not found, add $CLI_LINK_DIR to your shell PATH."
+}
+
+main "$@"

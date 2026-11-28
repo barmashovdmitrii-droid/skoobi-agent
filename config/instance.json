@@ -1,0 +1,87 @@
+{
+  "_readme": "Instance profile: the values that belong to one installation (names, chats, service labels, prompt fragments). Every key is optional; a missing or invalid key falls back to the default shown here. Schema and loader: packages/shared/src/instance-profile.ts. Keys that start with an underscore are notes and are ignored. Restart the services after an edit.",
+  "assistant": {
+    "defaultName": "Skoobi",
+    "notificationTitle": "Skoobi",
+    "addressHandles": []
+  },
+  "owner": {
+    "taskResultNameForms": [],
+    "reminderLeadForms": [
+      "владельцу",
+      "владельца"
+    ],
+    "workFolders": [],
+    "adminObjectStems": []
+  },
+  "telegram": {
+    "adminAlertJids": [],
+    "adminContact": "the bot owner",
+    "guestPromptOwnerFolder": "owner_main"
+  },
+  "google": {
+    "defaultCalendarId": ""
+  },
+  "dashboard": {
+    "panelSenderName": "Owner (dashboard)",
+    "restartableUnits": {},
+    "legacyCrmTopicFile": ""
+  },
+  "launchd": {
+    "mainLabel": "com.skoobi.default",
+    "fallbackHome": "",
+    "instanceDir": "",
+    "watchdogDir": "",
+    "units": [
+      {
+        "id": "main",
+        "name": "Скуби",
+        "label": "com.skoobi.default",
+        "kind": "daemon"
+      },
+      {
+        "id": "dashboard",
+        "name": "Локальная панель",
+        "label": "com.skoobi.dashboard",
+        "kind": "daemon"
+      }
+    ]
+  },
+  "voice": {
+    "edgeVoice": "ru-RU-SvetlanaNeural",
+    "azureVoice": "ru-RU-SvetlanaNeural",
+    "edgeProviderAliases": []
+  },
+  "memory": {
+    "curatorKeywords": []
+  },
+  "chatSecrets": {
+    "unitWords": []
+  },
+  "credentialDetector": {
+    "peopleWords": [],
+    "nameWords": [],
+    "serviceWords": [],
+    "accountWords": []
+  },
+  "prompts": {
+    "ownerName": "the owner",
+    "secretHolderExample": "бухгалтера",
+    "helperUnreachableHint": "check that the configured local helper service is running and that its loopback port is reachable.",
+    "helperPermissionTarget": "the Node.js executable that runs the helper",
+    "workTargetHint": "Exact execution environment and project.",
+    "taskTitleExample": "Слежка за обновлением сервиса"
+  },
+  "retention": {
+    "reportChatId": null
+  },
+  "skillsSeed": {
+    "adminFolders": [
+      "telegram_main"
+    ],
+    "extraSkills": []
+  },
+  "skills": {
+    "selectionPatterns": []
+  }
+}

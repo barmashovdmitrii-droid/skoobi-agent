@@ -1,0 +1,88 @@
+{
+  "name": "skoobi-agent",
+  "version": "2.6.0",
+  "private": true,
+  "description": "Telegram-first personal assistant runtime with isolated agent execution, memory, tools, and optional local integrations.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/barmashovdmitrii-droid/skoobi-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/barmashovdmitrii-droid/skoobi-agent/issues"
+  },
+  "homepage": "https://github.com/barmashovdmitrii-droid/skoobi-agent#readme",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "skoobi": "bin/skoobi.js"
+  },
+  "scripts": {
+    "build": "bash scripts/with-node22.sh sh -c 'npm run build:packages && npm run build:agent-runner && tsc && npm run build:apps && npm run build:extensions'",
+    "build:agent-runner": "bash scripts/with-node22.sh npm --prefix agent/runner run build",
+    "build:apps": "bash scripts/with-node22.sh sh -c 'npm run build -w @skoobi/app-art-bot && npm run build -w @skoobi/app-dashboard'",
+    "build:extensions": "bash scripts/with-node22.sh node scripts/build-extensions.mjs",
+    "start": "bash scripts/with-node22.sh node dist/service.js",
+    "dev": "bash scripts/with-node22.sh tsx src/service.ts",
+    "typecheck": "bash scripts/with-node22.sh sh -c 'npm run build:packages && npm run typecheck:agent-runner && node --max-old-space-size=4096 node_modules/typescript/bin/tsc --noEmit && node --max-old-space-size=4096 node_modules/typescript/bin/tsc -p setup/tsconfig.tests.json'",
+    "typecheck:agent-runner": "bash scripts/with-node22.sh npm --prefix agent/runner run build -- --noEmit",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "format:fix": "prettier --write \"src/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\"",
+    "prepare": "husky",
+    "setup": "bash scripts/with-node22.sh tsx setup/index.ts",
+    "preflight": "bash scripts/preflight.sh",
+    "runtime:check": "bash scripts/with-node22.sh node scripts/codex-toolchain.mjs --check",
+    "runtime:bootstrap": "bash scripts/with-node22.sh node scripts/codex-toolchain.mjs --install",
+    "selftest": "bash scripts/selftest.sh",
+    "recent-errors": "bash scripts/recent-errors.sh",
+    "apply:full-access": "bash scripts/with-node22.sh node scripts/apply-skoobi-full-access.mjs",
+    "monitor:telegram-main": "bash scripts/with-node22.sh node scripts/skoobi-telegram-chat-monitor.mjs --watch",
+    "auth:whatsapp": "bash scripts/with-node22.sh npm run auth -w @skoobi/channel-whatsapp",
+    "telegram-users": "bash scripts/with-node22.sh node scripts/telegram-users.mjs",
+    "smoke:telegram": "bash scripts/with-node22.sh node scripts/telegram-delivery-smoke.mjs",
+    "smoke:voice": "bash scripts/voice-smoke.sh",
+    "smoke:edge-tts": "bash scripts/with-node22.sh node scripts/edge-tts-smoke.mjs reply.mp3",
+    "smoke:google-calendar": "bash scripts/with-node22.sh tsx src/scripts/google-calendar-smoke.ts",
+    "test": "bash scripts/with-node22.sh vitest run",
+    "test:watch": "bash scripts/with-node22.sh vitest",
+    "build:packages": "bash scripts/with-node22.sh sh -c 'npm run build -w @skoobi/shared && npm run build -w @skoobi/providers && npm run build -w @skoobi/memory && npm run build -w @skoobi/voice-stt && npm run build -w @skoobi/voice-tts && npm run build -w @skoobi/core && npm run build -w @skoobi/channel-telegram && npm run build -w @skoobi/channel-whatsapp && npm run build -w @skoobi/dashboard'"
+  },
+  "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "^0.0.42",
+    "better-sqlite3": "^11.8.1",
+    "cron-parser": "^5.5.0",
+    "googleapis": "^173.0.0",
+    "grammy": "^1.39.3",
+    "mammoth": "^1.12.0",
+    "pdf-parse": "^2.4.5",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0",
+    "playwright": "1.64.1",
+    "read-excel-file": "^9.0.9",
+    "yaml": "^2.8.3",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.0",
+    "@vitest/coverage-v8": "^4.1.12",
+    "husky": "^9.1.7",
+    "prettier": "^3.8.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.12"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "overrides": {
+    "gaxios": "^7.3.0",
+    "postcss": "^8.5.23",
+    "shell-quote": "^1.12.0"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ]
+}

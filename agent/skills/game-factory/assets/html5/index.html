@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#142b2b">
+  <title>Lantern Garden</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div><p class="eyebrow" data-text="eyebrow">A little journey home</p><h1 data-text="title">Lantern Garden</h1></div>
+      <div class="settings">
+        <label><span class="sr-only" data-text="language">Language</span><select id="language"><option value="en">English</option><option value="ru">Русский</option></select></label>
+        <button id="mute" aria-pressed="false" disabled>Sound on</button>
+      </div>
+    </header>
+    <p id="instructions" data-text="instructions">Collect five lights, then return to the lantern. You have 24 steps.</p>
+    <section class="board" aria-label="Game">
+      <canvas id="game" width="700" height="500" tabindex="0" aria-describedby="instructions"></canvas>
+      <div id="panel" class="panel" role="status" aria-live="polite"><h2 id="heading">Loading…</h2><p id="detail"></p><button id="play" hidden>Play</button></div>
+    </section>
+    <div class="status-bar">
+      <p id="score" aria-live="polite">0 / 5</p><p id="steps">24</p><button id="pause" disabled>Pause</button>
+    </div>
+    <nav class="direction-pad" aria-label="Movement">
+      <button data-move="up" aria-label="Up">↑</button>
+      <div><button data-move="left" aria-label="Left">←</button><button data-move="down" aria-label="Down">↓</button><button data-move="right" aria-label="Right">→</button></div>
+    </nav>
+    <footer><span data-text="controls">Arrow keys / WASD, adjacent tile, or direction buttons</span><span id="record"></span></footer>
+  </main>
+  <script type="module" src="game.js"></script>
+</body>
+</html>

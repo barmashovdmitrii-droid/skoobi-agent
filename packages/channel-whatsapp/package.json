@@ -1,0 +1,42 @@
+{
+  "name": "@skoobi/channel-whatsapp",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Skoobi brick: WhatsApp channel — Baileys socket (WhatsAppChannel + injected core host), media download+transcribe glue, QR/pairing auth CLI",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./whatsapp": {
+      "types": "./dist/whatsapp.d.ts",
+      "default": "./dist/whatsapp.js"
+    },
+    "./whatsapp-media": {
+      "types": "./dist/whatsapp-media.d.ts",
+      "default": "./dist/whatsapp-media.js"
+    },
+    "./wiring": {
+      "types": "./dist/wiring.d.ts",
+      "default": "./dist/wiring.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "auth": "tsx src/whatsapp-auth.ts"
+  },
+  "dependencies": {
+    "@skoobi/shared": "*",
+    "@skoobi/voice-stt": "*",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "pino": "^9.6.0",
+    "qrcode-terminal": "^0.12.0",
+    "@skoobi/core": "*"
+  },
+  "devDependencies": {
+    "@types/qrcode-terminal": "^0.12.0"
+  }
+}

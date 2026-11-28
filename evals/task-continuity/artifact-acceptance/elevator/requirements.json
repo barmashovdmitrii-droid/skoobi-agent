@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "kind": "browser-archive",
+  "entrypoint": "index.html",
+  "initial": {
+    "selector": "#journey-state",
+    "text": "Ready with one resource"
+  },
+  "steps": [
+    {
+      "action": "press",
+      "selector": "#world",
+      "key": "ArrowRight",
+      "expect": {
+        "selector": "#journey-state",
+        "text": "Shaft crossed; at lower landing"
+      }
+    },
+    {
+      "action": "click",
+      "selector": "#call-lift",
+      "expect": {
+        "selector": "#lift-state",
+        "text": "Cabin ready at lower landing"
+      }
+    },
+    {
+      "action": "click",
+      "selector": "#deliver",
+      "expect": {
+        "selector": "#resource-state",
+        "text": "Resources delivered: 1"
+      }
+    },
+    {
+      "action": "press",
+      "selector": "#world",
+      "key": "ArrowRight",
+      "expect": {
+        "selector": "#journey-state",
+        "text": "Continued into next area"
+      }
+    }
+  ]
+}

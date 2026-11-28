@@ -1,0 +1,1398 @@
+/**
+ * Channel-agnostic audio transcription via local whisper-cli.
+ *
+ * The source file is owned by the caller and is never removed here. Every
+ * derived WAV/JSON artifact lives in a private per-call temporary directory
+ * and is removed on every exit path. There is deliberately no network or
+ * cloud fallback in this module.
+ */
+
+import { execFile, spawn } from 'child_process';
+import { promisify } from 'util';
+import { promises as fs } from 'fs';
+import { tmpdir } from 'os';
+import { basename, join } from 'path';
+import {
+  TRANSCRIPTION_TEXT_MAX_BYTES,
+  type LocalTranscriptionResult,
+  type TranscriptionPassEvidence,
+  type TranscriptionRecheckReason,
+} from '@skoobi/shared/transcription-result';
+import { assessTranscription, classifyTranscriptionError, failedTranscription, hasSensitiveRussianCorrection, hasSuspectCaptionTail } from './transcription-quality.js';
+import {
+  startOperationTraceStage,
+  type OperationTraceDetails,
+  type OperationTraceObserver,
+  type OperationTraceReason,
+} from '@skoobi/shared/operation-trace';
+
+import {
+  basenameOnly,
+  FFMPEG_FALLBACKS,
+  folderAbsFromMediaPath,
+  logger,
+  readEnvFile,
+  resolveBinary,
+  updateMediaEntry,
+  WHISPER_FALLBACKS,
+} from '@skoobi/shared';
+
+const execFileAsync = promisify(execFile);
+
+const envVars = readEnvFile([
+  'WHISPER_BIN',
+  'WHISPER_MODEL',
+  'WHISPER_LANG',
+  'WHISPER_NO_GPU',
+  'WHISPER_THREADS',
+  'WHISPER_TIMEOUT_MS',
+  'WHISPER_ACCURACY_MODE',
+  'WHISPER_RETRY_LANGUAGE_PROB',
+  'WHISPER_RETRY_MEAN_LOGPROB',
+  'WHISPER_INITIAL_PROMPT',
+  'WHISPER_PROMPT_FILE',
+  'FFMPEG_BIN',
+]);
+
+const DEFAULT_WHISPER_TIMEOUT_MS = 180_000;
+const DEFAULT_RETRY_LANGUAGE_PROBABILITY = 0.9;
+const DEFAULT_RETRY_MEAN_TOKEN_LOG_PROBABILITY = -0.15;
+const FFMPEG_TIMEOUT_MS = 60_000;
+const CHILD_MAX_BUFFER_BYTES = 2 * 1024 * 1024;
+const MAX_PROMPT_BYTES = 16 * 1024;
+const AUTO_TIE_EPSILON = 0.02;
+
+export type AccuracyMode = 'max' | 'single';
+
+export interface LocalTranscriptionConfig {
+  whisperBin: string;
+  whisperModel: string;
+  whisperLang: string;
+  whisperNoGpu: boolean;
+  whisperThreads: string;
+  whisperTimeoutMs: number;
+  accuracyMode: AccuracyMode;
+  retryLanguageProbability: number;
+  retryMeanTokenLogProbability: number;
+  initialPrompt: string;
+  promptFile: string;
+  ffmpegBin: string;
+}
+
+export interface WhisperCandidate {
+  requestedLanguage: string;
+  detectedLanguage: string | null;
+  languageProbability: number | null;
+  /** Arithmetic mean of ln(p) for lexical tokens reported by whisper.cpp. */
+  meanTokenLogProbability: number | null;
+  transcript: string | null;
+  valid: boolean;
+  invalidReason:
+    | 'empty'
+    /** Whisper reported silence ([BLANK_AUDIO], [silence], [no speech]). */
+    | 'no_speech'
+    | 'repetition'
+    | 'corruption'
+    | 'artifact'
+    | 'invalid_json'
+    | null;
+}
+
+interface ExecOptions {
+  timeout: number;
+  maxBuffer?: number;
+  signal?: AbortSignal;
+}
+
+export interface LocalTranscriptionControl {
+  signal: AbortSignal;
+  deadlineAtMs: number;
+}
+
+export type LocalExecFile = (
+  executable: string,
+  args: readonly string[],
+  options: ExecOptions,
+) => Promise<{ stdout: string; stderr: string }>;
+
+interface ParsedWhisperJson {
+  transcript: string | null;
+  detectedLanguage: string | null;
+  meanTokenLogProbability: number | null;
+}
+
+function envValue(name: keyof typeof envVars): string {
+  return process.env[name] || envVars[name] || '';
+}
+
+function finiteNumber(value: string, fallback: number): number {
+  if (!value.trim()) return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function positiveInteger(value: string, fallback: number): number {
+  const normalized = value.trim();
+  if (!/^[1-9]\d*$/u.test(normalized)) return fallback;
+  const parsed = Number(normalized);
+  return Number.isSafeInteger(parsed) ? parsed : fallback;
+}
+
+function normalizeThreads(value: string | undefined): string {
+  const normalized = String(value || '').trim();
+  return /^[1-9]\d*$/u.test(normalized) &&
+    Number.isSafeInteger(Number(normalized))
+    ? normalized
+    : '';
+}
+
+function normalizeLanguage(value: string | undefined): string {
+  const normalized = String(value || 'auto')
+    .trim()
+    .toLowerCase();
+  return /^[a-z]{2,3}(?:-[a-z0-9]+)?$/.test(normalized) || normalized === 'auto'
+    ? normalized
+    : 'auto';
+}
+
+export function resolveLocalTranscriptionConfig(): LocalTranscriptionConfig {
+  const accuracyMode = envValue('WHISPER_ACCURACY_MODE').toLowerCase();
+  return {
+    whisperBin:
+      envValue('WHISPER_BIN') ||
+      resolveBinary('whisper-cli', WHISPER_FALLBACKS),
+    whisperModel: envValue('WHISPER_MODEL'),
+    whisperLang: normalizeLanguage(envValue('WHISPER_LANG') || 'auto'),
+    whisperNoGpu: envValue('WHISPER_NO_GPU').toLowerCase() === 'true',
+    whisperThreads: normalizeThreads(envValue('WHISPER_THREADS')),
+    whisperTimeoutMs: positiveInteger(
+      envValue('WHISPER_TIMEOUT_MS'),
+      DEFAULT_WHISPER_TIMEOUT_MS,
+    ),
+    accuracyMode: accuracyMode === 'single' ? 'single' : 'max',
+    retryLanguageProbability: Math.min(
+      1,
+      Math.max(
+        0,
+        finiteNumber(
+          envValue('WHISPER_RETRY_LANGUAGE_PROB'),
+          DEFAULT_RETRY_LANGUAGE_PROBABILITY,
+        ),
+      ),
+    ),
+    retryMeanTokenLogProbability: Math.min(
+      0,
+      finiteNumber(
+        envValue('WHISPER_RETRY_MEAN_LOGPROB'),
+        DEFAULT_RETRY_MEAN_TOKEN_LOG_PROBABILITY,
+      ),
+    ),
+    initialPrompt: envValue('WHISPER_INITIAL_PROMPT'),
+    promptFile: envValue('WHISPER_PROMPT_FILE'),
+    ffmpegBin:
+      envValue('FFMPEG_BIN') || resolveBinary('ffmpeg', FFMPEG_FALLBACKS),
+  };
+}
+
+export interface WhisperArgsOptions {
+  model: string;
+  audioPath: string;
+  outputPrefix: string;
+  language: string;
+  threads?: string;
+  noGpu?: boolean;
+  initialPrompt?: string;
+}
+
+/** Build arguments without a shell; prompt/path values stay single argv items. */
+export function buildWhisperArgs(options: WhisperArgsOptions): string[] {
+  const args = [
+    '-m',
+    options.model,
+    '-f',
+    options.audioPath,
+    '-l',
+    normalizeLanguage(options.language),
+    '-nt',
+    '-ojf',
+    '-of',
+    options.outputPrefix,
+  ];
+  const threads = normalizeThreads(options.threads);
+  if (threads) args.push('-t', threads);
+  if (options.noGpu) args.push('--no-gpu');
+  if (options.initialPrompt?.trim()) {
+    args.push('--prompt', options.initialPrompt.trim());
+  }
+  return args;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function nullableLanguage(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const normalized = normalizeLanguage(value);
+  return normalized === 'auto' ? null : normalized;
+}
+
+function normalizeTranscript(value: string): string | null {
+  const text = value.replace(/\s+/gu, ' ').trim();
+  return text || null;
+}
+
+/** Parse the full JSON output emitted by whisper.cpp's -ojf flag. */
+export function parseWhisperJson(jsonText: string): ParsedWhisperJson | null {
+  let document: unknown;
+  try {
+    document = JSON.parse(jsonText);
+  } catch {
+    return null;
+  }
+  if (!isRecord(document)) return null;
+  if (
+    typeof document.text !== 'string' &&
+    (!Array.isArray(document.transcription) ||
+      (document.transcription.length > 0 &&
+        !document.transcription.some(
+          (segment) => isRecord(segment) && typeof segment.text === 'string',
+        )))
+  )
+    return null;
+
+  const result = isRecord(document.result) ? document.result : null;
+  const detectedLanguage = nullableLanguage(result?.language);
+  const segments = Array.isArray(document.transcription)
+    ? document.transcription
+    : [];
+  const textParts: string[] = [];
+  const tokenLogProbabilities: number[] = [];
+
+  for (const segment of segments) {
+    if (!isRecord(segment)) continue;
+    if (typeof segment.text === 'string') textParts.push(segment.text);
+    if (!Array.isArray(segment.tokens)) continue;
+    for (const token of segment.tokens) {
+      if (!isRecord(token) || typeof token.p !== 'number') continue;
+      const tokenText = typeof token.text === 'string' ? token.text : '';
+      // Control tokens are not transcript quality evidence. Lexical p=0 is
+      // retained with a small floor rather than silently inflating confidence.
+      if (
+        /^<\|[^|]+\|>$/u.test(tokenText) ||
+        /^\[_[^\]]+_\]$/u.test(tokenText) ||
+        !Number.isFinite(token.p)
+      )
+        continue;
+      if (token.p < 0 || token.p > 1) continue;
+      tokenLogProbabilities.push(Math.log(Math.max(token.p, 1e-12)));
+    }
+  }
+
+  const topLevelText =
+    typeof document.text === 'string' ? document.text : textParts.join(' ');
+  const transcript = normalizeTranscript(topLevelText);
+  const meanTokenLogProbability = tokenLogProbabilities.length
+    ? tokenLogProbabilities.reduce((sum, value) => sum + value, 0) /
+      tokenLogProbabilities.length
+    : null;
+
+  return { transcript, detectedLanguage, meanTokenLogProbability };
+}
+
+/** Parse whisper.cpp's real auto-language probability from diagnostics. */
+export function parseAutoLanguageProbability(stderr: string): {
+  language: string | null;
+  probability: number | null;
+} {
+  const match = stderr.match(
+    /auto[- ]detected language:\s*([a-z]{2,3}(?:-[a-z0-9]+)?)\s*\(\s*p\s*=\s*([0-9.eE+-]+)\s*\)/iu,
+  );
+  if (!match) return { language: null, probability: null };
+  const probability = Number(match[2]);
+  return {
+    language: nullableLanguage(match[1]),
+    probability:
+      Number.isFinite(probability) && probability >= 0 && probability <= 1
+        ? probability
+        : null,
+  };
+}
+
+function hasRepetition(text: string): boolean {
+  const words = text.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) || [];
+  if (words.length < 8) return false;
+
+  const frequencies = new Map<string, number>();
+  for (const word of words) {
+    frequencies.set(word, (frequencies.get(word) || 0) + 1);
+  }
+  const maxFrequency = Math.max(...frequencies.values());
+  if (
+    frequencies.size / words.length <= 0.25 &&
+    maxFrequency / words.length >= 0.5
+  ) {
+    return true;
+  }
+
+  // Detect an exact phrase repeated at least three times (common Whisper
+  // hallucination) without rejecting short, legitimate "да, да" utterances.
+  for (
+    let width = 1;
+    width <= Math.min(6, Math.floor(words.length / 3));
+    width += 1
+  ) {
+    const phrase = words.slice(0, width).join('\u0000');
+    let repeats = 1;
+    for (let offset = width; offset + width <= words.length; offset += width) {
+      if (words.slice(offset, offset + width).join('\u0000') !== phrase) break;
+      repeats += 1;
+    }
+    if (repeats >= 3 && repeats * width >= words.length * 0.75) return true;
+  }
+  return false;
+}
+
+/**
+ * Captions Whisper learnt from subtitled video and "hears" in music or
+ * silence. Reject caption-only hallucinations instead of treating them as
+ * recognized speech. Match only when the WHOLE transcript is made of these
+ * phrases, so a real sentence that happens to contain one survives.
+ */
+const WHISPER_CAPTION_ARTIFACTS: readonly RegExp[] = [
+  /^субтитры (?:сделал|делал|создавал|подготовил[аи]?|подогнал|подготовлены|создан[ыо]?)(?:\s.*)?$/u,
+  /^редактор субтитров(?:\s.*)?$/u,
+  /^продолжение следует$/u,
+  /^спасибо за просмотр$/u,
+  /^подписывайтесь на (?:наш )?канал$/u,
+  /^подпишись на канал$/u,
+  /^ставьте лайки$/u,
+  /^(?:thanks|thank you) for watching$/u,
+  /^subtitles by(?:\s.*)?$/u,
+];
+
+/** «[Музыка]», «(аплодисменты)», «♪♪» — only as bracketed markers or notes. */
+const WHISPER_SOUND_MARKERS_ONLY =
+  /^(?:\s*(?:[[(]\s*(?:музыка|music|аплодисменты|applause|смех|laughter)\s*[\])]|♪+|♫+))+\s*$/iu;
+
+function isWhisperCaptionArtifact(text: string): boolean {
+  if (WHISPER_SOUND_MARKERS_ONLY.test(text)) return true;
+  const fragments = text
+    .toLocaleLowerCase()
+    .replace(/[♪♫*[\]()«»"“”]/gu, ' ')
+    // Initials («А.Тестовый») are not sentence ends.
+    .replace(/(^|\s)(\p{L})\./gu, '$1$2 ')
+    .split(/[.!?…\n]+/u)
+    .map((fragment) => fragment.replace(/[\s,;:—-]+/gu, ' ').trim())
+    .filter(Boolean);
+  return (
+    fragments.length > 0 &&
+    fragments.every((fragment) =>
+      WHISPER_CAPTION_ARTIFACTS.some((pattern) => pattern.test(fragment)),
+    )
+  );
+}
+
+export function validateTranscript(
+  transcript: string | null,
+): Pick<WhisperCandidate, 'valid' | 'invalidReason'> {
+  if (!transcript?.trim()) return { valid: false, invalidReason: 'empty' };
+  // Silence markers are a property of the audio, not of the decoded
+  // language, so they get their own reason: a forced ru/kk pass cannot find
+  // speech the auto pass already reported absent (muted clips).
+  if (/^\s*[[(](?:blank_audio|silence|no speech)[\])].*$/iu.test(transcript)) {
+    return { valid: false, invalidReason: 'no_speech' };
+  }
+  if (
+    /[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffd]/u.test(transcript) ||
+    /^\s*[[(]speaking in foreign language[\])].*$/iu.test(transcript)
+  ) {
+    return { valid: false, invalidReason: 'corruption' };
+  }
+  if (hasRepetition(transcript)) {
+    return { valid: false, invalidReason: 'repetition' };
+  }
+  if (isWhisperCaptionArtifact(transcript)) {
+    return { valid: false, invalidReason: 'artifact' };
+  }
+  return { valid: true, invalidReason: null };
+}
+
+export function candidateFromWhisperOutput(
+  requestedLanguage: string,
+  jsonText: string,
+  stderr: string,
+): WhisperCandidate {
+  const parsed = parseWhisperJson(jsonText);
+  if (!parsed) {
+    return {
+      requestedLanguage,
+      detectedLanguage: requestedLanguage === 'auto' ? null : requestedLanguage,
+      languageProbability: null,
+      meanTokenLogProbability: null,
+      transcript: null,
+      valid: false,
+      invalidReason: 'invalid_json',
+    };
+  }
+  const autoLanguage =
+    requestedLanguage === 'auto'
+      ? parseAutoLanguageProbability(stderr)
+      : { language: null, probability: null };
+  const transcriptState = validateTranscript(parsed.transcript);
+  return {
+    requestedLanguage,
+    detectedLanguage:
+      autoLanguage.language ||
+      parsed.detectedLanguage ||
+      (requestedLanguage === 'auto' ? null : requestedLanguage),
+    languageProbability: autoLanguage.probability,
+    meanTokenLogProbability: parsed.meanTokenLogProbability,
+    transcript: parsed.transcript,
+    ...transcriptState,
+  };
+}
+
+export type RetryReason = TranscriptionRecheckReason;
+
+export function retryReasonForAutoCandidate(
+  candidate: WhisperCandidate,
+  config: Pick<
+    LocalTranscriptionConfig,
+    'retryLanguageProbability' | 'retryMeanTokenLogProbability'
+  >,
+): RetryReason | null {
+  if (!candidate.valid) {
+    // Nothing decoded, or decoded silence: language-independent, so the
+    // optional ru/kk passes would only burn CPU on the same silence (18 muted
+    // observer videos × 3 passes).
+    if (
+      candidate.invalidReason === 'empty' ||
+      candidate.invalidReason === 'no_speech'
+    ) {
+      return null;
+    }
+    return 'invalid_transcript';
+  }
+  if (candidate.languageProbability === null) {
+    // Some compatible builds omit the language p diagnostic. Do not damage a
+    // healthy, clearly decoded third language merely because that optional
+    // diagnostic is absent; ru/kk still enter the accuracy comparison.
+    if (
+      candidate.detectedLanguage &&
+      candidate.detectedLanguage !== 'ru' &&
+      candidate.detectedLanguage !== 'kk' &&
+      candidate.meanTokenLogProbability !== null &&
+      candidate.meanTokenLogProbability >= config.retryMeanTokenLogProbability
+    ) {
+      return null;
+    }
+    return 'missing_language_probability';
+  }
+  if (candidate.languageProbability < config.retryLanguageProbability) {
+    return 'low_language_probability';
+  }
+  if (candidate.meanTokenLogProbability === null) {
+    return 'missing_mean_token_log_probability';
+  }
+  if (candidate.meanTokenLogProbability < config.retryMeanTokenLogProbability) {
+    return 'low_mean_token_log_probability';
+  }
+  if (hasSuspectCaptionTail(candidate.transcript))
+    return 'suspect_caption_tail';
+  if (candidate.detectedLanguage === 'ru' && hasSensitiveRussianCorrection(candidate.transcript))
+    return 'sensitive_correction';
+  return null;
+}
+
+/** Pick by measured token quality; prefer auto only inside a small real tie. */
+export function selectBestCandidate(
+  candidates: readonly WhisperCandidate[],
+): WhisperCandidate | null {
+  const valid = candidates.filter(
+    (candidate) => candidate.valid && candidate.transcript,
+  );
+  if (!valid.length) return null;
+
+  return valid.reduce((best, candidate) => {
+    const bestScore = best.meanTokenLogProbability;
+    const candidateScore = candidate.meanTokenLogProbability;
+    if (bestScore === null && candidateScore !== null) return candidate;
+    if (bestScore !== null && candidateScore === null) return best;
+    if (bestScore !== null && candidateScore !== null) {
+      const difference = candidateScore - bestScore;
+      const comparisonIncludesAuto =
+        best.requestedLanguage === 'auto' ||
+        candidate.requestedLanguage === 'auto';
+      if (
+        difference !== 0 &&
+        (!comparisonIncludesAuto || Math.abs(difference) > AUTO_TIE_EPSILON)
+      ) {
+        return difference > 0 ? candidate : best;
+      }
+    }
+
+    // Language probability is comparable only when both passes report it.
+    if (
+      best.languageProbability !== null &&
+      candidate.languageProbability !== null &&
+      best.languageProbability !== candidate.languageProbability
+    ) {
+      return candidate.languageProbability > best.languageProbability
+        ? candidate
+        : best;
+    }
+    if (best.requestedLanguage === 'auto') return best;
+    if (candidate.requestedLanguage === 'auto') return candidate;
+    return best;
+  });
+}
+
+async function defaultExecFile(
+  executable: string,
+  args: readonly string[],
+  options: ExecOptions,
+): Promise<{ stdout: string; stderr: string }> {
+  if (options.signal)
+    return runControlledLocalProcess(executable, args, options);
+  const result = await execFileAsync(executable, [...args], {
+    timeout: options.timeout,
+    maxBuffer: options.maxBuffer,
+    encoding: 'utf8',
+  });
+  return {
+    stdout: String(result.stdout || ''),
+    stderr: String(result.stderr || ''),
+  };
+}
+
+/** A controlled call owns one POSIX process group, including local wrappers.
+ * Cancellation waits for direct-child close and cannot lose the group KILL
+ * escalation merely because a wrapper exits before its descendants.
+ */
+export function runControlledLocalProcess(
+  executable: string,
+  args: readonly string[],
+  options: ExecOptions,
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const aborted = () =>
+      Object.assign(new Error('Local process aborted'), { code: 'ABORT_ERR' });
+    if (options.signal?.aborted) {
+      reject(aborted());
+      return;
+    }
+    let processError: Error | undefined;
+    let stopError: Error | undefined;
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let closed = false;
+    let settled = false;
+    let groupKillSettled = false;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const ownProcessGroup = process.platform !== 'win32';
+    const child = spawn(executable, [...args], {
+      detached: ownProcessGroup,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const signalOwnedProcess = (signal: NodeJS.Signals) => {
+      try {
+        if (ownProcessGroup && child.pid) process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH')
+          processError ??= error as Error;
+      }
+    };
+    const groupExists = () => {
+      if (!ownProcessGroup || !child.pid) return false;
+      try {
+        process.kill(-child.pid, 0);
+        return true;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+      }
+    };
+    const complete = () => {
+      if (settled || !closed || (stopError && !groupKillSettled)) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      options.signal?.removeEventListener('abort', abort);
+      const output = {
+        stdout: Buffer.concat(stdout).toString('utf8'),
+        stderr: Buffer.concat(stderr).toString('utf8'),
+      };
+      const error = stopError || processError;
+      if (error) reject(Object.assign(error, output));
+      else resolve(output);
+    };
+    const stop = (error: Error) => {
+      if (stopError) return;
+      stopError = error;
+      signalOwnedProcess('SIGTERM');
+      killTimer = setTimeout(() => {
+        signalOwnedProcess('SIGKILL');
+        groupKillSettled = true;
+        complete();
+      }, 2000);
+    };
+    const maxBuffer = options.maxBuffer ?? 1024 * 1024;
+    const capture = (
+      chunks: Buffer[],
+      bytes: number,
+      chunk: Buffer,
+    ): number => {
+      if (bytes + chunk.length > maxBuffer) {
+        if (bytes < maxBuffer)
+          chunks.push(chunk.subarray(0, maxBuffer - bytes));
+        stop(
+          Object.assign(new Error('Local process output exceeded limit'), {
+            code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+          }),
+        );
+        return maxBuffer;
+      }
+      chunks.push(chunk);
+      return bytes + chunk.length;
+    };
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdoutBytes = capture(stdout, stdoutBytes, chunk);
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderrBytes = capture(stderr, stderrBytes, chunk);
+    });
+    const abort = () => stop(aborted());
+    const timer = setTimeout(
+      () =>
+        stop(
+          Object.assign(new Error('Local process timed out'), {
+            code: 'ETIMEDOUT',
+          }),
+        ),
+      Math.max(1, options.timeout),
+    );
+    child.on('error', (error) => {
+      processError = error;
+    });
+    child.once('close', (code, signal) => {
+      closed = true;
+      if (!processError && (code !== 0 || signal))
+        processError = Object.assign(new Error('Local process failed'), {
+          code,
+          signal,
+        });
+      if (!stopError && groupExists())
+        stop(
+          Object.assign(new Error('Local wrapper left running descendants'), {
+            code: 'EINCOMPLETE',
+          }),
+        );
+      if (stopError && !groupExists()) groupKillSettled = true;
+      complete();
+    });
+    options.signal?.addEventListener('abort', abort, { once: true });
+    if (options.signal?.aborted) abort();
+  });
+}
+
+function controlledTimeout(
+  timeout: number,
+  control?: LocalTranscriptionControl,
+): number {
+  if (!control) return timeout;
+  if (control.signal.aborted || control.deadlineAtMs <= Date.now()) {
+    throw Object.assign(new Error('Local transcription cancelled'), {
+      code: 'ABORT_ERR',
+    });
+  }
+  return Math.max(1, Math.min(timeout, control.deadlineAtMs - Date.now()));
+}
+
+async function readInitialPrompt(
+  config: LocalTranscriptionConfig,
+): Promise<string> {
+  const promptParts: string[] = [];
+  if (config.initialPrompt.trim())
+    promptParts.push(config.initialPrompt.trim());
+
+  if (config.promptFile.trim()) {
+    let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+    try {
+      handle = await fs.open(config.promptFile, 'r');
+      const buffer = Buffer.alloc(MAX_PROMPT_BYTES + 1);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      if (bytesRead > MAX_PROMPT_BYTES) {
+        logger.warn(
+          { reason: 'prompt_file_too_large' },
+          'Local Whisper prompt file ignored',
+        );
+      } else {
+        const filePrompt = buffer
+          .subarray(0, bytesRead)
+          .toString('utf8')
+          .trim();
+        if (filePrompt) promptParts.push(filePrompt);
+      }
+    } catch {
+      logger.warn(
+        { reason: 'prompt_file_unavailable' },
+        'Local Whisper prompt file ignored',
+      );
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+  }
+
+  return promptParts.join('\n').slice(0, MAX_PROMPT_BYTES).trim();
+}
+
+function parseWavDuration(header: Buffer): number | null {
+  if (
+    header.length < 12 ||
+    header.toString('ascii', 0, 4) !== 'RIFF' ||
+    header.toString('ascii', 8, 12) !== 'WAVE'
+  ) {
+    return null;
+  }
+  let byteRate: number | null = null;
+  let dataBytes: number | null = null;
+  for (let offset = 12; offset + 8 <= header.length;) {
+    const id = header.toString('ascii', offset, offset + 4);
+    const size = header.readUInt32LE(offset + 4);
+    const payloadOffset = offset + 8;
+    if (id === 'fmt ' && size >= 16 && payloadOffset + 12 <= header.length) {
+      byteRate = header.readUInt32LE(payloadOffset + 8);
+    }
+    if (id === 'data') {
+      dataBytes = size;
+      break;
+    }
+    offset = payloadOffset + size + (size % 2);
+  }
+  if (!byteRate || dataBytes === null) return null;
+  const duration = dataBytes / byteRate;
+  return Number.isFinite(duration) && duration > 0 ? duration : null;
+}
+
+async function wavDurationSeconds(wavPath: string): Promise<number | null> {
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    handle = await fs.open(wavPath, 'r');
+    const buffer = Buffer.alloc(64 * 1024);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return parseWavDuration(buffer.subarray(0, bytesRead));
+  } catch {
+    return null;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+const CHILD_STDERR_SNIPPET_CHARS = 160;
+
+/**
+ * A short, path-free excerpt of a failed child's stderr. ffmpeg names the
+ * reason in its last lines ("Output file #0 does not contain any stream" for
+ * a muted clip); without it the ERROR line only says `process_error`. Every
+ * absolute path is reduced to its basename so chat folders and temporary
+ * directories never reach the log.
+ */
+function childStderrSnippet(err: unknown): string | undefined {
+  const raw = isRecord(err) ? err.stderr : undefined;
+  if (typeof raw !== 'string') return undefined;
+  const collapsed = raw
+    .replace(/(?:^|[\s'"(])\/(?:[^\s'"/]+\/)*([^\s'"/]*)/gu, (match, base) =>
+      match.startsWith('/') ? `…/${base}` : `${match[0]}…/${base}`,
+    )
+    .replace(/\s+/gu, ' ')
+    .trim();
+  if (!collapsed) return undefined;
+  return collapsed.length > CHILD_STDERR_SNIPPET_CHARS
+    ? collapsed.slice(-CHILD_STDERR_SNIPPET_CHARS)
+    : collapsed;
+}
+
+function safeProcessFailure(err: unknown): {
+  failureCode: string;
+  timedOut: boolean;
+} {
+  const record = isRecord(err) ? err : {};
+  const rawCode = record.code;
+  const failureCode =
+    typeof rawCode === 'string' && /^[A-Z0-9_-]{1,32}$/i.test(rawCode)
+      ? rawCode
+      : 'process_error';
+  return {
+    failureCode,
+    timedOut:
+      failureCode === 'ETIMEDOUT' ||
+      record.killed === true ||
+      typeof record.signal === 'string',
+  };
+}
+
+async function runWhisperPass(
+  config: LocalTranscriptionConfig,
+  execLocal: LocalExecFile,
+  wavPath: string,
+  privateTmpDir: string,
+  language: string,
+  passIndex: number,
+  initialPrompt: string,
+  trace?: OperationTraceObserver,
+  retryReason?: OperationTraceReason,
+  control?: LocalTranscriptionControl,
+  capture?: (pass: TranscriptionPassEvidence) => void,
+): Promise<WhisperCandidate> {
+  const span = startOperationTraceStage(
+    trace,
+    passIndex === 1 ? 'stt' : 'stt_recheck',
+    {
+      passIndex,
+      language: traceLanguage(language),
+      ...(retryReason ? { reason: retryReason } : {}),
+    },
+  );
+  try {
+    const outputPrefix = join(privateTmpDir, `pass-${passIndex}-${language}`);
+    const args = buildWhisperArgs({
+      model: config.whisperModel,
+      audioPath: wavPath,
+      outputPrefix,
+      language,
+      threads: config.whisperThreads,
+      noGpu: config.whisperNoGpu,
+      initialPrompt,
+    });
+    const { stderr } = await execLocal(config.whisperBin, args, {
+      timeout: controlledTimeout(config.whisperTimeoutMs, control),
+      maxBuffer: CHILD_MAX_BUFFER_BYTES,
+      ...(control ? { signal: control.signal } : {}),
+    });
+    const json = await fs
+      .readFile(`${outputPrefix}.json`, 'utf8')
+      .catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT')
+          throw Object.assign(
+            new Error('Local transcription output unavailable'),
+            { code: 'STT_OUTPUT_UNAVAILABLE' },
+          );
+        throw error;
+      });
+    const candidate = candidateFromWhisperOutput(language, json, stderr);
+    let originalText: string | null = null;
+    try {
+      const document = JSON.parse(json);
+      if (isRecord(document)) {
+        originalText =
+          typeof document.text === 'string'
+            ? document.text
+            : Array.isArray(document.transcription)
+              ? document.transcription
+                  .flatMap((segment) =>
+                    isRecord(segment) && typeof segment.text === 'string'
+                      ? [segment.text]
+                      : [],
+                  )
+                  .join(' ')
+              : null;
+      }
+    } catch {
+      /* invalid JSON is retained as a rejected candidate, not speech */
+    }
+    if (
+      originalText !== null &&
+      Buffer.byteLength(originalText) > TRANSCRIPTION_TEXT_MAX_BYTES
+    )
+      throw Object.assign(
+        new Error('Local transcription output exceeded limit'),
+        { code: 'STT_OUTPUT_TOO_LARGE' },
+      );
+    capture?.({
+      index: passIndex,
+      requestedLanguage: language,
+      detectedLanguage: candidate.detectedLanguage,
+      languageProbability: candidate.languageProbability,
+      meanTokenLogProbability: candidate.meanTokenLogProbability,
+      text: originalText,
+      valid: candidate.valid,
+      invalidReason: candidate.invalidReason,
+      outcome: 'completed',
+    });
+    span.finish(candidate.valid ? 'succeeded' : 'failed', {
+      ...traceCandidateDetails(candidate),
+      ...(candidate.invalidReason
+        ? { reason: traceInvalidReason(candidate.invalidReason) }
+        : {}),
+    });
+    return candidate;
+  } catch (err) {
+    capture?.({
+      index: passIndex,
+      requestedLanguage: language,
+      detectedLanguage: null,
+      languageProbability: null,
+      meanTokenLogProbability: null,
+      text: null,
+      valid: false,
+      invalidReason: null,
+      outcome: 'technical_error',
+      errorCode: classifyTranscriptionError(
+        err,
+        'whisper',
+        control?.signal.aborted,
+      ).code,
+    });
+    span.finish('failed', {
+      reason: safeProcessFailure(err).timedOut
+        ? 'process_timeout'
+        : 'process_failure',
+    });
+    throw err;
+  }
+}
+
+function traceLanguage(
+  language: string | null,
+): OperationTraceDetails['language'] {
+  return language === 'auto' ||
+    language === 'ru' ||
+    language === 'kk' ||
+    language === 'en'
+    ? language
+    : 'other';
+}
+
+function traceInvalidReason(
+  reason: NonNullable<WhisperCandidate['invalidReason']>,
+): OperationTraceReason {
+  return reason === 'artifact' ? 'caption_artifact' : reason;
+}
+
+function traceRetryReason(
+  reason: RetryReason,
+  candidate: WhisperCandidate,
+): OperationTraceReason {
+  if (reason === 'invalid_transcript')
+    return candidate.invalidReason
+      ? traceInvalidReason(candidate.invalidReason)
+      : 'recheck_uncertain';
+  if (reason === 'low_mean_token_log_probability') return 'low_mean_logprob';
+  if (reason === 'missing_mean_token_log_probability')
+    return 'missing_mean_logprob';
+  if (reason === 'suspect_caption_tail' || reason === 'sensitive_correction') return 'recheck_uncertain';
+  return reason;
+}
+
+function traceCandidateDetails(
+  candidate: WhisperCandidate,
+): OperationTraceDetails {
+  return {
+    language: traceLanguage(
+      candidate.detectedLanguage || candidate.requestedLanguage,
+    ),
+    ...(candidate.languageProbability !== null
+      ? { languageProbability: candidate.languageProbability }
+      : {}),
+    ...(candidate.meanTokenLogProbability !== null
+      ? { meanLogProbability: candidate.meanTokenLogProbability }
+      : {}),
+  };
+}
+
+function roundMetric(value: number | null, digits: number): number | null {
+  return value === null ? null : Number(value.toFixed(digits));
+}
+
+async function transcribeUnserialized(
+  audioPath: string,
+  langOverride: string | undefined,
+  config: LocalTranscriptionConfig,
+  execLocal: LocalExecFile,
+  trace?: OperationTraceObserver,
+  control?: LocalTranscriptionControl,
+): Promise<LocalTranscriptionResult> {
+  const processing = startOperationTraceStage(trace, 'stt_preprocess');
+  if (!config.whisperModel) {
+    processing.finish('skipped', { reason: 'unavailable' });
+    logger.error(
+      { failureCode: 'missing_local_model' },
+      'Local voice transcription disabled',
+    );
+    return failedTranscription({
+      stage: 'configuration',
+      code: 'missing_model',
+      retryable: false,
+    });
+  }
+
+  const startedAt = performance.now();
+  let privateTmpDir: string | null = null;
+  let audioDuration: number | null = null;
+  let stage: 'temporary_directory' | 'ffmpeg' | 'whisper' =
+    'temporary_directory';
+  let passCount = 0;
+  let retryReason: RetryReason | null = null;
+  const passes: TranscriptionPassEvidence[] = [];
+
+  try {
+    controlledTimeout(FFMPEG_TIMEOUT_MS, control);
+    privateTmpDir = await fs.mkdtemp(join(tmpdir(), 'skoobi-voice-stt-'));
+    await fs.chmod(privateTmpDir, 0o700);
+    const wavPath = join(privateTmpDir, 'audio.wav');
+
+    stage = 'ffmpeg';
+    const ffmpeg = startOperationTraceStage(trace, 'ffmpeg');
+    try {
+      await execLocal(
+        config.ffmpegBin,
+        [
+          '-y',
+          '-i',
+          audioPath,
+          '-ar',
+          '16000',
+          '-ac',
+          '1',
+          '-loglevel',
+          'error',
+          wavPath,
+        ],
+        {
+          timeout: controlledTimeout(FFMPEG_TIMEOUT_MS, control),
+          maxBuffer: CHILD_MAX_BUFFER_BYTES,
+          ...(control ? { signal: control.signal } : {}),
+        },
+      );
+      ffmpeg.finish('succeeded');
+    } catch (err) {
+      ffmpeg.finish('failed', {
+        reason: safeProcessFailure(err).timedOut
+          ? 'process_timeout'
+          : 'process_failure',
+      });
+      throw err;
+    }
+    audioDuration = await wavDurationSeconds(wavPath);
+    const initialPrompt = await readInitialPrompt(config);
+    processing.finish('succeeded', {
+      ...(audioDuration !== null
+        ? { audioDurationMs: Math.round(audioDuration * 1000) }
+        : {}),
+    });
+    const requestedLanguage = normalizeLanguage(
+      langOverride || config.whisperLang || 'auto',
+    );
+    const candidates: WhisperCandidate[] = [];
+
+    stage = 'whisper';
+    candidates.push(
+      await runWhisperPass(
+        config,
+        execLocal,
+        wavPath,
+        privateTmpDir,
+        requestedLanguage,
+        ++passCount,
+        initialPrompt,
+        trace,
+        undefined,
+        control,
+        (pass) => passes.push(pass),
+      ),
+    );
+
+    if (requestedLanguage === 'auto' && config.accuracyMode === 'max') {
+      retryReason = retryReasonForAutoCandidate(candidates[0], config);
+      if (retryReason) {
+        const semanticCheck = retryReason === 'sensitive_correction';
+        const languages = semanticCheck ? ['ru'] : ['ru', 'kk'];
+        for (const retryLanguage of languages) {
+          controlledTimeout(config.whisperTimeoutMs, control);
+          passCount += 1;
+          try {
+            candidates.push(
+              await runWhisperPass(
+                config,
+                execLocal,
+                wavPath,
+                privateTmpDir,
+                retryLanguage,
+                passCount,
+                semanticCheck ? '' : initialPrompt,
+                trace,
+                traceRetryReason(retryReason, candidates[0]),
+                control,
+                (pass) => passes.push(pass),
+              ),
+            );
+          } catch (err) {
+            // A failed optional retry must not discard an already usable auto
+            // result or prevent the other local retry from being attempted.
+            logger.warn(
+              {
+                via: 'local-whisper',
+                stage: 'whisper_retry',
+                retryLanguage,
+                ...safeProcessFailure(err),
+                model: basename(config.whisperModel),
+              },
+              'Local Whisper accuracy retry failed',
+            );
+          }
+        }
+      }
+    }
+
+    if (control) controlledTimeout(1, control);
+    const selected = selectBestCandidate(candidates);
+    const invalidReason = selected
+      ? null
+      : (candidates[0]?.invalidReason ?? null);
+    const processingDurationMs = performance.now() - startedAt;
+    const realtimeFactor =
+      audioDuration && audioDuration > 0
+        ? processingDurationMs / 1000 / audioDuration
+        : null;
+    logger.info(
+      {
+        via: 'local-whisper',
+        selectedLanguage:
+          selected?.detectedLanguage || selected?.requestedLanguage || null,
+        passCount,
+        retryReason,
+        invalidReason,
+        model: basename(config.whisperModel),
+        audioDurationSeconds: roundMetric(audioDuration, 3),
+        processingDurationMs: roundMetric(processingDurationMs, 1),
+        realtimeFactor: roundMetric(realtimeFactor, 3),
+        meanTokenLogProbability: roundMetric(
+          selected?.meanTokenLogProbability ?? null,
+          4,
+        ),
+      },
+      selected
+        ? 'Transcribed audio file locally'
+        : 'Local transcription was unusable',
+    );
+
+    const transcript = selected?.transcript || null;
+    if (transcript) {
+      const folderAbs = folderAbsFromMediaPath(audioPath);
+      if (folderAbs) {
+        await updateMediaEntry(folderAbs, basenameOnly(audioPath), {
+          has_transcript: true,
+          transcript_chars: transcript.length,
+        }).catch(() => undefined);
+      }
+    }
+    return assessTranscription({
+      passes,
+      selectedPassIndex: selected
+        ? (passes.find(
+            (pass) =>
+              pass.valid &&
+              pass.requestedLanguage === selected.requestedLanguage,
+          )?.index ?? null)
+        : null,
+      recheckReason: retryReason,
+      retryLanguageProbability: config.retryLanguageProbability,
+      retryMeanTokenLogProbability: config.retryMeanTokenLogProbability,
+      metrics: {
+        queueWaitMs: 0,
+        processingMs: processingDurationMs,
+        audioDurationMs: audioDuration === null ? null : audioDuration * 1000,
+      },
+    });
+  } catch (err) {
+    processing.finish('failed', {
+      reason:
+        stage === 'temporary_directory'
+          ? 'storage_failure'
+          : safeProcessFailure(err).timedOut
+            ? 'process_timeout'
+            : 'process_failure',
+    });
+    const processingDurationMs = performance.now() - startedAt;
+    const stderrSnippet =
+      stage === 'ffmpeg' ? childStderrSnippet(err) : undefined;
+    logger.error(
+      {
+        via: 'local-whisper',
+        stage,
+        ...safeProcessFailure(err),
+        ...(stderrSnippet ? { stderrSnippet } : {}),
+        passCount,
+        model: basename(config.whisperModel),
+        audioDurationSeconds: roundMetric(audioDuration, 3),
+        processingDurationMs: roundMetric(processingDurationMs, 1),
+      },
+      'Local audio transcription failed',
+    );
+    return failedTranscription(
+      classifyTranscriptionError(err, stage, control?.signal.aborted),
+      passes,
+      {
+        queueWaitMs: 0,
+        processingMs: processingDurationMs,
+        audioDurationMs: audioDuration === null ? null : audioDuration * 1000,
+      },
+      retryReason,
+    );
+  } finally {
+    if (privateTmpDir) {
+      await fs
+        .rm(privateTmpDir, { recursive: true, force: true })
+        .catch(() => undefined);
+    }
+  }
+}
+
+/**
+ * Make a transcriber whose entire ffmpeg + one-to-three Whisper sequence is
+ * serialized. A rejection cannot poison the tail; the next queued call runs.
+ * Exported for deterministic local-only unit testing.
+ */
+export function createSerializedLocalTranscribers(
+  configProvider: () => LocalTranscriptionConfig,
+  execLocal: LocalExecFile = defaultExecFile,
+) {
+  let tail: Promise<void> = Promise.resolve();
+  const detailed = (
+    audioPath: string,
+    langOverride?: string,
+    trace?: OperationTraceObserver,
+    control?: LocalTranscriptionControl,
+  ): Promise<LocalTranscriptionResult> => {
+    const queuedAt = performance.now();
+    const queued = startOperationTraceStage(trace, 'stt_queue');
+    const previous = tail;
+    let release!: () => void;
+    tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let began = false;
+    const scheduled = previous
+      .then(async () => {
+        began = true;
+        if (
+          control &&
+          (control.signal.aborted || control.deadlineAtMs <= Date.now())
+        ) {
+          queued.finish('cancelled', { reason: 'cancelled' });
+          return failedTranscription(
+            { stage: 'queue', code: 'aborted', retryable: false },
+            [],
+            {
+              queueWaitMs: Math.max(0, performance.now() - queuedAt),
+              processingMs: 0,
+              audioDurationMs: null,
+            },
+          );
+        }
+        queued.finish('succeeded', {
+          queueWaitMs: Math.max(0, Math.round(performance.now() - queuedAt)),
+        });
+        const queueWaitMs = Math.max(0, performance.now() - queuedAt);
+        let result: LocalTranscriptionResult;
+        try {
+          result = await transcribeUnserialized(
+            audioPath,
+            langOverride,
+            configProvider(),
+            execLocal,
+            trace,
+            control,
+          );
+        } catch (error) {
+          result = failedTranscription(
+            classifyTranscriptionError(
+              error,
+              'configuration',
+              control?.signal.aborted,
+            ),
+          );
+        }
+        result.metrics.queueWaitMs = queueWaitMs;
+        return result;
+      })
+      .finally(release);
+    if (!control) return scheduled;
+    return new Promise<LocalTranscriptionResult>((resolve, reject) => {
+      const abortQueued = () => {
+        if (began) return; // active work settles only after actual child close.
+        queued.finish('cancelled', { reason: 'cancelled' });
+        resolve(
+          failedTranscription(
+            { stage: 'queue', code: 'aborted', retryable: false },
+            [],
+            {
+              queueWaitMs: Math.max(0, performance.now() - queuedAt),
+              processingMs: 0,
+              audioDurationMs: null,
+            },
+          ),
+        );
+      };
+      control.signal.addEventListener('abort', abortQueued, { once: true });
+      if (control.signal.aborted) abortQueued();
+      void scheduled
+        .then(resolve, reject)
+        .finally(() =>
+          control.signal.removeEventListener('abort', abortQueued),
+        );
+    });
+  };
+  const legacy = async (
+    ...args: Parameters<typeof detailed>
+  ): Promise<string | null> => (await detailed(...args)).text;
+  return { detailed, legacy };
+}
+
+export function createSerializedLocalTranscriber(
+  configProvider: () => LocalTranscriptionConfig,
+  execLocal: LocalExecFile = defaultExecFile,
+) {
+  return createSerializedLocalTranscribers(configProvider, execLocal).legacy;
+}
+
+const defaultLocalTranscribers = createSerializedLocalTranscribers(
+  resolveLocalTranscriptionConfig,
+);
+
+/**
+ * Transcribe a local audio file to text.
+ *
+ * @param audioPath Absolute path to an audio file ffmpeg can read.
+ * @param langOverride ISO language code or "auto". Overrides WHISPER_LANG.
+ */
+export function transcribeAudioFile(
+  audioPath: string,
+  langOverride?: string,
+  trace?: OperationTraceObserver,
+  control?: LocalTranscriptionControl,
+): Promise<string | null> {
+  return defaultLocalTranscribers.legacy(
+    audioPath,
+    langOverride,
+    trace,
+    control,
+  );
+}
+
+export function transcribeAudioFileDetailed(
+  audioPath: string,
+  langOverride?: string,
+  trace?: OperationTraceObserver,
+  control?: LocalTranscriptionControl,
+): Promise<LocalTranscriptionResult> {
+  return defaultLocalTranscribers.detailed(
+    audioPath,
+    langOverride,
+    trace,
+    control,
+  );
+}
